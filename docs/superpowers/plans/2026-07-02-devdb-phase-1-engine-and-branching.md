@@ -1224,6 +1224,8 @@ git add -A && git commit -m "feat: embedded postgres wrapper for storage control
 
 ### Task 7: Engine config generation (trust mode)
 
+> **AMENDED (A12, post-review):** beyond the blocks below — TOML path values go through a `tomlString()` escaping helper; `pageserverMetadataJson(cfg)` and `safekeeperRegistrationBody(cfg, nowIso)` now take the config so ports derive from `cfg.engine` (single source of truth; Task 8's call sites in this plan were updated to match); `loadConfig` additionally requires the three path env vars to be absolute. See commit 749f6f6.
+
 **Files:**
 - Create: `packages/daemon/src/engine/configs.ts`
 - Test: `packages/daemon/test/configs.test.ts`
