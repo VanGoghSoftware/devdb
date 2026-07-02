@@ -1,6 +1,6 @@
 import { execa } from "execa";
 import { existsSync, readdirSync } from "node:fs";
-import { mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ManagedProcess } from "./process.js";
@@ -21,6 +21,7 @@ export function resolveVanillaPgDir(pgInstallDir: string): string {
 export class EmbeddedPostgres {
   private proc: ManagedProcess | null = null;
   private pgDir: string;
+  private initInFlight: Promise<void> | null = null;
 
   constructor(private opts: {
     name: string; dataDir: string; pgInstallDir: string; port: number; password: string;
@@ -30,15 +31,27 @@ export class EmbeddedPostgres {
   }
 
   connectionUri(): string {
-    return `postgresql://devdb:${this.opts.password}@127.0.0.1:${this.opts.port}/postgres`;
+    return `postgresql://devdb:${encodeURIComponent(this.opts.password)}@127.0.0.1:${this.opts.port}/postgres`;
   }
 
-  async init(): Promise<void> {
+  init(): Promise<void> {
+    this.initInFlight ??= this.doInit().finally(() => {
+      this.initInFlight = null;
+    });
+    return this.initInFlight;
+  }
+
+  private async doInit(): Promise<void> {
     if (existsSync(join(this.opts.dataDir, "PG_VERSION"))) return;
     await mkdir(this.opts.dataDir, { recursive: true });
-    const pwfile = join(tmpdir(), `devdb-pw-${process.pid}-${this.opts.port}`);
-    await writeFile(pwfile, this.opts.password, { mode: 0o600 });
+    // No PG_VERSION but non-empty = an interrupted init; initdb refuses non-empty dirs, so clear it.
+    for (const entry of await readdir(this.opts.dataDir)) {
+      await rm(join(this.opts.dataDir, entry), { recursive: true, force: true });
+    }
+    const pwDir = await mkdtemp(join(tmpdir(), "devdb-pw-"));
+    const pwfile = join(pwDir, "pw");
     try {
+      await writeFile(pwfile, this.opts.password, { mode: 0o600, flag: "wx" });
       // oracle: initdb -U <user> --pwfile <f> --auth-local=scram-sha-256 --auth-host=scram-sha-256 -D <dir>
       await execa(join(this.pgDir, "bin", "initdb"), [
         "-U", "devdb", "--pwfile", pwfile,
@@ -46,11 +59,14 @@ export class EmbeddedPostgres {
         "-D", this.opts.dataDir,
       ], { env: { LD_LIBRARY_PATH: join(this.pgDir, "lib") } });
     } finally {
-      await rm(pwfile, { force: true });
+      await rm(pwDir, { recursive: true, force: true });
     }
   }
 
   async start(): Promise<void> {
+    if (this.proc && (this.proc.state === "running" || this.proc.state === "starting")) {
+      throw new Error(`${this.opts.name} already ${this.proc.state}`);
+    }
     this.proc = new ManagedProcess({
       name: this.opts.name,
       bin: join(this.pgDir, "bin", "postgres"),
