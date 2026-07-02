@@ -41,3 +41,9 @@ Scope: whole-surface code scan of the attached source bundle; no tests were run.
 - P3: branch parent foreign key does not enforce same-project ancestry at packages/daemon/src/state/schema.ts:11 and packages/daemon/src/state/schema.ts:12.
 - P4: BranchQueue retains a tail entry forever for every branch id at packages/daemon/src/state/queue.ts:2 and packages/daemon/src/state/queue.ts:7.
 - P4: queue rejection serialization is requested but untested at packages/daemon/test/state.test.ts:63.
+
+
+## 2026-07-02 19:50 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of ManagedProcess supervisor and tests; no tests were run.
+
+Found 5 new findings. The highest-risk issue is the timeout/retry lifecycle race: failed starts reject before the killed child has fully exited, and stale exit handlers can clear a later child. Coverage is also thin for several explicit Task 5 requirements, especially stderr readiness, fanout metadata, and ring-buffer bounds.
