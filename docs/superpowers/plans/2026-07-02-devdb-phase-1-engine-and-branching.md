@@ -3224,6 +3224,8 @@ git add -A && git commit -m "feat: branch service and REST (create/list/get/dele
 
 ### Task 14: Endpoint lifecycle REST + live compute verification
 
+> **AMENDED (A19, post-review + live):** live launch surfaced: `compute_ctl_config` requires `{ jwks: { keys: [] } }` even in trust mode; `listen_addresses` must be GUC-quoted; shards "0000" CONFIRMED; compute signals ready ~10ms before SCRAM usable (bounded test-helper retry, daemon-side fix chipped). Post-review: `ensureRunning` runs its check inside the queue via an extracted `startLocked`; post-launch persist failures compensate by stopping the compute; `stop` persists "stopped" in `finally`; **branches carry a durable `endpoint_error`** (cleared on healthy transitions, exposed via detail + BranchDto) so polling clients can diagnose failures; exhaustion 409s are project-qualified; live coverage includes stop → status/port-null → restart-freed-capacity. See commits d9f06df + 650ad2b.
+
 **Files:**
 - Create: `packages/daemon/src/services/endpoints.ts`
 - Modify: `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
