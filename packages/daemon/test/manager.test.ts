@@ -73,7 +73,8 @@ describe("ComputeManager", () => {
     expect(ManagedProcessMock).toHaveBeenCalledTimes(1);
     const opts = ManagedProcessMock.mock.calls[0]![0] as {
       bin: string; args: string[]; env: Record<string, string>;
-      readyNeedle: string; readyTimeoutMs: number; onLine: (line: string) => void;
+      readyNeedle: string; readyTimeoutMs: number;
+      onLine: (line: string, stream: "stdout" | "stderr") => void;
     };
     expect(opts.bin).toBe(join(cfg.neonBinDir, "compute_ctl"));
     expect(opts.env).toEqual({});

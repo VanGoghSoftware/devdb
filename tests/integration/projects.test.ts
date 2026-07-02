@@ -19,5 +19,14 @@ describe("projects", () => {
     expect(del.status).toBe(204);
     const list = await (await fetch(`${dev.base}/api/projects`)).json();
     expect(list).toHaveLength(0);
+
+    // Confirm the engine tenant is actually torn down, not just the local state rows — probe
+    // the pageserver directly (same container, same network namespace as the daemon) since the
+    // daemon's own REST surface has no route to ask the engine this question.
+    const probe = await dev.container.exec([
+      "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+      `http://127.0.0.1:9898/v1/tenant/${project.id}`,
+    ]);
+    expect(probe.output.trim()).toBe("404");
   });
 });

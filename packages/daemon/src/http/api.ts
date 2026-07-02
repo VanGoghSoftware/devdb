@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { PgVersionSchema } from "@devdb/shared";
 import type { DevdbConfig } from "../config.js";
 import type { StateDb } from "../state/db.js";
@@ -18,6 +18,12 @@ export function buildServer(deps: Deps): FastifyInstance {
   const app = Fastify({ logger: true });
 
   app.setErrorHandler((err, _req, reply) => {
+    if (err instanceof ZodError) {
+      return reply.status(400).send({
+        error: "invalid request body",
+        issues: err.issues.map((i) => `${i.path.join(".")}: ${i.message}`),
+      });
+    }
     if (err instanceof DevdbError) {
       return reply.status(err.statusCode).send({ error: err.message });
     }

@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
-    "test": "pnpm --filter @devdb/shared build && vitest run"
+    "test": "pnpm --filter @devdb/shared build && tsc --noEmit -p tsconfig.test.json && vitest run"
   },
   "dependencies": {
     "@devdb/shared": "workspace:*",

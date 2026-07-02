@@ -105,8 +105,8 @@ describe("StorconClient", () => {
       checkpoint_distance: 1, checkpoint_timeout: "5m",
     })).rejects.toMatchObject({ status: 409, operation: "tenant_create" });
     // Bounded — a permanent 409 (e.g. real scheduling failure) must not retry forever.
-    expect(seen.length).toBeGreaterThan(1);
-    expect(seen.length).toBeLessThanOrEqual(6);
+    // Exact: maxAttempts is 3, so a persistently-transient 409 must be seen exactly 3 times.
+    expect(seen.length).toBe(3);
   });
 
   it("does not retry a non-scheduling 409 (e.g. a real conflict) on tenantCreate", async () => {

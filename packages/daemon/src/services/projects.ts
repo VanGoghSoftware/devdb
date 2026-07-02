@@ -43,26 +43,54 @@ export class ProjectsService {
     const projectId = newHexId(); // doubles as tenant id — oracle: project.rs:83-84
 
     await this.deps.storcon.tenantCreate(projectId, TENANT_CONFIG);
+    try {
+      // oracle: bootstrap mode timeline create — src/mgmt/service/branch.rs:124-128
+      const timelineId = newHexId();
+      await this.deps.pageserver.timelineCreate(projectId, {
+        new_timeline_id: timelineId,
+        pg_version: pgVersion,
+      });
 
-    // oracle: bootstrap mode timeline create — src/mgmt/service/branch.rs:124-128
-    const timelineId = newHexId();
-    await this.deps.pageserver.timelineCreate(projectId, {
-      new_timeline_id: timelineId,
-      pg_version: pgVersion,
-    });
-
-    const project = this.deps.state.projects.create({ id: projectId, name, pgVersion });
-    const mainBranch = this.deps.state.branches.create({
-      id: crypto.randomUUID(),
-      projectId,
-      parentBranchId: null,
-      name: "main",
-      slug: slugify(name, "main"),
-      timelineId,
-      password: generatePassword(),
-      createdBy: "api",
-    });
-    return { project, mainBranch };
+      const password = generatePassword();
+      // suffixed like branch slugs elsewhere — collision-proof even if two projects normalize
+      // to the same base slug (name uniqueness is enforced separately by the byName check above).
+      const slug = `${slugify(name, "main")}-${timelineId.slice(0, 6)}`;
+      const branchId = crypto.randomUUID();
+      // the two local inserts are atomic — never leave a project row without its main branch.
+      const tx = this.deps.state.raw.transaction(() => {
+        this.deps.state.projects.create({ id: projectId, name, pgVersion });
+        this.deps.state.branches.create({
+          id: branchId,
+          projectId,
+          parentBranchId: null,
+          name: "main",
+          slug,
+          timelineId,
+          password,
+          createdBy: "api",
+        });
+      });
+      try {
+        tx();
+      } catch (e) {
+        if ((e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
+          throw new DevdbError(409, `project or branch identity conflicts with an existing one: ${(e as Error).message}`);
+        }
+        throw e;
+      }
+      return {
+        project: this.deps.state.projects.byId(projectId)!,
+        mainBranch: this.deps.state.branches.byId(branchId)!,
+      };
+    } catch (e) {
+      // compensation: never leave a live tenant on the engine for a create that failed after
+      // tenantCreate succeeded (best-effort — loud on failure rather than silently swallowed).
+      await this.deps.pageserver.tenantDelete(projectId).catch((c) =>
+        console.error(`compensation failed — orphaned tenant ${projectId} on pageserver:`, c));
+      await this.deps.safekeeper.tenantDelete(projectId).catch((c) =>
+        console.error(`compensation failed — orphaned tenant ${projectId} on safekeeper:`, c));
+      throw e;
+    }
   }
 
   list(): ProjectRow[] {
@@ -84,6 +112,9 @@ export class ProjectsService {
       const leaves = [...remaining.values()].filter(
         (b) => ![...remaining.values()].some((o) => o.parentBranchId === b.id),
       );
+      if (leaves.length === 0) {
+        throw new DevdbError(500, "branch tree has a cycle or dangling parent — aborting project delete");
+      }
       for (const leaf of leaves) {
         await this.deps.computes.stop(leaf.id);
         await this.deps.pageserver.timelineDelete(project.id, leaf.timelineId);
