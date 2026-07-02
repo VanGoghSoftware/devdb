@@ -24,4 +24,20 @@ describe("loadConfig", () => {
   it("requires data dir", () => {
     expect(() => loadConfig({})).toThrow(/DEVDB_DATA_DIR/);
   });
+  it("rejects non-decimal http port syntax", () => {
+    expect(() => loadConfig({ ...base, DEVDB_HTTP_PORT: "0x1130" })).toThrow(/DEVDB_HTTP_PORT/);
+    expect(() => loadConfig({ ...base, DEVDB_HTTP_PORT: "4.4e3" })).toThrow(/DEVDB_HTTP_PORT/);
+  });
+  it("rejects whitespace-only path vars", () => {
+    expect(() => loadConfig({ ...base, DEVDB_DATA_DIR: "   " })).toThrow(/DEVDB_DATA_DIR/);
+  });
+  it("trims path vars", () => {
+    expect(loadConfig({ ...base, DEVDB_DATA_DIR: "  /data  " }).dataDir).toBe("/data");
+  });
+  it("rejects ranges overlapping reserved engine ports", () => {
+    expect(() => loadConfig({ ...base, DEVDB_PORT_RANGE: "63990-64010" })).toThrow(/64000/);
+  });
+  it("rejects http port inside the endpoint range", () => {
+    expect(() => loadConfig({ ...base, DEVDB_HTTP_PORT: "54310" })).toThrow(/54310/);
+  });
 });

@@ -1,11 +1,21 @@
 import { z } from "zod";
 
+const ENGINE_PORTS = {
+  brokerPort: 50051,
+  storconPort: 1234,
+  storconDbPort: 5431,
+  pageserverHttpPort: 9898,
+  pageserverPgPort: 64000,
+  safekeeperPgPort: 5454,
+  safekeeperHttpPort: 7676,
+} as const;
+
 const EnvSchema = z.object({
-  DEVDB_HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(4400),
-  DEVDB_DATA_DIR: z.string().min(1),
+  DEVDB_HTTP_PORT: z.string().regex(/^\d+$/, "must be a decimal integer").default("4400"),
+  DEVDB_DATA_DIR: z.string().trim().min(1),
   DEVDB_PORT_RANGE: z.string().regex(/^\d+-\d+$/).default("54300-54339"),
-  NEON_BINARIES_DIR: z.string().min(1),
-  PG_INSTALL_DIR: z.string().min(1),
+  NEON_BINARIES_DIR: z.string().trim().min(1),
+  PG_INSTALL_DIR: z.string().trim().min(1),
 });
 
 export interface DevdbConfig {
@@ -32,27 +42,40 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     throw new Error(`Invalid environment: ${missing}`);
   }
   const e = parsed.data;
+
+  const httpPort = Number(e.DEVDB_HTTP_PORT);
+  if (!(httpPort >= 1 && httpPort <= 65535)) {
+    throw new Error(`DEVDB_HTTP_PORT out of range: ${httpPort}`);
+  }
+
   const [minS, maxS] = e.DEVDB_PORT_RANGE.split("-") as [string, string];
   const min = Number(minS);
   const max = Number(maxS);
-  if (!(min > 0 && max >= min && max <= 65535)) {
+  if (!(min >= 1 && max >= min && max <= 65535)) {
     throw new Error(`DEVDB_PORT_RANGE invalid: ${e.DEVDB_PORT_RANGE}`);
   }
+
+  // oracle: port constants from src/daemon/mod.rs + src/daemon/pageserver/mod.rs
+  const reserved = Object.values(ENGINE_PORTS) as number[];
+  const clash = reserved.find((p) => p >= min && p <= max);
+  if (clash !== undefined) {
+    throw new Error(
+      `DEVDB_PORT_RANGE ${e.DEVDB_PORT_RANGE} overlaps reserved engine port ${clash} — pick a range clear of ${reserved.join(", ")}`,
+    );
+  }
+  if (httpPort >= min && httpPort <= max) {
+    throw new Error(`DEVDB_HTTP_PORT ${httpPort} falls inside DEVDB_PORT_RANGE ${e.DEVDB_PORT_RANGE}`);
+  }
+  if (reserved.includes(httpPort)) {
+    throw new Error(`DEVDB_HTTP_PORT ${httpPort} is a reserved engine port`);
+  }
+
   return {
-    httpPort: e.DEVDB_HTTP_PORT,
+    httpPort,
     dataDir: e.DEVDB_DATA_DIR,
     portRange: { min, max },
     neonBinDir: e.NEON_BINARIES_DIR,
     pgInstallDir: e.PG_INSTALL_DIR,
-    // oracle: port constants from src/daemon/mod.rs + src/daemon/pageserver/mod.rs
-    engine: {
-      brokerPort: 50051,
-      storconPort: 1234,
-      storconDbPort: 5431,
-      pageserverHttpPort: 9898,
-      pageserverPgPort: 64000,
-      safekeeperPgPort: 5454,
-      safekeeperHttpPort: 7676,
-    },
+    engine: { ...ENGINE_PORTS },
   };
 }
