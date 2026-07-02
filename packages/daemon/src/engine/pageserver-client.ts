@@ -37,6 +37,8 @@ export class PageserverClient {
 
   // oracle: src/mgmt/service/branch.rs:487. Deletion is async on the engine side (202).
   async timelineDelete(tenantId: string, timelineId: string): Promise<void> {
+    assertEngineId(tenantId);
+    assertEngineId(timelineId);
     await engineFetch("timeline_delete", this.tl(tenantId, timelineId), { method: "DELETE" }, [200, 202, 404]);
   }
 

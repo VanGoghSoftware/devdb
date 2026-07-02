@@ -105,6 +105,12 @@ describe("PageserverClient", () => {
     expect(seen).toHaveLength(2);
   });
 
+  it("rejects malformed engine ids before any request", async () => {
+    await expect(new PageserverClient(base).timelineDelete("../evil", "b".repeat(32)))
+      .rejects.toThrow(/invalid engine id/);
+    expect(seen).toHaveLength(0);
+  });
+
   it("timelineInfo GETs the timeline route", async () => {
     nextResponse = { status: 200, body: JSON.stringify({ timeline_id: "b".repeat(32), last_record_lsn: "0/2" }) };
     const c = new PageserverClient(base);
