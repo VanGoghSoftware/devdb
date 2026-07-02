@@ -21,6 +21,21 @@ describe("scram", () => {
   it("generatePassword is 32 alphanumerics", () => {
     expect(generatePassword()).toMatch(/^[A-Za-z0-9]{32}$/);
   });
+  it("generates a fresh 16-byte salt per call", () => {
+    const a = scramSha256Verifier("secret");
+    const b = scramSha256Verifier("secret");
+    expect(a).not.toBe(b);
+    const salt = Buffer.from(a.match(/^SCRAM-SHA-256\$\d+:([^$]+)\$/)![1]!, "base64");
+    expect(salt.length).toBe(16);
+  });
+  it("binds a custom iteration count into prefix and keys", () => {
+    const salt = Buffer.from("0123456789abcdef", "utf8");
+    const v = scramSha256Verifier("secret", salt, 8192);
+    expect(v.startsWith("SCRAM-SHA-256$8192:")).toBe(true);
+    const salted = pbkdf2Sync("secret", salt, 8192, 32, "sha256");
+    const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+    expect(v).toContain(createHash("sha256").update(clientKey).digest("base64"));
+  });
 });
 
 describe("postgresql.conf", () => {
@@ -30,15 +45,22 @@ describe("postgresql.conf", () => {
       "shared_buffers=128MB", "fsync=off", "wal_level=logical",
       "listen_addresses=0.0.0.0", "port=54321", "shared_preload_libraries=neon",
       "synchronous_standby_names=walproposer", "neon.safekeepers=localhost:5454",
-      "password_encryption=scram-sha-256", "hba_file=/x/pg_hba.conf",
+      "password_encryption=scram-sha-256", "hba_file='/x/pg_hba.conf'",
     ]) expect(conf, line).toContain(line);
     expect(conf).not.toContain("ssl=on");
     expect(conf).not.toContain("ssl_cert_file");
   });
   it("pg_hba keeps scram for remote, trust for local cloud_admin, no hostssl", () => {
     expect(PG_HBA).toContain("local   all       cloud_admin                 trust");
+    expect(PG_HBA).toContain("host    all       cloud_admin   127.0.0.1/32  trust");
+    expect(PG_HBA).toContain("host    all       cloud_admin   ::1/128       trust");
+    expect(PG_HBA).not.toContain("::1/32 ");
     expect(PG_HBA).toContain("host    all       all           all           scram-sha-256");
     expect(PG_HBA).not.toContain("hostssl");
+  });
+  it("quotes hba_file paths with spaces and quotes", () => {
+    const conf = computePostgresqlConf({ port: 1, hbaPath: "/da ta/it's/pg_hba.conf" });
+    expect(conf).toContain("hba_file='/da ta/it''s/pg_hba.conf'");
   });
 });
 
@@ -62,5 +84,23 @@ describe("compute config json", () => {
     expect(spec.suspend_timeout_seconds).toBe(-1);
     expect(spec.storage_auth_token).toBeUndefined();
     expect(doc.compute_ctl_config).toEqual({});
+  });
+  it("rejects malformed ids in compute config", () => {
+    expect(() => computeConfigJson({
+      tenantIdHex: "not-hex", timelineIdHex: "b".repeat(32),
+      port: 1, hbaPath: "/x", password: "pw",
+    })).toThrow(/invalid engine id/);
+  });
+  it("pins pageserver_connection_info exactly", () => {
+    const doc = JSON.parse(computeConfigJson({
+      tenantIdHex: "a".repeat(32), timelineIdHex: "b".repeat(32),
+      port: 54321, hbaPath: "/x/pg_hba.conf", password: "pw",
+    }));
+    expect(doc.spec.pageserver_connection_info).toEqual({
+      shard_count: 0,
+      stripe_size: null,
+      shards: { "0000": { pageservers: [{ id: 1, libpq_url: "postgres://cloud_admin@127.0.0.1:64000", grpc_url: null }] } },
+      prefer_protocol: "libpq",
+    });
   });
 });

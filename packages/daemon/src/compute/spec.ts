@@ -1,5 +1,6 @@
 import { computePostgresqlConf } from "./pgconf.js";
 import { scramSha256Verifier } from "./scram.js";
+import { assertEngineId } from "../engine/ids.js";
 
 // oracle: src/mgmt/compute/mod.rs:820-917 generate_config.
 // Deviation: storage_auth_token omitted (trust mode).
@@ -9,6 +10,8 @@ import { scramSha256Verifier } from "./scram.js";
 export function computeConfigJson(a: {
   tenantIdHex: string; timelineIdHex: string; port: number; hbaPath: string; password: string;
 }): string {
+  assertEngineId(a.tenantIdHex);
+  assertEngineId(a.timelineIdHex);
   const spec = {
     format_version: 1.0,
     features: [],

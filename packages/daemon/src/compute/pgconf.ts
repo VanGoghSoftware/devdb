@@ -1,4 +1,9 @@
 // oracle: src/mgmt/compute/mod.rs:737-809 setup_pg_conf. Deviations: no ssl block, no cert files.
+
+function pgQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 export function computePostgresqlConf(a: { port: number; hbaPath: string }): string {
   const kv: Array<[string, string]> = [
     ["max_wal_senders", "10"], ["wal_log_hints", "off"], ["max_replication_slots", "10"],
@@ -24,15 +29,16 @@ export function computePostgresqlConf(a: { port: number; hbaPath: string }): str
     ["synchronous_standby_names", "walproposer"],
     ["neon.safekeepers", "localhost:5454"],
     ["password_encryption", "scram-sha-256"],
-    ["hba_file", a.hbaPath],
+    ["hba_file", pgQuote(a.hbaPath)],
   ];
   return kv.map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
 }
 
 // oracle: src/mgmt/compute/pg_hba.conf, hostssl lines dropped (no TLS)
+// (deviation: oracle uses ::1/32, which is far broader than IPv6 loopback — /128 is the loopback host)
 export const PG_HBA = `# TYPE  DATABASE  USER          ADDRESS       METHOD
 local   all       cloud_admin                 trust
 host    all       cloud_admin   127.0.0.1/32  trust
-host    all       cloud_admin   ::1/32        trust
+host    all       cloud_admin   ::1/128       trust
 host    all       all           all           scram-sha-256
 `;
