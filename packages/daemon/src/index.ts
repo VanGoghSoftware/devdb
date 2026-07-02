@@ -5,6 +5,11 @@ import { loadConfig } from "./config.js";
 import { openState } from "./state/db.js";
 import { EngineRuntime } from "./engine/boot.js";
 import { buildServer } from "./http/api.js";
+import { StorconClient } from "./engine/storcon-client.js";
+import { PageserverClient } from "./engine/pageserver-client.js";
+import { SafekeeperClient } from "./engine/safekeeper-client.js";
+import { ComputeManager } from "./compute/manager.js";
+import { ProjectsService } from "./services/projects.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -25,7 +30,13 @@ async function main(): Promise<void> {
     const engine = new EngineRuntime(cfg, state);
     await engine.start();
 
-    const app = buildServer({ cfg, state, engine });
+    const storcon = new StorconClient();
+    const pageserver = new PageserverClient();
+    const safekeeper = new SafekeeperClient();
+    const computes = new ComputeManager(cfg);
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes });
+
+    const app = buildServer({ cfg, state, engine, services: { projects } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     let stopping = false;
@@ -51,6 +62,13 @@ async function main(): Promise<void> {
       } catch (e) {
         ok = false;
         console.error("error closing http server:", e);
+      }
+
+      try {
+        await computes.stopAll();
+      } catch (e) {
+        ok = false;
+        console.error("error stopping computes:", e);
       }
 
       try {

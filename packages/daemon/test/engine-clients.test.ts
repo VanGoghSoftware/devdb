@@ -11,14 +11,18 @@ let server: http.Server;
 let base: string;
 let seen: Seen[] = [];
 let nextResponse: { status: number; body: string } = { status: 200, body: "{}" };
+// Queue of one-shot responses consumed in order before falling back to nextResponse — lets a
+// single test simulate a sequence (e.g. transient 409 then 201) without a second harness.
+let responseQueue: Array<{ status: number; body: string }> = [];
 
 beforeAll(async () => {
   server = http.createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     seen.push({ method: req.method!, url: req.url!, body });
-    res.writeHead(nextResponse.status, { "content-type": "application/json" });
-    res.end(nextResponse.body);
+    const r = responseQueue.shift() ?? nextResponse;
+    res.writeHead(r.status, { "content-type": "application/json" });
+    res.end(r.body);
   });
   server.listen(0);
   await once(server, "listening");
@@ -26,7 +30,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${addr.port}`;
 });
 afterAll(() => server.close());
-beforeEach(() => { seen = []; nextResponse = { status: 200, body: "{}" }; });
+beforeEach(() => { seen = []; nextResponse = { status: 200, body: "{}" }; responseQueue = []; });
 
 describe("ids", () => {
   it("newHexId is 32 hex chars", () => expect(newHexId()).toMatch(/^[0-9a-f]{32}$/));
@@ -45,7 +49,11 @@ describe("StorconClient", () => {
     expect(seen[0]).toMatchObject({ method: "POST", url: "/v1/tenant" });
     const body = JSON.parse(seen[0]!.body);
     expect(body.new_tenant_id).toBe("a".repeat(32));
-    expect(body.config.gc_horizon).toBe(67108864);
+    // Confirmed live (2026-07-02): TenantConfig fields flatten onto the top-level request body —
+    // a nested `config` field 400s with "unknown field `config`". See storcon-client.ts oracle comment.
+    expect(body.config).toBeUndefined();
+    expect(body.gc_horizon).toBe(67108864);
+    expect(body.gc_period).toBe("1h");
   });
 
   it("getLsnByTimestamp GETs with timestamp query", async () => {
@@ -56,6 +64,59 @@ describe("StorconClient", () => {
     expect(seen[0]!.url).toBe(
       `/v1/tenant/${"a".repeat(32)}/timeline/${"b".repeat(32)}/get_lsn_by_timestamp?timestamp=2026-07-02T10%3A00%3A00.000Z`,
     );
+  });
+
+  // Confirmed live (2026-07-02, container run): immediately after /api/status first reports all
+  // engine components "running", the storage_controller has marked the freshly re-attached
+  // pageserver "warming-up" but not yet "active" — its own heartbeat loop (fixed ~5s cadence,
+  // independent of daemon boot) is what promotes it to schedulable. A tenant_create landing in
+  // that window gets a well-formed-but-rejected 409:
+  //   {"msg":"Conflict: Failed to schedule shard(s): No pageserver found matching constraint"}
+  // Log evidence (docker logs), timestamps from the same run as the 409 below:
+  //   19:35:58.384 storage_controller: "Marking 1 warming-up on reattach"
+  //   19:35:59.354 storage_controller: "Error processing HTTP request: Conflict: Failed to
+  //                schedule shard(s): No pageserver found matching constraint" (our POST)
+  //   (next heartbeat tick, ~5s later, is when the node would have transitioned to active)
+  // Retrying tolerates this exactly like registerSafekeeper() already retries storcon
+  // registration during boot (engine/boot.ts) — same class of "component not immediately
+  // ready" problem, same bounded-backoff shape, just at request-serving time instead of boot time.
+  it("retries a transient scheduling 409 on tenantCreate and succeeds once the pageserver is schedulable", async () => {
+    responseQueue = [
+      { status: 409, body: '{"msg":"Conflict: Failed to schedule shard(s): No pageserver found matching constraint"}' },
+      { status: 409, body: '{"msg":"Conflict: Failed to schedule shard(s): No pageserver found matching constraint"}' },
+    ];
+    nextResponse = { status: 201, body: "{}" };
+    // sleepMs injected as a no-op so the test exercises the real retry loop without waiting out
+    // the production backoff in wall-clock time.
+    const c = new StorconClient(base, async () => {});
+    await c.tenantCreate("a".repeat(32), {
+      gc_period: "1h", gc_horizon: 1, pitr_interval: "7 days",
+      checkpoint_distance: 1, checkpoint_timeout: "5m",
+    });
+    expect(seen).toHaveLength(3);
+    expect(seen.every((s) => s.method === "POST" && s.url === "/v1/tenant")).toBe(true);
+  });
+
+  it("gives up on tenantCreate after repeated scheduling 409s and surfaces the engine error", async () => {
+    nextResponse = { status: 409, body: '{"msg":"Conflict: Failed to schedule shard(s): No pageserver found matching constraint"}' };
+    const c = new StorconClient(base, async () => {});
+    await expect(c.tenantCreate("a".repeat(32), {
+      gc_period: "1h", gc_horizon: 1, pitr_interval: "7 days",
+      checkpoint_distance: 1, checkpoint_timeout: "5m",
+    })).rejects.toMatchObject({ status: 409, operation: "tenant_create" });
+    // Bounded — a permanent 409 (e.g. real scheduling failure) must not retry forever.
+    expect(seen.length).toBeGreaterThan(1);
+    expect(seen.length).toBeLessThanOrEqual(6);
+  });
+
+  it("does not retry a non-scheduling 409 (e.g. a real conflict) on tenantCreate", async () => {
+    nextResponse = { status: 409, body: '{"msg":"tenant already exists"}' };
+    const c = new StorconClient(base);
+    await expect(c.tenantCreate("a".repeat(32), {
+      gc_period: "1h", gc_horizon: 1, pitr_interval: "7 days",
+      checkpoint_distance: 1, checkpoint_timeout: "5m",
+    })).rejects.toMatchObject({ status: 409, operation: "tenant_create" });
+    expect(seen).toHaveLength(1);
   });
 
   it("surfaces engine errors with status and body", async () => {
