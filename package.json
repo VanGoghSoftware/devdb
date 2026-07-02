@@ -1,0 +1,11 @@
+{
+  "name": "devdb",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "test:integration": "vitest run --root tests/integration"
+  }
+}

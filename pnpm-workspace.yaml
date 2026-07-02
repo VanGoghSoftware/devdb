@@ -1,0 +1,10 @@
+packages:
+  - "packages/*"
+  - "tests/integration"
+
+allowBuilds:
+  better-sqlite3: true
+  esbuild: false
+
+# Supply-chain policy: dependencies must be >=24h old at resolution time
+minimumReleaseAge: 1440

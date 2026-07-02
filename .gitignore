@@ -1,1 +1,6 @@
 .claude/worktrees/
+node_modules/
+dist/
+*.tsbuildinfo
+.devdb-data/
+.superpowers/
