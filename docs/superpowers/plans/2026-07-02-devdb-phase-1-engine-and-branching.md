@@ -2291,6 +2291,8 @@ git add -A && git commit -m "feat: compute scram/pgconf/spec generation"
 
 ### Task 11: ComputeManager (compute_ctl lifecycle + port allocation)
 
+> **AMENDED (A16, post-review):** beyond the blocks below — `start()` reserves the branch's map slot synchronously (closing the double-start TOCTOU) and all cleanup is identity-aware; the whole setup path after reservation is failure-cleaned (ports released, dir removed); a manager-held reservation Set feeds `allocatePort(range, preferred?, exclude?)` so concurrent starts and metrics/endpoint ranges can't collide; `stop()` exposes a real `"stopping"` status and cleans up in `finally`; onLine fanout snapshots listeners with per-callback catch. Launch contract pinned by mock-level manager.test.ts. See commit ee7e382.
+
 **Files:**
 - Create: `packages/daemon/src/compute/ports.ts`, `packages/daemon/src/compute/manager.ts`
 - Test: `packages/daemon/test/ports.test.ts` (unit); live compute start is exercised in Task 14's integration test.
