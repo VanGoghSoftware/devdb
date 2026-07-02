@@ -3379,6 +3379,8 @@ git add -A && git commit -m "feat: endpoint lifecycle with sticky ports and exha
 
 ### Task 15: Time travel — LSN by timestamp, branch-at-point, restore, reset
 
+> **AMENDED (A21, post-review + live):** all three time-travel engine APIs worked on first live contact. Post-review: reset's child/parent guards run INSIDE the branch lane; the queued swap compensates ANY post-stop failure (orphan timeline deleted, original endpoint restarted) with the detach→swap crash window documented (boot reconciliation tracked for the durability phase); LSN-range engine rejections map to 400 per the oracle's classification (branch.rs:689-701); timestamps require an explicit timezone; reapOrphanedPostgres kills all matches (invariant warning on >1) with a bounded post-kill wait and one rm retry. Live lesson: get_lsn_by_timestamp stays kind=future until later COMMITS advance the timeline clock — integration polls after the destructive write. See commits 31e0fff + 82567cf.
+
 **Files:**
 - Create: `packages/daemon/src/services/timetravel.ts`
 - Modify: `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
