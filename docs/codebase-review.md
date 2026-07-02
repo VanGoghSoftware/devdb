@@ -105,3 +105,9 @@ Findings:
 Scope: whole-surface code scan of the Task 12 project service, REST routes, narrow engine APIs, storcon tenant_create retry, and related unit/integration coverage. No tests were run.
 
 Found six new findings: three create-path correctness risks, one REST validation mapping bug, and two actionable coverage gaps around retry bounds and live delete parity.
+
+
+## 2026-07-02 22:14 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan; no tests were run.
+
+Findings: P2 branch create lacks compensation for local insert failure after timeline creation; P2 create is not queued against parent deletion; P3 detail swallows non-transient timelineInfo failures; P3 boot failure after engine start skips engine cleanup; P4 branch REST params lack id-format validation; P4 branch names are not normalized before uniqueness checks.
