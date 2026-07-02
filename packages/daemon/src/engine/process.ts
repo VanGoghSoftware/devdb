@@ -29,7 +29,11 @@ export class ManagedProcess {
   private ingest(line: string, stream: "stdout" | "stderr"): void {
     this.ring.push(line);
     if (this.ring.length > RING_SIZE) this.ring.shift();
-    this.opts.onLine?.(line, stream);
+    try {
+      this.opts.onLine?.(line, stream);
+    } catch {
+      // onLine fanout must never break the child lifecycle; observer errors are swallowed by contract.
+    }
   }
 
   async start(): Promise<void> {
@@ -38,21 +42,34 @@ export class ManagedProcess {
     }
     this.state = "starting";
     const timeoutMs = this.opts.readyTimeoutMs ?? 60_000;
-    const child = spawn(this.opts.bin, this.opts.args, {
-      env: this.opts.env ?? {},
-      cwd: this.opts.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+
+    let child: ChildProcess;
+    try {
+      child = spawn(this.opts.bin, this.opts.args, {
+        env: this.opts.env ?? {},
+        cwd: this.opts.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      this.state = "failed";
+      throw new Error(`${this.opts.name}: spawn failed synchronously: ${(e as Error).message}`);
+    }
     this.child = child;
     this.pid = child.pid ?? null;
 
-    let ready: () => void;
-    let failed: (e: Error) => void;
-    const readiness = new Promise<void>((res, rej) => { ready = res; failed = rej; });
+    let ready!: () => void;
+    let failed!: (e: Error) => void;
+    const readiness = new Promise<void>((res, rej) => {
+      ready = res;
+      failed = rej;
+    });
 
     let seen = false;
-    const watch = (stream: NodeJS.ReadableStream, which: "stdout" | "stderr") => {
+    const rls: readline.Interface[] = [];
+    const watch = (stream: NodeJS.ReadableStream | null, which: "stdout" | "stderr") => {
+      if (!stream) return;
       const rl = readline.createInterface({ input: stream });
+      rls.push(rl);
       rl.on("line", (line) => {
         this.ingest(line, which);
         if (!seen && line.includes(this.opts.readyNeedle)) {
@@ -61,29 +78,50 @@ export class ManagedProcess {
         }
       });
     };
-    watch(child.stdout!, "stdout");
-    watch(child.stderr!, "stderr");
+    watch(child.stdout, "stdout");
+    watch(child.stderr, "stderr");
 
     const timer = setTimeout(() => {
       failed(new Error(`${this.opts.name}: timed out waiting for "${this.opts.readyNeedle}" after ${timeoutMs}ms`));
     }, timeoutMs);
 
+    // Settling the readiness promise must never be fenced — an aborted or superseded
+    // start() still has an awaiting caller. Only instance-field cleanup is fenced.
     child.on("exit", (code, signal) => {
-      this.pid = null;
+      rls.forEach((rl) => rl.close());
       if (!seen) {
-        failed(new Error(`${this.opts.name}: exited (code=${code} signal=${signal}) before ready. Last output:\n${this.recentLines(20).join("\n")}`));
+        failed(new Error(
+          `${this.opts.name}: exited (code=${code} signal=${signal}) before ready. Last output:\n${this.recentLines(20).join("\n")}`,
+        ));
       }
-      if (this.state !== "stopped") this.state = seen && this.state === "running" ? "failed" : this.state;
-      this.child = null;
+      if (this.child === child) {
+        this.pid = null;
+        this.child = null;
+        if (this.state === "running") this.state = "failed";
+      }
     });
-    child.on("error", (e) => failed(new Error(`${this.opts.name}: spawn error: ${e.message}`)));
+    child.on("error", (e) => {
+      rls.forEach((rl) => rl.close());
+      failed(new Error(`${this.opts.name}: spawn error: ${e.message}`));
+      if (this.child === child) {
+        this.pid = null;
+        this.child = null;
+      }
+    });
 
     try {
       await readiness;
       this.state = "running";
     } catch (e) {
-      this.state = "failed";
-      child.kill("SIGKILL");
+      // stop() may have claimed the transition ("stopped") while we were starting — don't clobber it.
+      if (this.state === "starting") this.state = "failed";
+      if (this.child === child) {
+        this.child = null;
+        this.pid = null;
+      }
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
       throw e;
     } finally {
       clearTimeout(timer);
@@ -92,17 +130,18 @@ export class ManagedProcess {
 
   async stop(timeoutMs = 10_000): Promise<void> {
     const child = this.child;
-    if (!child) {
-      this.state = "stopped";
-      return;
-    }
     this.state = "stopped";
-    const exited = new Promise<void>((res) => child.once("exit", () => res()));
+    if (!child) return;
+    this.child = null;
+    this.pid = null;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((res) => {
+      child.once("exit", () => res());
+      child.once("error", () => res());
+    });
     child.kill("SIGTERM");
     const killer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
     await exited;
     clearTimeout(killer);
-    this.child = null;
-    this.pid = null;
   }
 }
