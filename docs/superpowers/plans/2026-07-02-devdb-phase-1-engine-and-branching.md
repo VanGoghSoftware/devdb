@@ -2515,6 +2515,8 @@ git add -A && git commit -m "feat: compute manager with compute_ctl lifecycle an
 
 ### Task 12: Projects service + REST
 
+> **AMENDED (A17, post-review + live engine):** the live engine resolved the tenant_create VERIFY note — config fields are FLAT on the body (nested `config` 400s); a bounded 3-attempt retry covers the ~5s post-boot storcon scheduling window (substring-gated, fail-safe); `create()` compensates the tenant on any post-create failure, wraps the two local inserts in one transaction, maps unique violations to 409, and suffixes the main slug with 6 hex of the timeline id; delete's leaves loop aborts loudly on dangling parents; ZodError maps to 400; the daemon test script now runs `tsc --noEmit -p tsconfig.test.json` (A2 conformance standing guard); integration probes pageserver in-container for real teardown. See commits 719fe20 + de2fa28.
+
 **Files:**
 - Create: `packages/daemon/src/services/errors.ts`, `packages/daemon/src/services/slug.ts`, `packages/daemon/src/services/projects.ts`
 - Modify: `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
