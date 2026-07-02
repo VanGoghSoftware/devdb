@@ -31,3 +31,13 @@ Findings:
 Scope: whole-surface code scan of the supplied source bundle; no tests were run.
 
 Findings: 5 new issues. The highest-risk gaps are missing runtime Zod schemas for the shared DTOs, endpoint port ranges that can collide with fixed engine ports, and absent parity coverage for manually copied daemon port constants.
+
+
+## 2026-07-02 19:40 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the attached source bundle; no tests were run.
+
+- P2: restoreSwap can reparent unrelated rows by timeline id alone at packages/daemon/src/state/repos.ts:117.
+- P2: archived branch keeps sticky port after identity is moved to replacement at packages/daemon/src/state/repos.ts:110 and packages/daemon/src/state/repos.ts:113.
+- P3: branch parent foreign key does not enforce same-project ancestry at packages/daemon/src/state/schema.ts:11 and packages/daemon/src/state/schema.ts:12.
+- P4: BranchQueue retains a tail entry forever for every branch id at packages/daemon/src/state/queue.ts:2 and packages/daemon/src/state/queue.ts:7.
+- P4: queue rejection serialization is requested but untested at packages/daemon/test/state.test.ts:63.
