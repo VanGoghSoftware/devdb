@@ -87,3 +87,14 @@ Findings:
 - P4: Compute config IDs are serialized without validation at packages/daemon/src/compute/spec.ts:26.
 - P4: pageserver_connection_info shape is not pinned by tests at packages/daemon/src/compute/spec.ts:28.
 - P4: SCRAM salt freshness and iteration binding lack targeted coverage at packages/daemon/src/compute/scram.ts:4.
+
+
+## 2026-07-02 21:11 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the supplied Task 11 source bundle, focused on ComputeManager, port allocation, temp-dir lifecycle, map hygiene, status/listener behavior, and recent tests; no tests were run.
+
+Findings:
+- P2: Branch lifecycle races can orphan or untrack compute processes.
+- P3: Setup failures after mkdtemp leak compute directories.
+- P3: Allocated ports are not reserved before compute_ctl binds them.
+- P4: ComputeManager launch contract has no unit coverage.
+- P4: One log listener can prevent later listeners from seeing a line.
