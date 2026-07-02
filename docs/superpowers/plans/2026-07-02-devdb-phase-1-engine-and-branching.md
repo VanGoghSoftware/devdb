@@ -896,7 +896,7 @@ git add -A && git commit -m "feat: sqlite state layer with repos and per-branch 
   - `start(): Promise<void>` (resolves when `readyNeedle` seen on stdout or stderr; rejects on timeout/exit)
   - `stop(timeoutMs?: number): Promise<void>` (SIGTERM, then SIGKILL after timeout; resolves on exit)
   - `state: "stopped"|"starting"|"running"|"failed"`, `pid: number | null`, `recentLines(n: number): string[]`
-  - `waitForLine(proc, needle, timeoutMs)` internal helper — oracle: neond `wait_for_output_timeout` (`src/mgmt/compute/mod.rs:245-252` usage)
+  - ~~`waitForLine` internal helper~~ **AMENDED (A10):** needle-watching is inlined in `start()` (per-stream readline watch, one shared readiness timeout) rather than a named helper — oracle: neond `wait_for_output_timeout` (`src/mgmt/compute/mod.rs:245-252`). Post-review the class also fences handlers by child identity, survives stop()-during-starting, evicts readline interfaces on exit, and swallows onLine observer errors (commit b1623d5).
 
 - [ ] **Step 1: Write the failing tests**
 
