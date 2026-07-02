@@ -1,4 +1,4 @@
-import { open } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { loadConfig } from "./config.js";
@@ -20,25 +20,62 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const state = openState(join(cfg.dataDir, "state.db"));
-  const engine = new EngineRuntime(cfg, state);
-  await engine.start();
+  try {
+    const state = openState(join(cfg.dataDir, "state.db"));
+    const engine = new EngineRuntime(cfg, state);
+    await engine.start();
 
-  const app = buildServer({ cfg, state, engine });
-  await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
+    const app = buildServer({ cfg, state, engine });
+    await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
-  let stopping = false;
-  const shutdown = async () => {
-    if (stopping) return;
-    stopping = true;
-    await app.close();
-    await engine.stop();
-    const { rm } = await import("node:fs/promises");
-    await rm(lockPath, { force: true });
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => void shutdown());
-  process.on("SIGINT", () => void shutdown());
+    let stopping = false;
+    const shutdown = async (signal: string) => {
+      if (stopping) {
+        console.error("second signal — forcing immediate exit");
+        process.exit(130);
+      }
+      stopping = true;
+
+      // Belt-and-suspenders: if any shutdown step hangs, don't leave the process running forever.
+      const hardExit = setTimeout(() => {
+        console.error("shutdown timed out — forcing exit");
+        process.exit(1);
+      }, 45_000);
+      hardExit.unref();
+
+      console.error(`received ${signal}, shutting down`);
+      let ok = true;
+
+      try {
+        await app.close();
+      } catch (e) {
+        ok = false;
+        console.error("error closing http server:", e);
+      }
+
+      try {
+        await engine.stop();
+      } catch (e) {
+        ok = false;
+        console.error("error stopping engine:", e);
+      }
+
+      try {
+        await rm(lockPath, { force: true });
+      } catch (e) {
+        ok = false;
+        console.error("error removing lockfile:", e);
+      }
+
+      process.exit(ok ? 0 : 1);
+    };
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    process.on("SIGINT", () => void shutdown("SIGINT"));
+  } catch (e) {
+    console.error("boot failed:", e);
+    await rm(lockPath, { force: true }).catch(() => {});
+    process.exit(1);
+  }
 }
 
 main().catch((e) => {

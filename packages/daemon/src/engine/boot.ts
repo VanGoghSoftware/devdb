@@ -45,35 +45,56 @@ export class EngineRuntime {
 
   // oracle: startup order src/daemon/mod.rs:182-232
   async start(): Promise<void> {
-    const dirs = engineDirs(this.cfg);
-    await Promise.all(Object.values(dirs).map((d) => mkdir(d, { recursive: true })));
+    try {
+      const dirs = engineDirs(this.cfg);
+      await Promise.all(Object.values(dirs).map((d) => mkdir(d, { recursive: true })));
 
-    await this.storconDb.init();
-    await this.storconDb.start();
+      await this.storconDb.init();
+      await this.storconDb.start();
 
-    await this.launch(brokerSpec(this.cfg));
-    await this.launch(storconSpec(this.cfg, this.storconDbUri));
+      await this.launch(brokerSpec(this.cfg));
+      await this.launch(storconSpec(this.cfg, this.storconDbUri));
 
-    await this.launch(safekeeperSpec(this.cfg));
-    await this.registerSafekeeper();
+      await this.launch(safekeeperSpec(this.cfg));
+      await this.registerSafekeeper();
 
-    await writeFile(join(dirs.pageserverDir, "identity.toml"), pageserverIdentityToml());
-    await writeFile(join(dirs.pageserverDir, "pageserver.toml"), pageserverToml(this.cfg));
-    await writeFile(join(dirs.pageserverDir, "metadata.json"), pageserverMetadataJson(this.cfg));
-    await this.launch(pageserverSpec(this.cfg));
+      await writeFile(join(dirs.pageserverDir, "identity.toml"), pageserverIdentityToml());
+      await writeFile(join(dirs.pageserverDir, "pageserver.toml"), pageserverToml(this.cfg));
+      await writeFile(join(dirs.pageserverDir, "metadata.json"), pageserverMetadataJson(this.cfg));
+      await this.launch(pageserverSpec(this.cfg));
+    } catch (e) {
+      // Partial boot: stop() only tears down what actually started (ManagedProcess.stop()
+      // no-ops on a null child; EmbeddedPostgres.stop() optional-chains), so it's safe to
+      // call unconditionally here in reverse startup order.
+      await this.stop().catch((stopErr) => {
+        console.error("cleanup after failed boot also failed:", stopErr);
+      });
+      throw e;
+    }
   }
 
   // oracle: src/daemon/mod.rs:247-281 (no bearer — trust mode)
   private async registerSafekeeper(): Promise<void> {
     const url = `http://127.0.0.1:${this.cfg.engine.storconPort}/control/v1/safekeeper/1`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(safekeeperRegistrationBody(this.cfg, new Date().toISOString())),
-    });
-    if (!res.ok) {
-      throw new Error(`safekeeper registration failed: ${res.status} ${await res.text()}`);
+    const body = JSON.stringify(safekeeperRegistrationBody(this.cfg, new Date().toISOString()));
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (res.ok) return;
+        lastError = new Error(`safekeeper registration failed: ${res.status} ${await res.text()}`);
+        if (res.status >= 400 && res.status < 500) break; // non-transient
+      } catch (e) {
+        lastError = e;
+      }
+      await new Promise((r) => setTimeout(r, 500 * attempt));
     }
+    throw new Error(`safekeeper registration at ${url} failed after retries: ${String(lastError)}`);
   }
 
   // oracle: shutdown order src/daemon/mod.rs:235-244

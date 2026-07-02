@@ -14,5 +14,8 @@ describe("boot", () => {
     for (const name of ["storcon_db", "storage_broker", "storage_controller", "safekeeper", "pageserver"]) {
       expect(body.engine[name].state, name).toBe("running");
     }
+    for (const name of ["storage_broker", "storage_controller", "safekeeper", "pageserver"]) {
+      expect(body.engine[name].pid, name).not.toBeNull();
+    }
   });
 });
