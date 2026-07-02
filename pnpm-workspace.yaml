@@ -5,6 +5,13 @@ packages:
 allowBuilds:
   better-sqlite3: true
   esbuild: false
+  # testcontainers -> dockerode optional deps; only exercised for remote Docker-over-SSH
+  # (cpu-features/ssh2) or a version-scheme postinstall lint (protobufjs) — neither applies
+  # here (local Unix-socket Docker only). Declining their install scripts to keep the image's
+  # native-compile surface minimal.
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
 
 # Supply-chain policy: dependencies must be >=24h old at resolution time
 minimumReleaseAge: 1440

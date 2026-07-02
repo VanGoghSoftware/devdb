@@ -17,6 +17,7 @@ RUN corepack enable && mkdir -p /data /app && chown -R node:node /data /app
 WORKDIR /app
 COPY --chown=node:node package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json ./
 COPY --chown=node:node packages ./packages
+COPY --chown=node:node tests/integration/package.json ./tests/integration/package.json
 USER node
 RUN pnpm install --frozen-lockfile && pnpm -r build
 COPY --chown=node:node docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
