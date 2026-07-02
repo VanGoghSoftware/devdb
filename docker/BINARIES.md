@@ -136,3 +136,10 @@ followed by `pnpm -r build` (both packages/shared and packages/daemon build
 via `tsc` with no errors); the lockfile's supply-chain policy check
 (`minimumReleaseAge: 1440`) passes inside the image build (`Lockfile passes
 supply-chain policies (229 entries)`).
+
+## Platform caveat
+
+This inventory was verified on linux/arm64 (Docker Desktop, macOS host). The pinned
+digest is a multi-arch index; a build on another platform selects that platform's
+manifest, so re-run `verify-binaries.sh` there and re-record the inventory before
+trusting SUPPORTED_PG_VERSIONS on that platform. (Review-broker finding, 2026-07-02.)

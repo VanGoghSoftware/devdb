@@ -13,12 +13,13 @@ ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
     DEVDB_DATA_DIR=/data \
     DEVDB_HTTP_PORT=4400 \
     DEVDB_PORT_RANGE=54300-54339
-RUN corepack enable && mkdir -p /data /app && chown -R node:node /data /app /usr/local/share/neon
+RUN corepack enable && mkdir -p /data /app && chown -R node:node /data /app
 WORKDIR /app
 COPY --chown=node:node package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json ./
 COPY --chown=node:node packages ./packages
 USER node
 RUN pnpm install --frozen-lockfile && pnpm -r build
 COPY --chown=node:node docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
+RUN bash /usr/local/bin/verify-binaries.sh
 EXPOSE 4400 54300-54339
 CMD ["node", "packages/daemon/dist/index.js"]
