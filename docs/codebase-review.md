@@ -76,3 +76,14 @@ Findings: 6 new findings. Highest risk is startup failure cleanup: boot can leav
 Scope: whole-surface code scan of the attached source bundle; no tests were run.
 
 Findings: 5 new findings. The main implementation risk is malformed 2xx JSON bypassing EngineApiError. The remaining findings are actionable coverage gaps around error body assertions, status allowlists, method coverage, and real engine parity, plus a low-severity ID/path validation risk.
+
+
+## 2026-07-02 21:00 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of Task 10 compute config generation using the supplied bundle; no tests were run.
+
+Findings:
+- P3: IPv6 cloud_admin trust rule is broader than loopback at packages/daemon/src/compute/pgconf.ts:36.
+- P3: hba_file is emitted without PostgreSQL config quoting at packages/daemon/src/compute/pgconf.ts:27.
+- P4: Compute config IDs are serialized without validation at packages/daemon/src/compute/spec.ts:26.
+- P4: pageserver_connection_info shape is not pinned by tests at packages/daemon/src/compute/spec.ts:28.
+- P4: SCRAM salt freshness and iteration binding lack targeted coverage at packages/daemon/src/compute/scram.ts:4.
