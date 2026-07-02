@@ -1086,6 +1086,8 @@ git add -A && git commit -m "feat: managed process supervisor with readiness nee
 
 ### Task 6: Embedded Postgres for the storage controller
 
+> **AMENDED (A11, post-review):** beyond the block below — `connectionUri()` percent-encodes the password; the pwfile lives in a private `mkdtemp` dir written with `wx`; `start()` refuses while a prior process is starting/running; `init()` dedupes concurrent calls via an in-flight promise and clears a PG_VERSION-less (interrupted-init) data dir before running initdb. See commit 50ea41c. Cross-task note: T13's `connectionString` builder must also percent-encode the branch password.
+
 **Files:**
 - Create: `packages/daemon/src/engine/embedded-postgres.ts`
 - Test: `packages/daemon/test/embedded-postgres.test.ts` (unit, mocked spawn paths) — real behavior covered in Task 8's integration test.
