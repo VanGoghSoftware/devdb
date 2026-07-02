@@ -1,0 +1,13 @@
+services:
+  devdb:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    image: devdb:dev
+    init: true
+    ports:
+      - "4400:4400"
+      - "54300-54339:54300-54339"
+    volumes:
+      - devdb-data:/data
+    stop_grace_period: 60s
+volumes:
+  devdb-data:
