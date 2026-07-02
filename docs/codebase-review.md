@@ -117,3 +117,10 @@ Findings: P2 branch create lacks compensation for local insert failure after tim
 Scope: whole-surface code scan of the supplied endpoint lifecycle, REST route, compute config, and integration helper changes. No tests were run.
 
 Found six credible issues at or above P4, mostly around queue semantics, failure-path state consistency, and coverage gaps in live endpoint behavior.
+
+
+## 2026-07-03 00:36 CEST - Model-backed whole-surface scan
+
+Scope: whole-surface code scan over TimeTravelService, endpoint locked API, compute manager, HTTP time-travel routes, and time-travel tests; no tests were run.
+
+Findings: 7 new findings. The highest-risk areas are reset/create serialization, non-atomic restore/reset failure paths between engine and DB state, and compute stop cleanup when orphaned postgres reaping is incomplete.
