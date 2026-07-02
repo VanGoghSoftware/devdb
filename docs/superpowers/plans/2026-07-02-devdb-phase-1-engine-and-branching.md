@@ -529,6 +529,8 @@ git add -A && git commit -m "feat: shared DTO types and daemon env config"
 
 ### Task 4: SQLite state layer (schema, repos, per-branch mutation queue)
 
+> **AMENDED (A9, post-review):** beyond the blocks below — branches carries `UNIQUE(project_id, id)` + a composite FK enforcing same-project parentage; `restoreSwap` scopes reparenting by `project_id` and NULLs the archived row's `sticky_port`; `BranchQueue` evicts settled tails and exposes `pendingCount()`; repo `delete` methods document the FK-throw contract (services own guard ordering). See commit a76db9d.
+
 **Files:**
 - Create: `packages/daemon/src/state/db.ts`, `packages/daemon/src/state/schema.ts`, `packages/daemon/src/state/repos.ts`, `packages/daemon/src/state/queue.ts`
 - Test: `packages/daemon/test/state.test.ts`
