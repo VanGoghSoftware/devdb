@@ -6,13 +6,14 @@ import type { StateDb } from "../state/db.js";
 import type { EngineRuntime } from "../engine/boot.js";
 import type { ProjectsService } from "../services/projects.js";
 import type { BranchesService } from "../services/branches.js";
+import type { EndpointsService } from "../services/endpoints.js";
 import { DevdbError } from "../services/errors.js";
 
 export interface Deps {
   cfg: DevdbConfig;
   state: StateDb;
   engine: EngineRuntime;
-  services: { projects: ProjectsService; branches: BranchesService };
+  services: { projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService };
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
@@ -84,6 +85,20 @@ export function buildServer(deps: Deps): FastifyInstance {
     const { id } = req.params as { id: string };
     await deps.services.branches.delete(id);
     return reply.status(204).send();
+  });
+
+  app.post("/api/branches/:id/endpoint/start", async (req) => {
+    const { id } = req.params as { id: string };
+    return deps.services.endpoints.start(id);
+  });
+  app.post("/api/branches/:id/endpoint/stop", async (req) => {
+    const { id } = req.params as { id: string };
+    return deps.services.endpoints.stop(id);
+  });
+  app.get("/api/branches/:id/endpoint", async (req) => {
+    const { id } = req.params as { id: string };
+    const detail = await deps.services.branches.detail(deps.services.branches.byIdOr404(id));
+    return { status: detail.endpointStatus, port: detail.port };
   });
 
   return app;

@@ -43,7 +43,9 @@ describe("postgresql.conf", () => {
     const conf = computePostgresqlConf({ port: 54321, hbaPath: "/x/pg_hba.conf" });
     for (const line of [
       "shared_buffers=128MB", "fsync=off", "wal_level=logical",
-      "listen_addresses=0.0.0.0", "port=54321", "shared_preload_libraries=neon",
+      // CONFIRMED live (Task 14): unquoted "0.0.0.0" is a real postgresql.conf syntax error
+      // (Postgres's GUC lexer tokenizes on the dots) — quoted like the other string GUCs below.
+      "listen_addresses='0.0.0.0'", "port=54321", "shared_preload_libraries=neon",
       "synchronous_standby_names=walproposer", "neon.safekeepers=localhost:5454",
       "password_encryption=scram-sha-256", "hba_file='/x/pg_hba.conf'",
     ]) expect(conf, line).toContain(line);
@@ -83,7 +85,10 @@ describe("compute config json", () => {
     expect(spec.endpoint_id).toBe(`compute-${"b".repeat(32)}`);
     expect(spec.suspend_timeout_seconds).toBe(-1);
     expect(spec.storage_auth_token).toBeUndefined();
-    expect(doc.compute_ctl_config).toEqual({});
+    // CONFIRMED live (Task 14): compute_ctl's deserializer requires `jwks` present as a single
+    // jsonwebtoken::jwk::JwkSet object (`{ keys: [...] }`), not an array of them — see spec.ts's
+    // comment for the two live errors that pinned this shape down.
+    expect(doc.compute_ctl_config).toEqual({ jwks: { keys: [] } });
   });
   it("rejects malformed ids in compute config", () => {
     expect(() => computeConfigJson({

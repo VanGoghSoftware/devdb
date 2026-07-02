@@ -5,17 +5,45 @@ import type { Devdb } from "./container.js";
 // connect()/api() so later integration tests (endpoints, PITR, etc.) import the same
 // implementation instead of re-declaring it per test file.
 
+// CONFIRMED live (Task 14): a real race in compute_ctl's own startup sequence — POST
+// .../endpoint/start returns 200 (compute_ctl matched the "listening on IPv4 address" ready
+// needle, EndpointsService.start() correctly reports "running") slightly *before* SCRAM auth
+// against the configured role is actually usable. Reproduced in isolation outside any test
+// framework: connecting within ~10ms of a 200 response reliably fails with "password
+// authentication failed for user postgres"; a bare retry ~100ms later against the exact same
+// socket succeeds. This is not a config-generation bug (manually verified: psql from inside the
+// container and a bare `pg` client from the host both authenticate correctly against a
+// freshly-started endpoint once given a moment) — it's a brief window between "postmaster is
+// listening" and "role/password reconciliation has landed". A bounded retry-on-auth-failure is
+// the same discipline any real client (including Phase 2's MCP layer) will need against the
+// actual engine, so it belongs here rather than masked by a manager.ts/spec.ts launch-arg change.
+async function connectWithRetry(config: pg.ClientConfig, attempts = 20, delayMs = 150): Promise<pg.Client> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    const client = new pg.Client(config);
+    try {
+      await client.connect();
+      return client;
+    } catch (e) {
+      lastErr = e;
+      await client.end().catch(() => {});
+      const message = e instanceof Error ? e.message : String(e);
+      if (!message.includes("password authentication failed")) throw e; // a different failure must surface immediately
+      await new Promise((res) => setTimeout(res, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
 export async function connect(dev: Devdb, connectionString: string): Promise<pg.Client> {
   const url = new URL(connectionString);
-  const client = new pg.Client({
+  return connectWithRetry({
     host: "localhost",
     port: dev.mappedPort(Number(url.port)),
     user: url.username,
     password: decodeURIComponent(url.password),
     database: url.pathname.slice(1),
   });
-  await client.connect();
-  return client;
 }
 
 export async function api<T>(dev: Devdb, method: string, path: string, body?: unknown): Promise<T> {

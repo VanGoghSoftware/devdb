@@ -11,6 +11,7 @@ import { SafekeeperClient } from "./engine/safekeeper-client.js";
 import { ComputeManager } from "./compute/manager.js";
 import { ProjectsService } from "./services/projects.js";
 import { BranchesService } from "./services/branches.js";
+import { EndpointsService } from "./services/endpoints.js";
 import { BranchQueue } from "./state/queue.js";
 
 async function main(): Promise<void> {
@@ -45,8 +46,9 @@ async function main(): Promise<void> {
     const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes });
     const queue = new BranchQueue();
     const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches });
 
-    const app = buildServer({ cfg, state, engine, services: { projects, branches } });
+    const app = buildServer({ cfg, state, engine, services: { projects, branches, endpoints } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —

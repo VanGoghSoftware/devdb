@@ -3,6 +3,7 @@ import { buildServer } from "../src/http/api.js";
 import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
 import type { BranchesService } from "../src/services/branches.js";
+import type { EndpointsService } from "../src/services/endpoints.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
@@ -31,6 +32,14 @@ function fakeBranches(): BranchesService {
   } as unknown as BranchesService;
 }
 
+// Same rationale as fakeProjects()/fakeBranches() — Deps.services.endpoints is typed against
+// the concrete EndpointsService class.
+function fakeEndpoints(): EndpointsService {
+  return {
+    start: vi.fn(), stop: vi.fn(), ensureRunning: vi.fn(),
+  } as unknown as EndpointsService;
+}
+
 function testCfg() {
   return loadConfig({
     DEVDB_DATA_DIR: "/tmp/devdb-api-test-only",
@@ -45,7 +54,7 @@ describe("buildServer error handling", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches: fakeBranches() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/projects", payload: { bogus: true } });
@@ -70,7 +79,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
     });
 
     const res = await app.inject({
@@ -93,7 +102,10 @@ describe("buildServer branch routes", () => {
     const branches = fakeBranches();
     const rows = [{ id: "branch-1" }, { id: "branch-2" }];
     vi.mocked(branches.list).mockResolvedValue(rows as unknown as Awaited<ReturnType<BranchesService["list"]>>);
-    const app = buildServer({ cfg, state, engine: fakeEngine(), services: { projects, branches } });
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects, branches, endpoints: fakeEndpoints() },
+    });
 
     const res = await app.inject({ method: "GET", url: "/api/projects/project-1/branches" });
 
@@ -111,7 +123,7 @@ describe("buildServer branch routes", () => {
     });
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/does-not-exist" });
@@ -127,7 +139,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
     });
 
     const okRes = await app.inject({ method: "DELETE", url: "/api/branches/branch-1" });
@@ -140,5 +152,80 @@ describe("buildServer branch routes", () => {
     expect(blockedRes.statusCode).toBe(409);
     expect(blockedRes.json().error).toMatch(/dev-child/);
     expect(blockedRes.json().error).toMatch(/dev-child-2/);
+  });
+});
+
+describe("buildServer endpoint routes", () => {
+  it("POST /api/branches/:id/endpoint/start — 200 with the service's BranchDetail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const endpoints = fakeEndpoints();
+    const fakeDetail = { id: "branch-1", endpointStatus: "running", port: 54300, connectionString: "postgresql://..." };
+    vi.mocked(endpoints.start).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["start"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
+
+    expect(res.statusCode).toBe(200);
+    expect(endpoints.start).toHaveBeenCalledWith("branch-1");
+    expect(res.json()).toEqual(fakeDetail);
+  });
+
+  it("POST /api/branches/:id/endpoint/start — 409 when the service maps PortExhaustedError", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const endpoints = fakeEndpoints();
+    vi.mocked(endpoints.start).mockRejectedValue(
+      new DevdbError(409, "no free endpoint port in range — running endpoints: main, dev. Stop one or widen DEVDB_PORT_RANGE."),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/DEVDB_PORT_RANGE/);
+  });
+
+  it("POST /api/branches/:id/endpoint/stop — 200 with the service's BranchDetail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const endpoints = fakeEndpoints();
+    const fakeDetail = { id: "branch-1", endpointStatus: "stopped", port: null, connectionString: null };
+    vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["stop"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/stop" });
+
+    expect(res.statusCode).toBe(200);
+    expect(endpoints.stop).toHaveBeenCalledWith("branch-1");
+    expect(res.json()).toEqual(fakeDetail);
+  });
+
+  it("GET /api/branches/:id/endpoint — returns { status, port } from branches.detail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const branches = fakeBranches();
+    vi.mocked(branches.byIdOr404).mockReturnValue({ id: "branch-1" } as unknown as ReturnType<BranchesService["byIdOr404"]>);
+    vi.mocked(branches.detail).mockResolvedValue(
+      { endpointStatus: "running", port: 54300 } as unknown as Awaited<ReturnType<BranchesService["detail"]>>,
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/endpoint" });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: "running", port: 54300 });
   });
 });

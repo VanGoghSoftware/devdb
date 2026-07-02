@@ -14,7 +14,11 @@ export function computePostgresqlConf(a: { port: number; hbaPath: string }): str
     ["fsync", "off"], ["synchronous_commit", "on"],
     ["wal_level", "logical"], ["wal_sender_timeout", "60s"], ["wal_keep_size", "0"],
     ["restart_after_crash", "off"],
-    ["listen_addresses", "0.0.0.0"], ["port", String(a.port)],
+    // CONFIRMED live (Task 14): unquoted "0.0.0.0" produced a real postgresql.conf parse
+    // failure (`syntax error in file "...postgresql.conf" line 18, near token ".0"`) —
+    // Postgres's GUC lexer tokenizes an unquoted value containing dots instead of treating it
+    // as one string, exactly like log_line_prefix/hba_file below already need pgQuote().
+    ["listen_addresses", pgQuote("0.0.0.0")], ["port", String(a.port)],
     ["shared_preload_libraries", "neon"],
     ["jit", "off"],
     ["statement_timeout", "0"], ["idle_in_transaction_session_timeout", "600000"],
