@@ -2059,7 +2059,7 @@ git add -A && git commit -m "feat: typed engine http clients (storcon, pageserve
 
 ### Task 10: Compute config generation (SCRAM, postgresql.conf, pg_hba, ComputeSpec JSON)
 
-> **AMENDED (A15, post-review):** beyond the blocks below — pg_hba's IPv6 loopback row is `::1/128` (the oracle's `::1/32` is an upstream bug: far broader than loopback, worth reporting to neond); `hba_file` is GUC-quoted via `pgQuote`; `computeConfigJson` validates both ids with `assertEngineId`; tests pin `pageserver_connection_info` exactly and cover SCRAM salt freshness + custom iterations. T11 live-run watchpoint: `format_version` serializes as JSON `1` (JS int/float) — expected fine for the Rust deserializer, confirm. See commit 9a17afd.
+> **AMENDED (A15, post-review):** beyond the blocks below — pg_hba's IPv6 loopback row is `::1/128` (the oracle's `::1/32` is an upstream bug: far broader than loopback — documented internally in docs/notes/2026-07-02-neond-pg-hba-ipv6-loopback.md; do not report upstream, per policy); `hba_file` is GUC-quoted via `pgQuote`; `computeConfigJson` validates both ids with `assertEngineId`; tests pin `pageserver_connection_info` exactly and cover SCRAM salt freshness + custom iterations. T11 live-run watchpoint: `format_version` serializes as JSON `1` (JS int/float) — expected fine for the Rust deserializer, confirm. See commit 9a17afd.
 
 **Files:**
 - Create: `packages/daemon/src/compute/scram.ts`, `packages/daemon/src/compute/pgconf.ts`, `packages/daemon/src/compute/spec.ts`, `packages/daemon/src/compute/password.ts`
