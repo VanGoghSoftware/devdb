@@ -152,44 +152,83 @@ export class ComputeManager {
   // caller of stop() can retry around: this method deletes the map entry in its `finally` before
   // rm() runs, so a caller-side retry finds `entry` gone and silently no-ops without ever
   // attempting cleanup again — the fix has to live here.
+  // Review fix: the original version `return`ed from inside the first matching PID's poll loop
+  // on exit — which exits the WHOLE function, not just that PID's handling. Given `mkdtemp`'s
+  // uniqueness guarantee, a second match is not expected in practice, but "not expected" is not
+  // "impossible" (a future change to the match string, or two computes sharing a stale dir on a
+  // bug elsewhere, would silently under-reap here with the old early-return) — so every matching
+  // PID is now collected up front and reaped to completion, and a second-or-later match is a loud
+  // invariant violation (logged, not silently tolerated) rather than a quiet no-op.
   private async reapOrphanedPostgres(dir: string): Promise<void> {
     const pgDataDir = join(dir, "pg_data");
-    let pids: string[];
+    let candidatePids: string[];
     try {
-      pids = (await readdir("/proc")).filter((p) => /^\d+$/.test(p));
+      candidatePids = (await readdir("/proc")).filter((p) => /^\d+$/.test(p));
     } catch {
       return; // /proc unavailable (non-Linux dev run) — nothing we can do; rm() below still tries.
     }
-    for (const pid of pids) {
+    const matches: string[] = [];
+    for (const pid of candidatePids) {
       let cmdline: string;
       try {
         cmdline = (await readFile(`/proc/${pid}/cmdline`, "utf8")).replaceAll("\0", " ");
       } catch {
         continue; // process exited between readdir and readFile, or we lack permission — skip it.
       }
-      if (!cmdline.includes(pgDataDir)) continue;
-      try {
-        process.kill(Number(pid), "SIGTERM");
-      } catch {
-        continue; // already gone
-      }
-      // Bounded poll for the orphan to actually exit — kill(pid, 0) throws ESRCH once it has.
-      for (let i = 0; i < 50; i++) {
-        try {
-          process.kill(Number(pid), 0);
-        } catch {
-          return; // exited
-        }
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      // Still alive after 5s of SIGTERM — escalate, matching ManagedProcess.stop()'s own
-      // SIGTERM-then-SIGKILL discipline for the immediate child.
-      try {
-        process.kill(Number(pid), "SIGKILL");
-      } catch {
-        // already gone
-      }
+      if (cmdline.includes(pgDataDir)) matches.push(pid);
     }
+    if (matches.length > 1) {
+      // mkdtemp-generated compute dirs are expected to be unique — more than one process
+      // referencing the SAME pg_data path is an invariant we don't understand yet, not a routine
+      // occurrence. Still reap all of them (better an over-eager kill than a leaked writer), but
+      // this must be loud: silently reaping N>1 would hide whatever produced the collision.
+      console.error(
+        `reapOrphanedPostgres: invariant violation — ${matches.length} processes reference ` +
+        `${pgDataDir} (expected at most 1, mkdtemp paths should be unique): pids ${matches.join(", ")}`,
+      );
+    }
+    await Promise.all(matches.map((pid) => this.reapOnePid(pid)));
+  }
+
+  // Reaps a single orphaned postgres PID to completion: SIGTERM, bounded poll for exit, SIGKILL
+  // escalation if still alive, then a short bounded poll for the SIGKILL to actually land before
+  // returning — a caller proceeding straight to rm() immediately after SIGKILL is issued (but
+  // before the kernel has reaped the process) can still race the same ENOTEMPTY this whole
+  // mechanism exists to prevent, just in a narrower window.
+  private async reapOnePid(pid: string): Promise<void> {
+    try {
+      process.kill(Number(pid), "SIGTERM");
+    } catch {
+      return; // already gone
+    }
+    // Bounded poll for the orphan to actually exit — kill(pid, 0) throws ESRCH once it has.
+    if (await this.pollForExit(pid, 50, 100)) return; // exited within 5s of SIGTERM
+    // Still alive after 5s of SIGTERM — escalate, matching ManagedProcess.stop()'s own
+    // SIGTERM-then-SIGKILL discipline for the immediate child.
+    try {
+      process.kill(Number(pid), "SIGKILL");
+    } catch {
+      return; // already gone
+    }
+    // Give SIGKILL a brief window to actually land before returning to the caller (which
+    // immediately attempts rm() on the directory this process still has open).
+    if (!(await this.pollForExit(pid, 10, 100))) {
+      console.error(`reapOrphanedPostgres: pid ${pid} still alive ~1s after SIGKILL — proceeding anyway`);
+    }
+  }
+
+  // Polls kill(pid, 0) up to `attempts` times, `delayMs` apart. Returns true as soon as the
+  // process is observed gone (ESRCH), false if it's still alive after the full budget.
+  private async pollForExit(pid: string, attempts: number, delayMs: number): Promise<boolean> {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        process.kill(Number(pid), 0);
+      } catch {
+        return true; // exited
+      }
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    return false;
   }
 
   async stop(branchId: string): Promise<void> {
@@ -202,7 +241,32 @@ export class ComputeManager {
       if (this.computes.get(branchId) === entry) this.computes.delete(branchId);
       if (entry.dir) {
         await this.reapOrphanedPostgres(entry.dir);
-        await rm(entry.dir, { recursive: true, force: true });
+        try {
+          await rm(entry.dir, { recursive: true, force: true });
+        } catch (e) {
+          // Review fix: a single retry of reap+rm before giving up. An ENOTEMPTY here means some
+          // process was still writing to entry.dir despite the reap pass above — most likely a
+          // race where the orphan hadn't yet released its file handles at the moment rm() ran, or
+          // (rarer) a straggler that appeared after reapOrphanedPostgres's /proc scan completed.
+          // One retry is cheap insurance against exactly that race. Any OTHER error here (not
+          // ENOTEMPTY) is unexpected but handled the same way — logged, not retried, not
+          // rethrown — because this whole block runs inside stop()'s outer `finally`: a `throw`
+          // here would propagate out of that finally and skip the map/port release below it,
+          // which must settle unconditionally regardless of whether directory cleanup succeeded
+          // (same "loud on failure, never swallowed silently, never blocks the caller" discipline
+          // as the compensation catches elsewhere in this codebase, e.g. timetravel.ts/branches.ts).
+          if ((e as { code?: string }).code !== "ENOTEMPTY") {
+            console.error(`stop(): rm() failed unexpectedly for ${entry.dir} — giving up (not retried):`, e);
+          } else {
+            console.error(`stop(): rm() hit ENOTEMPTY for ${entry.dir} after reaping — retrying reap+rm once:`, e);
+            await this.reapOrphanedPostgres(entry.dir);
+            try {
+              await rm(entry.dir, { recursive: true, force: true });
+            } catch (e2) {
+              console.error(`stop(): retry of reap+rm also failed for ${entry.dir} — giving up:`, e2);
+            }
+          }
+        }
       }
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
       if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);

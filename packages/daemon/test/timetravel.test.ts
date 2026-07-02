@@ -5,6 +5,7 @@ import { ProjectsService } from "../src/services/projects.js";
 import { BranchesService } from "../src/services/branches.js";
 import { EndpointsService, type EndpointsLockedApi } from "../src/services/endpoints.js";
 import { TimeTravelService } from "../src/services/timetravel.js";
+import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
 
@@ -209,5 +210,87 @@ describe("TimeTravelService", () => {
     expect(out2.name).toContain("main_pitr_archived_"); // p2 ran second, against p1's archived leftover
     expect(state.branches.byId(mainBranch.id)!.name).toContain("main_pitr_archived_");
     expect(queue.pendingCount()).toBe(0);
+  });
+
+  // Review fix 3: oracle (neond branch.rs:689-701) classifies engine LSN-range failures at
+  // create-at-LSN time into a client-actionable 400, not a generic passthrough of whatever status
+  // the engine returned. restoreInPlace always creates at an LSN (its own-timeline branch point),
+  // so it's the most direct path to exercise this without also standing up a second scenario for
+  // branchAtTimestamp (which shares the exact same classifyLsnRangeError() helper).
+  it("restoreInPlace maps an engine LSN-out-of-range failure to a 400 carrying the engine's text", async () => {
+    const { f, mainBranch, tt } = await seeded();
+    vi.mocked(f.pageserver.timelineCreate).mockRejectedValueOnce(
+      new EngineApiError("timeline_create", 400, "requested LSN is out of range"),
+    );
+    await expect(tt.restoreInPlace(mainBranch.id, "2026-07-02T10:00:00Z")).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringContaining("requested LSN is out of range"),
+    });
+  });
+
+  // Review fix 4: a timestamp with no explicit offset is silently interpreted in the SERVER's
+  // local timezone by the Date constructor — a correctness trap for a PITR timestamp, not a
+  // style nit. Must be rejected before it ever reaches storcon.
+  it("lsnAtTimestamp rejects a timestamp with no explicit timezone", async () => {
+    const { mainBranch, tt } = await seeded();
+    await expect(tt.lsnAtTimestamp(mainBranch.id, "2026-07-02T10:00:00"))
+      .rejects.toMatchObject({ statusCode: 400, message: expect.stringMatching(/timezone/) });
+  });
+
+  // Review fix 1: resetToParent's children-exist check must run INSIDE the queued lane against
+  // lane-fresh state, not against a pre-queue snapshot taken before the caller even reached the
+  // front of the line. Proof: queue a job on dev.id's OWN lane that inserts a child of dev
+  // BEFORE resetToParent(dev.id) is even called — branches.create() for a child of dev queues
+  // under parent.id (i.e. dev.id, see BranchesService.create), the exact same lane key
+  // resetToParent(dev.id) uses, and both calls reach their respective queue.run(dev.id, ...)
+  // registration synchronously (no `await` precedes it in either call chain) — so the child-
+  // creating job is guaranteed to be queued first and to have committed its insert before
+  // reset's own queued body runs its (now lane-scoped) children check.
+  it("resetToParent's children check sees a child created after the call was queued but before its lane turn (TOCTOU)", async () => {
+    const { project, tt, branches, queue } = await seeded();
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+
+    const childPromise = branches.create({
+      projectId: project.id, name: "late-child", parentBranchId: dev.id,
+    });
+    const resetPromise = tt.resetToParent(dev.id);
+
+    await childPromise;
+    await expect(resetPromise).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("late-child"),
+    });
+    expect(queue.pendingCount()).toBe(0);
+  });
+
+  // Review fix 2: ANY failure after the endpoint was stopped — not just a failed detachAncestor —
+  // must trigger the full compensation: best-effort delete the new timeline on both engine
+  // components, restart the ORIGINAL branch's endpoint if it was running, rethrow. restoreSwap is
+  // the failure point never previously covered (only detachAncestor had a compensation path).
+  it("restoreInPlace compensates a restoreSwap failure: new timeline deleted on both engines, original endpoint restarted", async () => {
+    const { f, mainBranch, tt, state } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValue("running");
+    const startLocked = vi.fn(async () => ({}) as never);
+    const stopLocked = vi.fn(async () => ({}) as never);
+    const project2 = await new ProjectsService({ state, ...f }).create({ name: "swapfail" });
+    const queue = new BranchQueue();
+    const branches = new BranchesService({ state, queue, ...f });
+    const tt2 = new TimeTravelService({
+      state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
+    });
+
+    vi.spyOn(state.branches, "restoreSwap").mockImplementationOnce(() => {
+      throw new Error("swap boom");
+    });
+
+    await expect(tt2.restoreInPlace(project2.mainBranch.id, "2026-07-02T10:00:00Z")).rejects.toThrow(/swap boom/);
+
+    expect(f.pageserver.timelineDelete).toHaveBeenCalled();
+    expect(f.safekeeper.timelineDelete).toHaveBeenCalled();
+    // the swap never committed — branch.id is still the ORIGINAL, unchanged identity, so the
+    // restart must target that same id.
+    expect(stopLocked).toHaveBeenCalledWith(project2.mainBranch.id);
+    expect(startLocked).toHaveBeenCalledWith(project2.mainBranch.id);
+    void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
 });
