@@ -13,3 +13,14 @@ Findings:
 - P3: Workspace smoke test depends on generated shared dist output (package.json:8, packages/shared/package.json:5, packages/shared/package.json:7, .gitignore:3, packages/daemon/test/smoke.test.ts:2).
 - P4: Root integration test script has no root-owned Vitest binary (package.json:9, packages/daemon/package.json:26, .npmrc:1).
 - P4: Node 22+ requirement is not enforced by the scaffold (package.json:5, .npmrc:1).
+
+
+## 2026-07-02 18:20 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of Task 2 Dockerfile, compose wiring, digest-pinned binary inventory, frozen-lockfile install path, and verify script; no tests were run.
+
+Findings:
+- P3: verify-binaries.sh only executes pageserver, so most engine binaries can be executable-but-broken while the script reports success.
+- P3: pg_install inventory is informational only; missing or non-runnable Postgres versions still reach ALL BINARIES OK.
+- P3: BINARIES.md records linux/arm64 inventory, but Dockerfile/compose do not constrain or verify the build platform.
+- P3: the Docker image build does not run the binary verification gate.
+- P4: /usr/local/share/neon is chowned to the runtime user, making the pinned engine inventory mutable.
