@@ -95,7 +95,20 @@ describe("ComputeManager", () => {
       "--connstr", `postgresql://cloud_admin@localhost:${port}/postgres`,
       "--config", join(dir, "config.json"),
       "--external-http-port", String(opts.args[opts.args.indexOf("--external-http-port") + 1]),
+      "--internal-http-port", String(opts.args[opts.args.indexOf("--internal-http-port") + 1]),
     ]);
+
+    // Both HTTP ports are per-compute allocations from the 40000-40999 range and must be
+    // distinct: leaving --internal-http-port unset means every compute defaults to 3081 and
+    // concurrent computes silently collide on the internal server.
+    const externalHttpPort = Number(opts.args[opts.args.indexOf("--external-http-port") + 1]);
+    const internalHttpPort = Number(opts.args[opts.args.indexOf("--internal-http-port") + 1]);
+    for (const p of [externalHttpPort, internalHttpPort]) {
+      expect(p).toBeGreaterThanOrEqual(40000);
+      expect(p).toBeLessThanOrEqual(40999);
+    }
+    expect(internalHttpPort).not.toBe(externalHttpPort);
+    expect(internalHttpPort).not.toBe(port);
 
     expect(existsSync(join(dir, "config.json"))).toBe(true);
     expect(existsSync(join(dir, "pg_hba.conf"))).toBe(true);

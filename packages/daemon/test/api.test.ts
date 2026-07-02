@@ -4,6 +4,7 @@ import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
 import type { BranchesService } from "../src/services/branches.js";
 import type { EndpointsService } from "../src/services/endpoints.js";
+import type { TimeTravelService } from "../src/services/timetravel.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
@@ -40,6 +41,14 @@ function fakeEndpoints(): EndpointsService {
   } as unknown as EndpointsService;
 }
 
+// Same rationale as fakeProjects()/fakeBranches()/fakeEndpoints() — Deps.services.timetravel is
+// typed against the concrete TimeTravelService class.
+function fakeTimetravel(): TimeTravelService {
+  return {
+    lsnAtTimestamp: vi.fn(), branchAtTimestamp: vi.fn(), restoreInPlace: vi.fn(), resetToParent: vi.fn(),
+  } as unknown as TimeTravelService;
+}
+
 function testCfg() {
   return loadConfig({
     DEVDB_DATA_DIR: "/tmp/devdb-api-test-only",
@@ -54,7 +63,7 @@ describe("buildServer error handling", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/projects", payload: { bogus: true } });
@@ -79,7 +88,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({
@@ -104,7 +113,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.list).mockResolvedValue(rows as unknown as Awaited<ReturnType<BranchesService["list"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects, branches, endpoints: fakeEndpoints() },
+      services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/projects/project-1/branches" });
@@ -123,7 +132,7 @@ describe("buildServer branch routes", () => {
     });
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/does-not-exist" });
@@ -139,7 +148,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const okRes = await app.inject({ method: "DELETE", url: "/api/branches/branch-1" });
@@ -164,7 +173,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.start).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["start"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
@@ -183,7 +192,7 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
@@ -200,7 +209,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["stop"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/stop" });
@@ -220,12 +229,167 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/endpoint" });
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ status: "running", port: 54300 });
+  });
+});
+
+describe("buildServer time travel routes", () => {
+  it("GET /api/branches/:id/lsn — 200 with { lsn } on success", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const timetravel = fakeTimetravel();
+    vi.mocked(timetravel.lsnAtTimestamp).mockResolvedValue("0/1A2B3C");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn?timestamp=2026-07-02T10:00:00Z" });
+
+    expect(res.statusCode).toBe(200);
+    expect(timetravel.lsnAtTimestamp).toHaveBeenCalledWith("branch-1", "2026-07-02T10:00:00Z");
+    expect(res.json()).toEqual({ lsn: "0/1A2B3C" });
+  });
+
+  it("GET /api/branches/:id/lsn — 400 when the timestamp query parameter is missing", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn" });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/timestamp/);
+  });
+
+  it("GET /api/branches/:id/lsn — 400 when the service rejects a non-present kind", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const timetravel = fakeTimetravel();
+    vi.mocked(timetravel.lsnAtTimestamp).mockRejectedValue(
+      new DevdbError(400, `cannot resolve 2030-01-01T00:00:00Z on "main": that timestamp is ahead of this branch's history (kind=future)`),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn?timestamp=2030-01-01T00:00:00Z" });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/ahead of this branch/);
+  });
+
+  it("POST /api/branches/:id/restore { mode: in_place } — calls restoreInPlace and returns its BranchDetail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const timetravel = fakeTimetravel();
+    const fakeDetail = { id: "branch-2", name: "main", endpointStatus: "stopped", port: null, connectionString: null };
+    vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["restoreInPlace"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/branches/branch-1/restore",
+      payload: { mode: "in_place", to: "2026-07-02T10:00:00Z" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(timetravel.restoreInPlace).toHaveBeenCalledWith("branch-1", "2026-07-02T10:00:00Z");
+    expect(res.json()).toEqual(fakeDetail);
+  });
+
+  it("POST /api/branches/:id/restore { mode: new_branch } — calls branchAtTimestamp scoped to the source branch's project, then returns branches.detail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const branches = fakeBranches();
+    const timetravel = fakeTimetravel();
+    vi.mocked(branches.byIdOr404).mockReturnValue(
+      { id: "branch-1", projectId: "project-1" } as unknown as ReturnType<BranchesService["byIdOr404"]>,
+    );
+    const newRow = { id: "branch-3", name: "rescued" };
+    vi.mocked(timetravel.branchAtTimestamp).mockResolvedValue(newRow as unknown as Awaited<ReturnType<TimeTravelService["branchAtTimestamp"]>>);
+    const fakeDetail = { id: "branch-3", name: "rescued", endpointStatus: "stopped", port: null, connectionString: null };
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/branches/branch-1/restore",
+      payload: { mode: "new_branch", to: "2026-07-02T10:00:00Z", name: "rescued" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(timetravel.branchAtTimestamp).toHaveBeenCalledWith({
+      projectId: "project-1", sourceBranchId: "branch-1", name: "rescued",
+      isoTimestamp: "2026-07-02T10:00:00Z", createdBy: "api",
+    });
+    expect(branches.detail).toHaveBeenCalledWith(newRow);
+    expect(res.json()).toEqual(fakeDetail);
+  });
+
+  it("POST /api/branches/:id/restore — 400 when the body matches neither discriminated-union variant", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/branches/branch-1/restore",
+      payload: { mode: "new_branch", to: "2026-07-02T10:00:00Z" }, // missing required `name`
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/branches/:id/reset — 200 with the service's BranchDetail", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const timetravel = fakeTimetravel();
+    const fakeDetail = { id: "branch-4", name: "dev", endpointStatus: "stopped", port: null, connectionString: null };
+    vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["resetToParent"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/reset" });
+
+    expect(res.statusCode).toBe(200);
+    expect(timetravel.resetToParent).toHaveBeenCalledWith("branch-1");
+    expect(res.json()).toEqual(fakeDetail);
+  });
+
+  it("POST /api/branches/:id/reset — 409 when the service reports child branches block it", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const timetravel = fakeTimetravel();
+    vi.mocked(timetravel.resetToParent).mockRejectedValue(
+      new DevdbError(409, `branch "dev" has child branches: grandchild — delete them first`),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/reset" });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/grandchild/);
   });
 });

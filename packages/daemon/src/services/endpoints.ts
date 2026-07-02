@@ -4,12 +4,30 @@ import { DevdbError } from "./errors.js";
 import type { ProjectsDeps } from "./projects.js";
 import type { BranchesService, BranchDetail } from "./branches.js";
 
+// TimeTravelService's swap (see services/timetravel.ts) must stop/restart a branch's endpoint
+// from WITHIN its own queue.run(branchId, ...) lane. Calling the public, queued start()/stop()
+// from in there would be a second queue.run() for the SAME branchId nested inside the first —
+// BranchQueue.run() chains onto the existing tail promise, so the inner call can only proceed
+// once the outer one settles, but the outer one is awaiting the inner one: a deadlock. This
+// narrow interface names exactly the two unqueued internals a caller already holding the
+// branch's lane may call directly, so a consumer never needs a concrete EndpointsService import.
+export interface EndpointsLockedApi {
+  startLocked(branchId: string): Promise<BranchDetail>;
+  stopLocked(branchId: string): Promise<BranchDetail>;
+}
+
 export class EndpointsService {
   constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService }) {}
 
   // Queued body shared by start()/ensureRunning() — see the comment on ensureRunning() for why
   // the idempotency check below must run INSIDE the queue lane rather than before it.
-  private async startLocked(branchId: string): Promise<BranchDetail> {
+  //
+  // Public (not private) with a `Locked` suffix + this doc: MUST be called only from a caller
+  // that already holds this branchId's queue.run() lane (e.g. TimeTravelService's swap, which
+  // queues under the same branchId to serialize with concurrent start()/stop()/delete() calls
+  // for that branch). Calling it unqueued is a deliberate least-invasive alternative to plumbing
+  // a second "already locked" queue primitive — see the EndpointsLockedApi comment above.
+  async startLocked(branchId: string): Promise<BranchDetail> {
     const branch = this.deps.branches.byIdOr404(branchId);
     const project = this.deps.state.projects.byId(branch.projectId)!;
     if (this.deps.computes.statusOf(branch.id) === "running") {
@@ -64,22 +82,25 @@ export class EndpointsService {
     return this.deps.queue.run(branchId, () => this.startLocked(branchId));
   }
 
-  async stop(branchId: string): Promise<BranchDetail> {
-    return this.deps.queue.run(branchId, async () => {
-      const branch = this.deps.branches.byIdOr404(branchId);
-      this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
-      try {
-        await this.deps.computes.stop(branch.id);
-      } finally {
-        // manager.stop()'s own cleanup (map entry, ports, dir) is finally-guaranteed (A16), so by
-        // the time this runs — even if computes.stop() above threw — the compute is truly gone.
-        // "stopped" must land regardless, or a throwing proc-stop would strand the branch at
-        // "stopping" forever with no way to retry (stop() short-circuits on nothing, but every
-        // other transition reads this row as truth).
-        this.deps.state.branches.updateEndpoint(branch.id, { status: "stopped", port: null });
-      }
-      return this.deps.branches.detail(this.deps.branches.byIdOr404(branchId));
-    });
+  // Public for the same reason as startLocked() above — see EndpointsLockedApi's doc comment.
+  async stopLocked(branchId: string): Promise<BranchDetail> {
+    const branch = this.deps.branches.byIdOr404(branchId);
+    this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
+    try {
+      await this.deps.computes.stop(branch.id);
+    } finally {
+      // manager.stop()'s own cleanup (map entry, ports, dir) is finally-guaranteed (A16), so by
+      // the time this runs — even if computes.stop() above threw — the compute is truly gone.
+      // "stopped" must land regardless, or a throwing proc-stop would strand the branch at
+      // "stopping" forever with no way to retry (stop() short-circuits on nothing, but every
+      // other transition reads this row as truth).
+      this.deps.state.branches.updateEndpoint(branch.id, { status: "stopped", port: null });
+    }
+    return this.deps.branches.detail(this.deps.branches.byIdOr404(branchId));
+  }
+
+  stop(branchId: string): Promise<BranchDetail> {
+    return this.deps.queue.run(branchId, () => this.stopLocked(branchId));
   }
 
   // Runs the SAME queued body as start() rather than pre-checking statusOf() before queuing:
