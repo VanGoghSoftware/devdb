@@ -1750,6 +1750,8 @@ git add -A && git commit -m "feat: engine boot orchestration, status endpoint, c
 
 ### Task 9: Engine HTTP clients (storcon, pageserver, safekeeper)
 
+> **AMENDED (A14, post-review):** beyond the blocks below — client methods validate 32-hex engine ids via `assertEngineId` before any request; 2xx JSON parsing goes through `parseJson(operation, res)` so malformed engine responses surface as `EngineApiError` with context; the stub-server test suite resets shared state in `beforeEach` and pins every allowlist branch. See commit 191b271.
+
 **Files:**
 - Create: `packages/daemon/src/engine/http.ts`, `packages/daemon/src/engine/storcon-client.ts`, `packages/daemon/src/engine/pageserver-client.ts`, `packages/daemon/src/engine/safekeeper-client.ts`, `packages/daemon/src/engine/ids.ts`
 - Test: `packages/daemon/test/engine-clients.test.ts`
