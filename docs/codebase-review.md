@@ -64,3 +64,9 @@ Scope: whole-surface code scan of the supplied Task 6 source bundle; no tests we
 Scope: whole-surface code scan of the supplied Task 7 engine config generation bundle; no tests were run.
 
 Found 5 new findings: 1 P3 source correctness issue and 4 P4 coverage or drift-resistance issues. The highest-risk item is unescaped TOML path interpolation in `pageserverToml`; the remaining findings focus on path-contract enforcement, incomplete ProcessSpec arg coverage, readiness needle parity, and duplicated port sources of truth.
+
+
+## 2026-07-02 20:35 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the attached source bundle; no tests were run.
+
+Findings: 6 new findings. Highest risk is startup failure cleanup: boot can leave an exclusive lock and already-started engine processes behind. The shutdown path also needs escalation/error handling, safekeeper registration needs bounded retry/timeout behavior, lock cleanup should verify ownership, the testcontainers image tag should be isolated per run/worktree, and the boot test should prove live downstream engine behavior rather than only the daemon status self-report.
