@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS branches (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
-  parent_branch_id TEXT REFERENCES branches(id),
+  parent_branch_id TEXT,
   name TEXT NOT NULL,
   slug TEXT NOT NULL UNIQUE,
   timeline_id TEXT NOT NULL,
@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS branches (
   created_by TEXT NOT NULL DEFAULT 'api',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE(project_id, name)
+  UNIQUE(project_id, name),
+  UNIQUE(project_id, id),
+  FOREIGN KEY (project_id, parent_branch_id) REFERENCES branches(project_id, id)
 );
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,

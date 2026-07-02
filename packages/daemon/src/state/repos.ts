@@ -48,6 +48,7 @@ export class ProjectsRepo {
     const r = this.db.prepare("SELECT * FROM projects WHERE name = ?").get(name);
     return r ? projectRow(r as Record<string, unknown>) : null;
   }
+  // Throws SQLITE_CONSTRAINT (FOREIGN KEY) if referencing rows exist — services guard ordering (children first).
   delete(id: string): void {
     this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
   }
@@ -90,6 +91,7 @@ export class BranchesRepo {
   setStickyPort(id: string, port: number): void {
     this.db.prepare("UPDATE branches SET sticky_port = ? WHERE id = ?").run(port, id);
   }
+  // Throws SQLITE_CONSTRAINT (FOREIGN KEY) if referencing rows exist — services guard ordering (children first).
   delete(id: string): void {
     this.db.prepare("DELETE FROM branches WHERE id = ?").run(id);
   }
@@ -107,7 +109,7 @@ export class BranchesRepo {
     const tx = this.db.transaction(() => {
       const old = this.byId(a.oldBranchId);
       if (!old) throw new Error(`branch ${a.oldBranchId} not found`);
-      this.db.prepare("UPDATE branches SET name = ?, slug = ? WHERE id = ?")
+      this.db.prepare("UPDATE branches SET name = ?, slug = ?, sticky_port = NULL WHERE id = ?")
         .run(a.archiveName, a.archiveSlug, a.oldBranchId);
       this.db.prepare(
         `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, sticky_port, created_by)
@@ -117,8 +119,8 @@ export class BranchesRepo {
       if (a.reparentedTimelineIds.length > 0) {
         const placeholders = a.reparentedTimelineIds.map(() => "?").join(",");
         this.db.prepare(
-          `UPDATE branches SET parent_branch_id = ? WHERE timeline_id IN (${placeholders})`,
-        ).run(a.newBranchId, ...a.reparentedTimelineIds);
+          `UPDATE branches SET parent_branch_id = ? WHERE project_id = ? AND timeline_id IN (${placeholders})`,
+        ).run(a.newBranchId, old.projectId, ...a.reparentedTimelineIds);
       }
       this.db.prepare("UPDATE branches SET parent_branch_id = ? WHERE parent_branch_id = ? AND id != ?")
         .run(a.newBranchId, a.oldBranchId, a.newBranchId);
