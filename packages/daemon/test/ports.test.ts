@@ -27,4 +27,13 @@ describe("allocatePort", () => {
       await expect(allocatePort({ min: 56020, max: 56021 })).rejects.toBeInstanceOf(PortExhaustedError);
     } finally { blockers.forEach((s) => s.close()); }
   });
+  it("skips excluded candidates, including the preferred port, and returns the remaining free one", async () => {
+    const p = await allocatePort({ min: 56100, max: 56101 }, 56100, new Set([56100]));
+    expect(p).toBe(56101);
+  });
+  it("throws PortExhaustedError when every candidate in range is excluded", async () => {
+    await expect(
+      allocatePort({ min: 56100, max: 56101 }, undefined, new Set([56100, 56101])),
+    ).rejects.toBeInstanceOf(PortExhaustedError);
+  });
 });

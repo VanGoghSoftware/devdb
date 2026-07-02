@@ -19,12 +19,20 @@ function tryBind(port: number): Promise<boolean> {
 export async function allocatePort(
   range: { min: number; max: number },
   preferred?: number | null,
+  exclude?: ReadonlySet<number>,
 ): Promise<number> {
-  if (preferred && preferred >= range.min && preferred <= range.max && (await tryBind(preferred))) {
+  if (
+    preferred &&
+    preferred >= range.min &&
+    preferred <= range.max &&
+    !exclude?.has(preferred) &&
+    (await tryBind(preferred))
+  ) {
     return preferred;
   }
   for (let i = 0; i < 100; i++) {
     const port = range.min + randomInt(range.max - range.min + 1);
+    if (exclude?.has(port)) continue;
     if (await tryBind(port)) return port;
   }
   throw new PortExhaustedError();
