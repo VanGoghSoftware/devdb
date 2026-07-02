@@ -1442,6 +1442,8 @@ git add -A && git commit -m "feat: engine config and process spec generation (tr
 
 ### Task 8: Engine boot orchestration + status endpoint + first container integration test
 
+> **AMENDED (A13, post-review):** beyond the blocks below — `EngineRuntime.start()` reverse-stops started components and rethrows on partial-boot failure; `main()` releases the lockfile on failed boot; `shutdown()` logs-and-continues per step with a 45s unref'd hard-exit timer and second-signal force exit (130); safekeeper registration uses a 10s AbortSignal timeout with 3-attempt backoff (4xx non-retryable). See commit 372772f.
+
 **Files:**
 - Create: `packages/daemon/src/engine/boot.ts`, `packages/daemon/src/http/api.ts`
 - Modify: `packages/daemon/src/index.ts`
