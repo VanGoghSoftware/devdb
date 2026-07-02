@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { join } from "path";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
 import { openState } from "../src/state/db.js";
 import { BranchQueue } from "../src/state/queue.js";
 
@@ -156,5 +160,33 @@ describe("state", () => {
     await q.run("b1", async () => {});
     await new Promise((r) => setTimeout(r, 0));
     expect(q.pendingCount()).toBe(0);
+  });
+
+  it("adds missing columns to a pre-existing legacy database", () => {
+    const legacyPath = join(mkdtempSync(join(tmpdir(), "devdb-legacy-")), "state.db");
+    const legacy = new Database(legacyPath);
+    // legacy branches table WITHOUT endpoint_error
+    legacy.exec(`
+      CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, pg_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+      CREATE TABLE branches (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+        parent_branch_id TEXT, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, timeline_id TEXT NOT NULL,
+        password TEXT NOT NULL, sticky_port INTEGER, endpoint_status TEXT NOT NULL DEFAULT 'stopped',
+        import_status TEXT NOT NULL DEFAULT 'none', import_error TEXT, created_by TEXT NOT NULL DEFAULT 'api',
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        UNIQUE(project_id, name), UNIQUE(project_id, id),
+        FOREIGN KEY (project_id, parent_branch_id) REFERENCES branches(project_id, id));
+    `);
+    legacy.close();
+    const s = openState(legacyPath);
+    const p = s.projects.create({ id: "a".repeat(32), name: "legacy", pgVersion: 17 });
+    const b = s.branches.create({
+      id: crypto.randomUUID(), projectId: p.id, parentBranchId: null,
+      name: "main", slug: "legacy-main", timelineId: "1".repeat(32), password: "pw", createdBy: "api",
+    });
+    s.branches.updateEndpoint(b.id, { status: "failed", port: null, error: "legacy upgrade works" });
+    expect(s.branches.byId(b.id)!.endpointError).toBe("legacy upgrade works");
   });
 });
