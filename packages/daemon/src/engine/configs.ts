@@ -1,0 +1,113 @@
+import { join } from "node:path";
+import type { DevdbConfig } from "../config.js";
+
+export function engineDirs(cfg: DevdbConfig) {
+  return {
+    pageserverDir: join(cfg.dataDir, "pageserver"),
+    pageserverLayers: join(cfg.dataDir, "pageserver_1"),
+    safekeeperDir: join(cfg.dataDir, "safekeeper"),
+    storconDbDir: join(cfg.dataDir, "daemon_data", "storage_controller_pg_data"),
+    logsDir: join(cfg.dataDir, "logs"),
+    computesDir: join(cfg.dataDir, "computes"),
+  };
+}
+
+// oracle: src/daemon/pageserver/mod.rs:67-96 (auth keys omitted — trust mode, see Task 7 note)
+// Trust-mode deviation (spec decision #7 detail): neond enables NeonJWT auth on every engine
+// component. DevDB omits ALL of it: engine ports bind to 127.0.0.1 inside the container and
+// upstream neon_local runs this exact stack in trust mode by default.
+export function pageserverToml(cfg: DevdbConfig): string {
+  const layers = engineDirs(cfg).pageserverLayers;
+  return [
+    `availability_zone = "devdb-1"`,
+    `pg_distrib_dir = "${cfg.pgInstallDir}"`,
+    `broker_endpoint = "http://127.0.0.1:${cfg.engine.brokerPort}/"`,
+    `listen_pg_addr = "127.0.0.1:${cfg.engine.pageserverPgPort}"`,
+    `listen_http_addr = "127.0.0.1:${cfg.engine.pageserverHttpPort}"`,
+    `control_plane_api = "http://127.0.0.1:${cfg.engine.storconPort}/upcall/v1/"`,
+    ``,
+    `[remote_storage]`,
+    `local_path = "${layers}"`,
+    ``,
+    `[disk_usage_based_eviction]`,
+    `enabled = true`,
+    `max_usage_pct = 100`,
+    `min_avail_bytes = 2000000000`,
+    ``,
+  ].join("\n");
+}
+
+export function pageserverIdentityToml(): string {
+  return "id = 1\n"; // oracle: identity.toml content "id=1"
+}
+
+export function pageserverMetadataJson(): string {
+  // oracle: src/daemon/pageserver/mod.rs:125-130
+  return JSON.stringify({ host: "127.0.0.1", http_host: "127.0.0.1", http_port: 9898, port: 64000 });
+}
+
+export interface ProcessSpec {
+  name: string; bin: string; args: string[]; readyNeedle: string;
+}
+
+export function brokerSpec(cfg: DevdbConfig): ProcessSpec {
+  // oracle: src/daemon/mod.rs:67-75
+  return {
+    name: "storage_broker",
+    bin: join(cfg.neonBinDir, "storage_broker"),
+    args: ["-l", `127.0.0.1:${cfg.engine.brokerPort}`],
+    readyNeedle: "listening",
+  };
+}
+
+export function storconSpec(cfg: DevdbConfig, dbUri: string): ProcessSpec {
+  // oracle: src/daemon/mod.rs:83-109 (JWT args omitted — trust mode)
+  return {
+    name: "storage_controller",
+    bin: join(cfg.neonBinDir, "storage_controller"),
+    args: [
+      "-l", `127.0.0.1:${cfg.engine.storconPort}`,
+      "--database-url", dbUri,
+      "--dev",
+      "--timeline-safekeeper-count", "1",
+      "--timelines-onto-safekeepers",
+      "--control-plane-url", "http://127.0.0.1:4318",
+    ],
+    readyNeedle: `Serving HTTP on 127.0.0.1:${cfg.engine.storconPort}`,
+  };
+}
+
+export function safekeeperSpec(cfg: DevdbConfig): ProcessSpec {
+  // oracle: src/daemon/mod.rs:117-144 (auth key paths omitted — trust mode)
+  return {
+    name: "safekeeper",
+    bin: join(cfg.neonBinDir, "safekeeper"),
+    args: [
+      "-D", engineDirs(cfg).safekeeperDir,
+      "--id", "1",
+      "--broker-endpoint", `http://127.0.0.1:${cfg.engine.brokerPort}`,
+      "--listen-pg", `127.0.0.1:${cfg.engine.safekeeperPgPort}`,
+      "--listen-http", `127.0.0.1:${cfg.engine.safekeeperHttpPort}`,
+      "--availability-zone", "devdb-1",
+    ],
+    readyNeedle: "starting safekeeper WAL service on",
+  };
+}
+
+export function pageserverSpec(cfg: DevdbConfig): ProcessSpec {
+  // oracle: src/daemon/mod.rs:152-165 (NEON_AUTH_TOKEN omitted — trust mode)
+  return {
+    name: "pageserver",
+    bin: join(cfg.neonBinDir, "pageserver"),
+    args: ["-D", engineDirs(cfg).pageserverDir],
+    readyNeedle: `Starting pageserver http handler on 127.0.0.1:${cfg.engine.pageserverHttpPort}`,
+  };
+}
+
+export function safekeeperRegistrationBody(nowIso: string): object {
+  // oracle: src/daemon/mod.rs:247-281
+  return {
+    id: 1, region_id: "devdb-1", host: "127.0.0.1", port: 5454, http_port: 7676,
+    version: 1, availability_zone_id: "devdb-1", created_at: nowIso, updated_at: nowIso,
+  };
+}
