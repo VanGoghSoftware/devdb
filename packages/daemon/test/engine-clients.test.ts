@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import http from "node:http";
 import { once } from "node:events";
 import { StorconClient } from "../src/engine/storcon-client.js";
@@ -26,6 +26,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${addr.port}`;
 });
 afterAll(() => server.close());
+beforeEach(() => { seen = []; nextResponse = { status: 200, body: "{}" }; });
 
 describe("ids", () => {
   it("newHexId is 32 hex chars", () => expect(newHexId()).toMatch(/^[0-9a-f]{32}$/));
@@ -35,7 +36,7 @@ describe("ids", () => {
 
 describe("StorconClient", () => {
   it("tenantCreate POSTs oracle payload to /v1/tenant and accepts 201", async () => {
-    seen = []; nextResponse = { status: 201, body: "{}" };
+    nextResponse = { status: 201, body: "{}" };
     const c = new StorconClient(base);
     await c.tenantCreate("a".repeat(32), {
       gc_period: "1h", gc_horizon: 67108864, pitr_interval: "7 days",
@@ -48,7 +49,7 @@ describe("StorconClient", () => {
   });
 
   it("getLsnByTimestamp GETs with timestamp query", async () => {
-    seen = []; nextResponse = { status: 200, body: JSON.stringify({ lsn: "0/1A2B3C", kind: "present" }) };
+    nextResponse = { status: 200, body: JSON.stringify({ lsn: "0/1A2B3C", kind: "present" }) };
     const c = new StorconClient(base);
     const out = await c.getLsnByTimestamp("a".repeat(32), "b".repeat(32), "2026-07-02T10:00:00.000Z");
     expect(out).toEqual({ lsn: "0/1A2B3C", kind: "present" });
@@ -64,11 +65,19 @@ describe("StorconClient", () => {
       status: 400, operation: "get_lsn_by_timestamp",
     });
   });
+
+  it("rejects malformed engine ids before any request", async () => {
+    await expect(new StorconClient(base).tenantCreate("../evil", {
+      gc_period: "1h", gc_horizon: 1, pitr_interval: "7 days",
+      checkpoint_distance: 1, checkpoint_timeout: "5m",
+    })).rejects.toThrow(/invalid engine id/);
+    expect(seen).toHaveLength(0);
+  });
 });
 
 describe("PageserverClient", () => {
   it("timelineCreate POSTs to /v1/tenant/{t}/timeline", async () => {
-    seen = []; nextResponse = { status: 201, body: JSON.stringify({ timeline_id: "c".repeat(32) }) };
+    nextResponse = { status: 201, body: JSON.stringify({ timeline_id: "c".repeat(32) }) };
     const c = new PageserverClient(base);
     await c.timelineCreate("a".repeat(32), {
       new_timeline_id: "c".repeat(32), ancestor_timeline_id: "b".repeat(32), read_only: false,
@@ -78,7 +87,7 @@ describe("PageserverClient", () => {
   });
 
   it("timelineDetachAncestor PUTs and parses reparented list", async () => {
-    seen = []; nextResponse = { status: 200, body: JSON.stringify({ reparented_timelines: ["d".repeat(32)] }) };
+    nextResponse = { status: 200, body: JSON.stringify({ reparented_timelines: ["d".repeat(32)] }) };
     const c = new PageserverClient(base);
     const out = await c.timelineDetachAncestor("a".repeat(32), "c".repeat(32));
     expect(out.reparented_timelines).toEqual(["d".repeat(32)]);
@@ -88,22 +97,62 @@ describe("PageserverClient", () => {
   });
 
   it("timelineDelete DELETEs and tolerates 202/404", async () => {
-    seen = []; nextResponse = { status: 202, body: "{}" };
+    nextResponse = { status: 202, body: "{}" };
     const c = new PageserverClient(base);
     await c.timelineDelete("a".repeat(32), "c".repeat(32));
     nextResponse = { status: 404, body: "{}" };
     await c.timelineDelete("a".repeat(32), "c".repeat(32));
     expect(seen).toHaveLength(2);
   });
+
+  it("timelineInfo GETs the timeline route", async () => {
+    nextResponse = { status: 200, body: JSON.stringify({ timeline_id: "b".repeat(32), last_record_lsn: "0/2" }) };
+    const c = new PageserverClient(base);
+    const info = await c.timelineInfo("a".repeat(32), "b".repeat(32));
+    expect(info.last_record_lsn).toBe("0/2");
+    expect(seen[0]).toMatchObject({ method: "GET", url: `/v1/tenant/${"a".repeat(32)}/timeline/${"b".repeat(32)}` });
+  });
+
+  it("pageserver tenantDelete tolerates 202", async () => {
+    nextResponse = { status: 202, body: "{}" };
+    await new PageserverClient(base).tenantDelete("a".repeat(32));
+    expect(seen[0]).toMatchObject({ method: "DELETE", url: `/v1/tenant/${"a".repeat(32)}` });
+  });
+
+  it("rejects statuses outside the allowlist (tenantCreate 200)", async () => {
+    nextResponse = { status: 200, body: "{}" };
+    await expect(new StorconClient(base).tenantCreate("a".repeat(32), {
+      gc_period: "1h", gc_horizon: 1, pitr_interval: "7 days",
+      checkpoint_distance: 1, checkpoint_timeout: "5m",
+    })).rejects.toMatchObject({ status: 200, operation: "tenant_create" });
+  });
+
+  it("captures the error body on non-ok responses", async () => {
+    nextResponse = { status: 500, body: "plain text engine panic" };
+    await expect(new PageserverClient(base).timelineInfo("a".repeat(32), "b".repeat(32)))
+      .rejects.toMatchObject({ status: 500, body: "plain text engine panic" });
+  });
+
+  it("wraps malformed 2xx JSON in EngineApiError", async () => {
+    nextResponse = { status: 200, body: "not json {" };
+    await expect(new PageserverClient(base).timelineInfo("a".repeat(32), "b".repeat(32)))
+      .rejects.toMatchObject({ operation: "timeline_info" });
+  });
 });
 
 describe("SafekeeperClient", () => {
   it("timelineDelete DELETEs /v1/tenant/{t}/timeline/{tl}", async () => {
-    seen = []; nextResponse = { status: 200, body: "{}" };
+    nextResponse = { status: 200, body: "{}" };
     const c = new SafekeeperClient(base);
     await c.timelineDelete("a".repeat(32), "b".repeat(32));
     expect(seen[0]).toMatchObject({
       method: "DELETE", url: `/v1/tenant/${"a".repeat(32)}/timeline/${"b".repeat(32)}`,
     });
+  });
+
+  it("safekeeper tenantDelete tolerates 404", async () => {
+    nextResponse = { status: 404, body: "{}" };
+    await new SafekeeperClient(base).tenantDelete("a".repeat(32));
+    expect(seen[0]).toMatchObject({ method: "DELETE", url: `/v1/tenant/${"a".repeat(32)}` });
   });
 });

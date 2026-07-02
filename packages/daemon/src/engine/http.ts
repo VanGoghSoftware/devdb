@@ -25,3 +25,12 @@ export async function engineFetch(
   }
   return res;
 }
+
+export async function parseJson<T>(operation: string, res: Response): Promise<T> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new EngineApiError(operation, res.status, `invalid JSON from engine: ${text.slice(0, 500)}`);
+  }
+}
