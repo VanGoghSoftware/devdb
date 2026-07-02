@@ -70,3 +70,9 @@ Found 5 new findings: 1 P3 source correctness issue and 4 P4 coverage or drift-r
 Scope: whole-surface code scan of the attached source bundle; no tests were run.
 
 Findings: 6 new findings. Highest risk is startup failure cleanup: boot can leave an exclusive lock and already-started engine processes behind. The shutdown path also needs escalation/error handling, safekeeper registration needs bounded retry/timeout behavior, lock cleanup should verify ownership, the testcontainers image tag should be isolated per run/worktree, and the boot test should prove live downstream engine behavior rather than only the daemon status self-report.
+
+
+## 2026-07-02 20:48 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the attached source bundle; no tests were run.
+
+Findings: 5 new findings. The main implementation risk is malformed 2xx JSON bypassing EngineApiError. The remaining findings are actionable coverage gaps around error body assertions, status allowlists, method coverage, and real engine parity, plus a low-severity ID/path validation risk.
