@@ -1,6 +1,10 @@
 import { join } from "node:path";
 import type { DevdbConfig } from "../config.js";
 
+function tomlString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 export function engineDirs(cfg: DevdbConfig) {
   return {
     pageserverDir: join(cfg.dataDir, "pageserver"),
@@ -20,14 +24,14 @@ export function pageserverToml(cfg: DevdbConfig): string {
   const layers = engineDirs(cfg).pageserverLayers;
   return [
     `availability_zone = "devdb-1"`,
-    `pg_distrib_dir = "${cfg.pgInstallDir}"`,
+    `pg_distrib_dir = ${tomlString(cfg.pgInstallDir)}`,
     `broker_endpoint = "http://127.0.0.1:${cfg.engine.brokerPort}/"`,
     `listen_pg_addr = "127.0.0.1:${cfg.engine.pageserverPgPort}"`,
     `listen_http_addr = "127.0.0.1:${cfg.engine.pageserverHttpPort}"`,
     `control_plane_api = "http://127.0.0.1:${cfg.engine.storconPort}/upcall/v1/"`,
     ``,
     `[remote_storage]`,
-    `local_path = "${layers}"`,
+    `local_path = ${tomlString(layers)}`,
     ``,
     `[disk_usage_based_eviction]`,
     `enabled = true`,
@@ -38,12 +42,17 @@ export function pageserverToml(cfg: DevdbConfig): string {
 }
 
 export function pageserverIdentityToml(): string {
-  return "id = 1\n"; // oracle: identity.toml content "id=1"
+  return "id = 1\n"; // oracle: identity.toml content — "id = 1"
 }
 
-export function pageserverMetadataJson(): string {
+export function pageserverMetadataJson(cfg: DevdbConfig): string {
   // oracle: src/daemon/pageserver/mod.rs:125-130
-  return JSON.stringify({ host: "127.0.0.1", http_host: "127.0.0.1", http_port: 9898, port: 64000 });
+  return JSON.stringify({
+    host: "127.0.0.1",
+    http_host: "127.0.0.1",
+    http_port: cfg.engine.pageserverHttpPort,
+    port: cfg.engine.pageserverPgPort,
+  });
 }
 
 export interface ProcessSpec {
@@ -52,6 +61,7 @@ export interface ProcessSpec {
 
 export function brokerSpec(cfg: DevdbConfig): ProcessSpec {
   // oracle: src/daemon/mod.rs:67-75
+  // (trust mode: the broker takes no auth flags in the oracle either — nothing to omit)
   return {
     name: "storage_broker",
     bin: join(cfg.neonBinDir, "storage_broker"),
@@ -104,10 +114,11 @@ export function pageserverSpec(cfg: DevdbConfig): ProcessSpec {
   };
 }
 
-export function safekeeperRegistrationBody(nowIso: string): object {
+export function safekeeperRegistrationBody(cfg: DevdbConfig, nowIso: string): object {
   // oracle: src/daemon/mod.rs:247-281
   return {
-    id: 1, region_id: "devdb-1", host: "127.0.0.1", port: 5454, http_port: 7676,
+    id: 1, region_id: "devdb-1", host: "127.0.0.1",
+    port: cfg.engine.safekeeperPgPort, http_port: cfg.engine.safekeeperHttpPort,
     version: 1, availability_zone_id: "devdb-1", created_at: nowIso, updated_at: nowIso,
   };
 }

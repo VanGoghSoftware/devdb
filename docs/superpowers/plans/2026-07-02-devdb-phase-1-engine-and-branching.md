@@ -1616,7 +1616,7 @@ export class EngineRuntime {
 
     await writeFile(join(dirs.pageserverDir, "identity.toml"), pageserverIdentityToml());
     await writeFile(join(dirs.pageserverDir, "pageserver.toml"), pageserverToml(this.cfg));
-    await writeFile(join(dirs.pageserverDir, "metadata.json"), pageserverMetadataJson());
+    await writeFile(join(dirs.pageserverDir, "metadata.json"), pageserverMetadataJson(this.cfg));
     await this.launch(pageserverSpec(this.cfg));
   }
 
@@ -1626,7 +1626,7 @@ export class EngineRuntime {
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(safekeeperRegistrationBody(new Date().toISOString())),
+      body: JSON.stringify(safekeeperRegistrationBody(this.cfg, new Date().toISOString())),
     });
     if (!res.ok) {
       throw new Error(`safekeeper registration failed: ${res.status} ${await res.text()}`);

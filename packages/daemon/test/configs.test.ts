@@ -26,7 +26,7 @@ describe("engine configs", () => {
 
   it("identity and metadata match oracle", () => {
     expect(pageserverIdentityToml()).toBe("id = 1\n");
-    expect(JSON.parse(pageserverMetadataJson())).toEqual({
+    expect(JSON.parse(pageserverMetadataJson(cfg))).toEqual({
       host: "127.0.0.1", http_host: "127.0.0.1", http_port: 9898, port: 64000,
     });
   });
@@ -45,16 +45,48 @@ describe("engine configs", () => {
     ]);
     expect(storcon.readyNeedle).toBe("Serving HTTP on 127.0.0.1:1234");
     const sk = safekeeperSpec(cfg);
-    expect(sk.args).toContain("--broker-endpoint");
+    expect(sk.args).toEqual([
+      "-D", "/data/safekeeper",
+      "--id", "1",
+      "--broker-endpoint", "http://127.0.0.1:50051",
+      "--listen-pg", "127.0.0.1:5454",
+      "--listen-http", "127.0.0.1:7676",
+      "--availability-zone", "devdb-1",
+    ]);
     expect(sk.readyNeedle).toBe("starting safekeeper WAL service on");
+    expect(pageserverSpec(cfg).args).toEqual(["-D", "/data/pageserver"]);
     expect(pageserverSpec(cfg).readyNeedle).toBe("Starting pageserver http handler on 127.0.0.1:9898");
   });
 
   it("safekeeper registration body matches oracle", () => {
-    expect(safekeeperRegistrationBody("2026-07-02T00:00:00Z")).toEqual({
+    expect(safekeeperRegistrationBody(cfg, "2026-07-02T00:00:00Z")).toEqual({
       id: 1, region_id: "devdb-1", host: "127.0.0.1", port: 5454, http_port: 7676,
       version: 1, availability_zone_id: "devdb-1",
       created_at: "2026-07-02T00:00:00Z", updated_at: "2026-07-02T00:00:00Z",
     });
+  });
+
+  it("escapes quotes and backslashes in TOML path values", () => {
+    const weird = loadConfig({
+      DEVDB_DATA_DIR: '/da"ta',
+      NEON_BINARIES_DIR: "/usr/local/share/neon/bin",
+      PG_INSTALL_DIR: '/pg\\install',
+    });
+    const toml = pageserverToml(weird);
+    expect(toml).toContain('pg_distrib_dir = "/pg\\\\install"');
+    expect(toml).toContain('local_path = "/da\\"ta/pageserver_1"');
+  });
+
+  it("rejects relative path env vars", () => {
+    expect(() => loadConfig({
+      DEVDB_DATA_DIR: "relative/data",
+      NEON_BINARIES_DIR: "/bin",
+      PG_INSTALL_DIR: "/pg",
+    })).toThrow(/DEVDB_DATA_DIR.*absolute/);
+  });
+
+  it("metadata and registration ports derive from cfg.engine", () => {
+    expect(JSON.parse(pageserverMetadataJson(cfg))).toMatchObject({ http_port: 9898, port: 64000 });
+    expect(safekeeperRegistrationBody(cfg, "x")).toMatchObject({ port: 5454, http_port: 7676 });
   });
 });

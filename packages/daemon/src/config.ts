@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 const ENGINE_PORTS = {
@@ -42,6 +43,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     throw new Error(`Invalid environment: ${missing}`);
   }
   const e = parsed.data;
+
+  for (const [name, value] of [
+    ["DEVDB_DATA_DIR", e.DEVDB_DATA_DIR],
+    ["NEON_BINARIES_DIR", e.NEON_BINARIES_DIR],
+    ["PG_INSTALL_DIR", e.PG_INSTALL_DIR],
+  ] as const) {
+    if (!isAbsolute(value)) {
+      throw new Error(`${name} must be an absolute path, got: ${value}`);
+    }
+  }
 
   const httpPort = Number(e.DEVDB_HTTP_PORT);
   if (!(httpPort >= 1 && httpPort <= 65535)) {
