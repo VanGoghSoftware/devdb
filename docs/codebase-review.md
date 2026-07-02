@@ -47,3 +47,14 @@ Scope: whole-surface code scan of the attached source bundle; no tests were run.
 Scope: whole-surface code scan of ManagedProcess supervisor and tests; no tests were run.
 
 Found 5 new findings. The highest-risk issue is the timeout/retry lifecycle race: failed starts reject before the killed child has fully exited, and stale exit handlers can clear a later child. Coverage is also thin for several explicit Task 5 requirements, especially stderr readiness, fanout metadata, and ring-buffer bounds.
+
+
+## 2026-07-02 20:02 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the supplied Task 6 source bundle; no tests were run.
+
+### Findings
+- P2: Connection URI does not percent-encode the password at packages/daemon/src/engine/embedded-postgres.ts:33.
+- P3: Predictable pwfile path can collide or reuse unsafe file permissions at packages/daemon/src/engine/embedded-postgres.ts:39.
+- P2: Repeated start() can lose the handle to an already-running postgres process at packages/daemon/src/engine/embedded-postgres.ts:54.
+- P3: init() is not serialized or atomic for first-boot initialization at packages/daemon/src/engine/embedded-postgres.ts:37.
+- P4: Unit tests do not pin the initdb and postgres supervisor contract at packages/daemon/test/embedded-postgres.test.ts:7.
