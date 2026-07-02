@@ -24,3 +24,10 @@ Findings:
 - P3: BINARIES.md records linux/arm64 inventory, but Dockerfile/compose do not constrain or verify the build platform.
 - P3: the Docker image build does not run the binary verification gate.
 - P4: /usr/local/share/neon is chowned to the runtime user, making the pinned engine inventory mutable.
+
+
+## 2026-07-02 18:55 CEST - Model-backed whole-surface scan
+
+Scope: whole-surface code scan of the supplied source bundle; no tests were run.
+
+Findings: 5 new issues. The highest-risk gaps are missing runtime Zod schemas for the shared DTOs, endpoint port ranges that can collide with fixed engine ports, and absent parity coverage for manually copied daemon port constants.
