@@ -4,3 +4,4 @@ dist/
 *.tsbuildinfo
 .devdb-data/
 .superpowers/
+.idea/
