@@ -2853,6 +2853,8 @@ git add -A && git commit -m "feat: projects service and REST with tenant + main 
 
 ### Task 13: Branch service + REST (create/list/get/delete + connection strings)
 
+> **AMENDED (A18, post-review):** beyond the blocks below — `create()` trims names, serializes under the PARENT's queue key (re-checking parent existence + name uniqueness inside the queue; closes the create-vs-parent-delete race) and compensates the engine timeline on local-insert failure (unique → 409), mirroring the projects pattern; `detail()` enrichment only swallows `EngineApiError` (logged) — programming errors surface; `connectionString` percent-encodes the password (A11); api.ts's generic error branch respects 4xx/5xx `err.statusCode`; index.ts stops computes+engine on post-start boot failures before releasing the lock; four branch routes have inject tests. Integration helpers live in tests/integration/helpers/pg.ts (A1). See commits 04a1787 + a31aa70.
+
 **Files:**
 - Create: `packages/daemon/src/services/branches.ts`
 - Modify: `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
