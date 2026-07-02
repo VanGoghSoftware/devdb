@@ -58,3 +58,9 @@ Scope: whole-surface code scan of the supplied Task 6 source bundle; no tests we
 - P2: Repeated start() can lose the handle to an already-running postgres process at packages/daemon/src/engine/embedded-postgres.ts:54.
 - P3: init() is not serialized or atomic for first-boot initialization at packages/daemon/src/engine/embedded-postgres.ts:37.
 - P4: Unit tests do not pin the initdb and postgres supervisor contract at packages/daemon/test/embedded-postgres.test.ts:7.
+
+
+## 2026-07-02 20:11 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan of the supplied Task 7 engine config generation bundle; no tests were run.
+
+Found 5 new findings: 1 P3 source correctness issue and 4 P4 coverage or drift-resistance issues. The highest-risk item is unescaped TOML path interpolation in `pageserverToml`; the remaining findings focus on path-contract enforcement, incomplete ProcessSpec arg coverage, readiness needle parity, and duplicated port sources of truth.
