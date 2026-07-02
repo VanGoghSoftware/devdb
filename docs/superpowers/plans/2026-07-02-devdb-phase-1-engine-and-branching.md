@@ -2118,6 +2118,7 @@ describe("postgresql.conf", () => {
   it("pg_hba keeps scram for remote, trust for local cloud_admin, no hostssl", () => {
     expect(PG_HBA).toContain("local   all       cloud_admin                 trust");
     expect(PG_HBA).toContain("host    all       all           all           scram-sha-256");
+    expect(PG_HBA).toContain("::1/128"); // not upstream's ::1/32 — that's a prefix, not loopback
     expect(PG_HBA).not.toContain("hostssl");
   });
 });
@@ -2213,11 +2214,13 @@ export function computePostgresqlConf(a: { port: number; hbaPath: string }): str
   return kv.map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
 }
 
-// oracle: src/mgmt/compute/pg_hba.conf, hostssl lines dropped (no TLS)
+// oracle: src/mgmt/compute/pg_hba.conf, hostssl lines dropped (no TLS).
+// Deviation: ::1/128, not upstream's ::1/32 — /32 is a prefix (matches all of ::/32,
+// incl. v4-mapped addrs), not loopback. See docs/notes/2026-07-02-neond-pg-hba-ipv6-loopback.md.
 export const PG_HBA = `# TYPE  DATABASE  USER          ADDRESS       METHOD
 local   all       cloud_admin                 trust
 host    all       cloud_admin   127.0.0.1/32  trust
-host    all       cloud_admin   ::1/32        trust
+host    all       cloud_admin   ::1/128       trust
 host    all       all           all           scram-sha-256
 `;
 ```
