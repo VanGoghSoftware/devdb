@@ -349,6 +349,8 @@ git add -A && git commit -m "feat: docker image with pinned neon engine binaries
 
 ### Task 3: Shared types + daemon config module
 
+> **AMENDED (A8, post-review):** `loadConfig` is hardened beyond the block below — decimal-only `DEVDB_HTTP_PORT`, `.trim().min(1)` path vars, and rejection of endpoint ranges/HTTP ports that collide with the reserved engine ports. See `packages/daemon/src/config.ts` (commit 5ec2418); the `loadConfig` signature and `DevdbConfig` shape are unchanged.
+
 **Files:**
 - Modify: `packages/shared/src/index.ts`
 - Create: `packages/daemon/src/config.ts`
