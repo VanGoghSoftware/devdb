@@ -80,10 +80,11 @@ Root `package.json`:
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
   "scripts": {
     "build": "pnpm -r build",
-    "test": "pnpm -r test",
-    "test:integration": "vitest run --root tests/integration"
+    "test": "pnpm --filter @devdb/shared build && pnpm -r test",
+    "test:integration": "pnpm --filter @devdb/integration test"
   }
 }
 ```
@@ -103,6 +104,7 @@ allowBuilds:
 `.npmrc`:
 ```
 shamefully-hoist=false
+engine-strict=true
 ```
 
 `tsconfig.base.json`:
@@ -168,7 +170,7 @@ export const DEVDB = "devdb";
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "pnpm --filter @devdb/shared build && vitest run"
   },
   "dependencies": {
     "@devdb/shared": "workspace:*",
