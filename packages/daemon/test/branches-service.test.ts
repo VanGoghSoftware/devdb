@@ -3,6 +3,7 @@ import { openState } from "../src/state/db.js";
 import { BranchQueue } from "../src/state/queue.js";
 import { BranchesService } from "../src/services/branches.js";
 import { ProjectsService } from "../src/services/projects.js";
+import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
 
@@ -117,7 +118,13 @@ describe("BranchesService", () => {
 
   it("detail tolerates a pageserver blip on timeline_info instead of throwing", async () => {
     const { f, mainBranch, branches } = await seeded();
-    vi.mocked(f.pageserver.timelineInfo).mockRejectedValueOnce(new Error("pageserver unreachable"));
+    // A real "pageserver unreachable" condition surfaces as an EngineApiError (see
+    // engine/http.ts engineFetch) — that's the class of failure detail() is meant to tolerate,
+    // per the narrowed catch in Fix 2 (services/branches.ts). Non-engine errors (e.g. a
+    // programming bug) are covered separately by "surfaces non-engine errors from enrichment".
+    vi.mocked(f.pageserver.timelineInfo).mockRejectedValueOnce(
+      new EngineApiError("timeline_info", 503, "pageserver unreachable"),
+    );
     const d = await branches.detail(mainBranch);
     expect(d.lastRecordLsn).toBeNull();
     expect(d.logicalSizeBytes).toBeNull();
@@ -181,5 +188,58 @@ describe("BranchesService", () => {
     const { branches } = await seeded();
     await expect(branches.create({ projectId: "does-not-exist", name: "dev" }))
       .rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("compensates the timeline when the local insert fails", async () => {
+    const { f, state, project, branches } = await seeded();
+    const err = { code: "SQLITE_CONSTRAINT_UNIQUE" } as unknown as Error;
+    const createSpy = vi.spyOn(state.branches, "create").mockImplementationOnce(() => {
+      throw err;
+    });
+
+    await expect(branches.create({ projectId: project.id, name: "dev" }))
+      .rejects.toMatchObject({ statusCode: 409 });
+
+    const [, req] = vi.mocked(f.pageserver.timelineCreate).mock.calls.at(-1)!;
+    const newTimelineId = (req as Record<string, unknown>).new_timeline_id as string;
+    expect(f.pageserver.timelineDelete).toHaveBeenCalledWith(project.id, newTimelineId);
+    expect(f.safekeeper.timelineDelete).toHaveBeenCalledWith(project.id, newTimelineId);
+
+    createSpy.mockRestore();
+  });
+
+  it("rejects create when the parent vanishes while queued", async () => {
+    // Built manually (not via seeded()) so the test holds a direct reference to the same
+    // BranchQueue instance the service uses — needed to occupy the parent's queue lane by hand.
+    const f = fakes();
+    const state = openState(":memory:");
+    const projects = new ProjectsService({ state, ...f });
+    const queue = new BranchQueue();
+    const branches = new BranchesService({ state, queue, ...f });
+    const { project, mainBranch } = await projects.create({ name: "acme" });
+
+    // Occupy the parent's queue lane first so our create() call below (which also queues under
+    // parent.id per Fix 1) is forced to wait behind this job — by the time it runs, the parent
+    // row is gone.
+    const blocker = queue.run(mainBranch.id, async () => {
+      state.branches.delete(mainBranch.id); // main is a leaf here — no FK/child issue
+    });
+
+    await expect(branches.create({ projectId: project.id, name: "dev", parentBranchId: mainBranch.id }))
+      .rejects.toThrow(/was deleted/);
+    await blocker;
+  });
+
+  it("surfaces non-engine errors from enrichment", async () => {
+    const { f, mainBranch, branches } = await seeded();
+    vi.mocked(f.pageserver.timelineInfo).mockRejectedValueOnce(new TypeError("boom"));
+    await expect(branches.detail(mainBranch)).rejects.toThrow(TypeError);
+  });
+
+  it("trims branch names", async () => {
+    const { project, branches } = await seeded();
+    const b = await branches.create({ projectId: project.id, name: "  dev  " });
+    expect(b.name).toBe("dev");
+    expect(branches.byIdOr404(b.id).name).toBe("dev");
   });
 });

@@ -30,7 +30,11 @@ export function buildServer(deps: Deps): FastifyInstance {
     }
     app.log.error(err);
     const message = err instanceof Error ? err.message : String(err);
-    return reply.status(500).send({ error: message });
+    const rawStatusCode = (err as { statusCode?: unknown }).statusCode;
+    const sc = typeof rawStatusCode === "number" && rawStatusCode >= 400 && rawStatusCode < 600
+      ? rawStatusCode
+      : 500;
+    return reply.status(sc).send({ error: message });
   });
 
   app.get("/api/status", async () => {

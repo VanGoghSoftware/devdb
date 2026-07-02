@@ -3,6 +3,7 @@ import type { BranchRow } from "../state/repos.js";
 import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
 import { generatePassword } from "../compute/scram.js";
+import { EngineApiError } from "../engine/http.js";
 import { DevdbError } from "./errors.js";
 import { slugify } from "./slug.js";
 import type { ProjectsDeps } from "./projects.js";
@@ -40,11 +41,12 @@ export class BranchesService {
     projectId: string; name: string; parentBranchId?: string | null;
     atLsn?: string | null; createdBy?: "ui" | "api" | "mcp";
   }): Promise<BranchRow> {
+    const name = a.name.trim();
     const project = this.deps.state.projects.byId(a.projectId);
     if (!project) throw new DevdbError(404, `project ${a.projectId} not found`);
-    if (!NAME_RE.test(a.name)) throw new DevdbError(400, `invalid branch name: ${JSON.stringify(a.name)}`);
-    if (this.deps.state.branches.byProjectAndName(project.id, a.name)) {
-      throw new DevdbError(409, `branch "${a.name}" already exists in project "${project.name}"`);
+    if (!NAME_RE.test(name)) throw new DevdbError(400, `invalid branch name: ${JSON.stringify(a.name)}`);
+    if (this.deps.state.branches.byProjectAndName(project.id, name)) {
+      throw new DevdbError(409, `branch "${name}" already exists in project "${project.name}"`);
     }
 
     let parent: BranchRow | null;
@@ -58,24 +60,49 @@ export class BranchesService {
       if (parent.projectId !== project.id) throw new DevdbError(400, "parent branch belongs to a different project");
     }
 
-    const timelineId = newHexId();
-    const req: { new_timeline_id: string } & Record<string, unknown> = {
-      new_timeline_id: timelineId,
-      ancestor_timeline_id: parent.timelineId,
-      read_only: false,
-    };
-    if (a.atLsn) req.ancestor_start_lsn = a.atLsn;
-    await this.deps.pageserver.timelineCreate(project.id, req);
+    // Serialized under the PARENT's queue key — not a new key of our own — so that a concurrent
+    // delete() of this same parent (which queues under branch.id, i.e. the parent's id) can never
+    // race a create() underneath it: both operations now share one queue lane keyed by parent.id.
+    return this.deps.queue.run(parent.id, async () => {
+      // re-check inside the queue: parent may have been deleted while we waited in line
+      if (!this.deps.state.branches.byId(parent.id)) {
+        throw new DevdbError(409, `parent branch "${parent.name}" was deleted while creating "${name}"`);
+      }
+      if (this.deps.state.branches.byProjectAndName(project.id, name)) {
+        throw new DevdbError(409, `branch "${name}" already exists in project "${project.name}"`);
+      }
+      const timelineId = newHexId();
+      const req: { new_timeline_id: string } & Record<string, unknown> = {
+        new_timeline_id: timelineId,
+        ancestor_timeline_id: parent.timelineId,
+        read_only: false,
+      };
+      if (a.atLsn) req.ancestor_start_lsn = a.atLsn;
+      await this.deps.pageserver.timelineCreate(project.id, req);
 
-    return this.deps.state.branches.create({
-      id: crypto.randomUUID(),
-      projectId: project.id,
-      parentBranchId: parent.id,
-      name: a.name,
-      slug: `${slugify(project.name, a.name)}-${timelineId.slice(0, 6)}`,
-      timelineId,
-      password: generatePassword(),
-      createdBy: a.createdBy ?? "api",
+      try {
+        return this.deps.state.branches.create({
+          id: crypto.randomUUID(),
+          projectId: project.id,
+          parentBranchId: parent.id,
+          name,
+          slug: `${slugify(project.name, name)}-${timelineId.slice(0, 6)}`,
+          timelineId,
+          password: generatePassword(),
+          createdBy: a.createdBy ?? "api",
+        });
+      } catch (e) {
+        // compensation: never leave a live timeline on the engine for a create that failed after
+        // timelineCreate succeeded (best-effort — loud on failure rather than silently swallowed).
+        await this.deps.pageserver.timelineDelete(project.id, timelineId).catch((c) =>
+          console.error(`compensation failed — orphaned timeline ${timelineId} on pageserver:`, c));
+        await this.deps.safekeeper.timelineDelete(project.id, timelineId).catch((c) =>
+          console.error(`compensation failed — orphaned timeline ${timelineId} on safekeeper:`, c));
+        if ((e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
+          throw new DevdbError(409, `branch identity conflicts with an existing one`);
+        }
+        throw e;
+      }
     });
   }
 
@@ -90,8 +117,10 @@ export class BranchesService {
       lastRecordLsn = info.last_record_lsn ?? null;
       logicalSizeBytes = info.current_logical_size ?? null;
       ancestorLsn = info.ancestor_lsn ?? null;
-    } catch {
+    } catch (e) {
+      if (!(e instanceof EngineApiError)) throw e; // programming bugs must surface
       // timeline info is enrichment — a briefly unavailable pageserver must not 500 branch listings
+      console.error(`timeline enrichment unavailable for branch ${branch.id} (${branch.name}):`, e.message);
     }
     return {
       ...branch,
