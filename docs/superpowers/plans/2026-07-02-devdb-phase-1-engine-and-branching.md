@@ -15,7 +15,7 @@ Spec: `docs/superpowers/specs/2026-07-02-devdb-design.md`. This is **plan 1 of 5
 ## Global constraints
 
 - Node `>=22`, TypeScript `strict: true`, ESM everywhere (`"type": "module"`).
-- Package manager: pnpm 9 via corepack. Monorepo layout per spec: `packages/daemon`, `packages/shared`, `docker/`, `tests/integration/`.
+- Package manager: pnpm **11.9.0** via corepack. Supply-chain policy (user amendment A4): npm dependencies must be **≥24h old** at resolution time — `minimumReleaseAge: 1440` in pnpm-workspace.yaml; native build scripts allowlisted for better-sqlite3 only (`allowBuilds`). Monorepo layout per spec: `packages/daemon`, `packages/shared`, `docker/`, `tests/integration/`.
 - Management HTTP port **4400**; endpoint port range default **54300-54339**; engine-internal ports exactly as neond: broker `50051`, storcon `1234`, storcon-DB `5431`, pageserver http `9898` / pg `64000`, safekeeper pg `5454` / http `7676`, all bound to `127.0.0.1` inside the container.
 - Default branch name: **`main`**. IDs: Neon tenant id = project id (32-char hex, no dashes); timeline id = 32-char hex.
 - Deviations from neond (approved in spec): SQLite instead of management Postgres; **no PgBouncer**; **no TLS** on computes; no orgs/users/auth on our API; **engine runs in trust mode** (no NeonJWT — all engine ports are loopback-only inside the container; see Task 7 note; fallback documented there).
@@ -79,7 +79,7 @@ Root `package.json`:
   "name": "devdb",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@9.15.0",
+  "packageManager": "pnpm@11.9.0",
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
@@ -93,6 +93,11 @@ Root `package.json`:
 packages:
   - "packages/*"
   - "tests/integration"
+# Supply-chain policy: dependencies must be >=24h old at resolution time
+minimumReleaseAge: 1440
+allowBuilds:
+  better-sqlite3: true
+  esbuild: false
 ```
 
 `.npmrc`:
@@ -284,10 +289,10 @@ ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
     DEVDB_PORT_RANGE=54300-54339
 RUN corepack enable && mkdir -p /data /app && chown -R node:node /data /app /usr/local/share/neon
 WORKDIR /app
-COPY --chown=node:node package.json pnpm-workspace.yaml .npmrc tsconfig.base.json ./
+COPY --chown=node:node package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json ./
 COPY --chown=node:node packages ./packages
 USER node
-RUN pnpm install --frozen-lockfile=false && pnpm -r build
+RUN pnpm install --frozen-lockfile && pnpm -r build
 COPY --chown=node:node docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
 EXPOSE 4400 54300-54339
 CMD ["node", "packages/daemon/dist/index.js"]
