@@ -5,13 +5,14 @@ import type { DevdbConfig } from "../config.js";
 import type { StateDb } from "../state/db.js";
 import type { EngineRuntime } from "../engine/boot.js";
 import type { ProjectsService } from "../services/projects.js";
+import type { BranchesService } from "../services/branches.js";
 import { DevdbError } from "../services/errors.js";
 
 export interface Deps {
   cfg: DevdbConfig;
   state: StateDb;
   engine: EngineRuntime;
-  services: { projects: ProjectsService };
+  services: { projects: ProjectsService; branches: BranchesService };
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
@@ -52,6 +53,32 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.delete("/api/projects/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     await deps.services.projects.delete(id);
+    return reply.status(204).send();
+  });
+
+  const CreateBranch = z.object({
+    name: z.string(),
+    parentBranchId: z.string().optional(),
+    atLsn: z.string().optional(),
+  });
+  app.post("/api/projects/:id/branches", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = CreateBranch.parse(req.body);
+    const branch = await deps.services.branches.create({ projectId: id, ...body, createdBy: "api" });
+    return reply.status(201).send(await deps.services.branches.detail(branch));
+  });
+  app.get("/api/projects/:id/branches", async (req) => {
+    const { id } = req.params as { id: string };
+    deps.services.projects.byIdOr404(id);
+    return deps.services.branches.list(id);
+  });
+  app.get("/api/branches/:id", async (req) => {
+    const { id } = req.params as { id: string };
+    return deps.services.branches.detail(deps.services.branches.byIdOr404(id));
+  });
+  app.delete("/api/branches/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    await deps.services.branches.delete(id);
     return reply.status(204).send();
   });
 

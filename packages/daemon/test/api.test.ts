@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { buildServer } from "../src/http/api.js";
 import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
+import type { BranchesService } from "../src/services/branches.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
 
@@ -20,6 +21,15 @@ function fakeProjects(): ProjectsService {
   return { create: vi.fn(), list: vi.fn(), byIdOr404: vi.fn(), delete: vi.fn() } as unknown as ProjectsService;
 }
 
+// Same rationale as fakeProjects() — Deps.services.branches is typed against the concrete
+// BranchesService class, so a plain fake needs the same narrowly-scoped cast.
+function fakeBranches(): BranchesService {
+  return {
+    create: vi.fn(), list: vi.fn(), byIdOr404: vi.fn(), delete: vi.fn(),
+    detail: vi.fn(), connectionString: vi.fn(),
+  } as unknown as BranchesService;
+}
+
 describe("buildServer error handling", () => {
   it("maps a Zod validation failure on POST /api/projects to 400 with an issues array", async () => {
     const cfg = loadConfig({
@@ -28,7 +38,10 @@ describe("buildServer error handling", () => {
       PG_INSTALL_DIR: "/tmp/devdb-api-test-only/pg",
     });
     const state = openState(":memory:");
-    const app = buildServer({ cfg, state, engine: fakeEngine(), services: { projects: fakeProjects() } });
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(),
+      services: { projects: fakeProjects(), branches: fakeBranches() },
+    });
 
     const res = await app.inject({ method: "POST", url: "/api/projects", payload: { bogus: true } });
 

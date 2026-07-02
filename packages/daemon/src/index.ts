@@ -10,6 +10,8 @@ import { PageserverClient } from "./engine/pageserver-client.js";
 import { SafekeeperClient } from "./engine/safekeeper-client.js";
 import { ComputeManager } from "./compute/manager.js";
 import { ProjectsService } from "./services/projects.js";
+import { BranchesService } from "./services/branches.js";
+import { BranchQueue } from "./state/queue.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -35,8 +37,10 @@ async function main(): Promise<void> {
     const safekeeper = new SafekeeperClient();
     const computes = new ComputeManager(cfg);
     const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes });
+    const queue = new BranchQueue();
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue });
 
-    const app = buildServer({ cfg, state, engine, services: { projects } });
+    const app = buildServer({ cfg, state, engine, services: { projects, branches } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     let stopping = false;
