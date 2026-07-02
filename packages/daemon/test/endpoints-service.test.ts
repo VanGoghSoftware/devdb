@@ -77,12 +77,14 @@ describe("EndpointsService", () => {
     expect(f.computes.start).not.toHaveBeenCalled();
   });
 
-  it("start maps PortExhaustedError to a 409 naming running endpoints and DEVDB_PORT_RANGE", async () => {
+  it("start maps PortExhaustedError to a 409 naming running endpoints (project-qualified) and DEVDB_PORT_RANGE", async () => {
     const { f, mainBranch, endpoints } = await seeded();
     vi.mocked(f.computes.start).mockRejectedValue(new PortExhaustedError());
     vi.mocked(f.computes.runningPorts).mockReturnValue([{ branchId: mainBranch.id, port: 54300 }]);
     await expect(endpoints.start(mainBranch.id)).rejects.toMatchObject({ statusCode: 409 });
-    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/main/);
+    // project-qualified (projectName/branchName), not the bare branch name — "acme" is the
+    // project seeded() creates, "main" is its root branch.
+    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/acme\/main/);
     await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/DEVDB_PORT_RANGE/);
   });
 
@@ -92,7 +94,7 @@ describe("EndpointsService", () => {
     await expect(endpoints.start("other-branch-id")).rejects.toMatchObject({ statusCode: 404 });
   });
 
-  it("start sets the persisted endpointStatus to failed (not left at starting) when computes.start throws a non-port error", async () => {
+  it("start sets the persisted endpointStatus to failed (not left at starting) and durably records the error message when computes.start throws a non-port error", async () => {
     const { f, state, mainBranch, endpoints } = await seeded();
     vi.mocked(f.computes.start).mockRejectedValueOnce(new Error("compute_ctl exited before ready"));
     await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/compute_ctl exited/);
@@ -100,7 +102,22 @@ describe("EndpointsService", () => {
     // for the live-derived endpointStatus, so it can't show this test's persisted-row assertion.
     // Read the SQLite row directly to confirm the catch block's updateEndpoint({status:"failed"})
     // actually ran, rather than leaving the row stuck at the earlier "starting" write.
-    expect(state.branches.byId(mainBranch.id)!.endpointStatus).toBe("failed");
+    const row = state.branches.byId(mainBranch.id)!;
+    expect(row.endpointStatus).toBe("failed");
+    expect(row.endpointError).toContain("compute_ctl exited before ready");
+  });
+
+  it("a subsequent successful start clears a previously-persisted endpointError", async () => {
+    const { f, state, mainBranch, endpoints } = await seeded();
+    vi.mocked(f.computes.start).mockRejectedValueOnce(new Error("compute_ctl exited before ready"));
+    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/compute_ctl exited/);
+    expect(state.branches.byId(mainBranch.id)!.endpointError).toContain("compute_ctl exited before ready");
+
+    vi.mocked(f.computes.start).mockResolvedValueOnce({ port: 54300 });
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    await endpoints.start(mainBranch.id);
+    expect(state.branches.byId(mainBranch.id)!.endpointError).toBeNull();
   });
 
   it("stop calls computes.stop and returns the branch as stopped", async () => {
@@ -114,10 +131,10 @@ describe("EndpointsService", () => {
 
   it("ensureRunning starts when not running", async () => {
     const { f, mainBranch, endpoints } = await seeded();
-    // Same statusOf-transition rationale as the "start allocates..." test above: ensureRunning's
-    // own not-running check, then start()'s idempotency check, both need "stopped" before the
-    // compute is (fake-)started; detail() at the end needs "running".
-    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValueOnce("stopped").mockReturnValue("running");
+    // ensureRunning() now shares start()'s exact queued startLocked() body (Fix 1) — a single
+    // statusOf() idempotency check inside the queue lane, not a separate pre-check outside it.
+    // So: one "stopped" for that check, then "running" once detail() builds the return value.
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
     vi.mocked(f.computes.portOf).mockReturnValue(54300);
     const detail = await endpoints.ensureRunning(mainBranch.id);
     expect(f.computes.start).toHaveBeenCalledOnce();

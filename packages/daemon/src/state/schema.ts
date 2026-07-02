@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS branches (
   password TEXT NOT NULL,
   sticky_port INTEGER,
   endpoint_status TEXT NOT NULL DEFAULT 'stopped',
+  endpoint_error TEXT,
   import_status TEXT NOT NULL DEFAULT 'none',
   import_error TEXT,
   created_by TEXT NOT NULL DEFAULT 'api',

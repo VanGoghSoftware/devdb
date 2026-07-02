@@ -7,6 +7,7 @@ export interface ProjectRow {
 export interface BranchRow {
   id: string; projectId: string; parentBranchId: string | null; name: string; slug: string;
   timelineId: string; password: string; stickyPort: number | null; endpointStatus: string;
+  endpointError: string | null;
   importStatus: string; importError: string | null; createdBy: string;
   createdAt: string; updatedAt: string;
 }
@@ -23,7 +24,9 @@ function branchRow(r: Record<string, unknown>): BranchRow {
     parentBranchId: (r.parent_branch_id as string | null) ?? null,
     name: r.name as string, slug: r.slug as string, timelineId: r.timeline_id as string,
     password: r.password as string, stickyPort: (r.sticky_port as number | null) ?? null,
-    endpointStatus: r.endpoint_status as string, importStatus: r.import_status as string,
+    endpointStatus: r.endpoint_status as string,
+    endpointError: (r.endpoint_error as string | null) ?? null,
+    importStatus: r.import_status as string,
     importError: (r.import_error as string | null) ?? null, createdBy: r.created_by as string,
     createdAt: r.created_at as string, updatedAt: r.updated_at as string,
   };
@@ -83,10 +86,12 @@ export class BranchesRepo {
     return this.db.prepare("SELECT * FROM branches WHERE parent_branch_id = ?")
       .all(parentBranchId).map((r) => branchRow(r as Record<string, unknown>));
   }
-  updateEndpoint(id: string, a: { status: string; port: number | null }): void {
+  // a.error is durable, not incremental: pass the failure message on a "failed" transition,
+  // omit it (or pass null explicitly) on every other transition to clear a stale error.
+  updateEndpoint(id: string, a: { status: string; port: number | null; error?: string | null }): void {
     this.db.prepare(
-      "UPDATE branches SET endpoint_status = ?, sticky_port = COALESCE(?, sticky_port), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
-    ).run(a.status, a.port, id);
+      "UPDATE branches SET endpoint_status = ?, sticky_port = COALESCE(?, sticky_port), endpoint_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+    ).run(a.status, a.port, a.error ?? null, id);
   }
   setStickyPort(id: string, port: number): void {
     this.db.prepare("UPDATE branches SET sticky_port = ? WHERE id = ?").run(port, id);

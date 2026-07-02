@@ -2,7 +2,7 @@ import net from "node:net";
 import { randomInt } from "node:crypto";
 
 export class PortExhaustedError extends Error {
-  constructor(public running: Array<{ branchId: string; port: number }> = []) {
+  constructor() {
     super("no free port in DEVDB_PORT_RANGE — stop an endpoint or widen the range");
   }
 }

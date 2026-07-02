@@ -45,6 +45,7 @@ function fakeBranch(overrides: Partial<BranchRow> = {}): BranchRow {
     password: "pw",
     stickyPort: null,
     endpointStatus: "stopped",
+    endpointError: null,
     importStatus: "none",
     importError: null,
     createdBy: "api",

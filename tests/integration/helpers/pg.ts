@@ -17,12 +17,20 @@ import type { Devdb } from "./container.js";
 // listening" and "role/password reconciliation has landed". A bounded retry-on-auth-failure is
 // the same discipline any real client (including Phase 2's MCP layer) will need against the
 // actual engine, so it belongs here rather than masked by a manager.ts/spec.ts launch-arg change.
-async function connectWithRetry(config: pg.ClientConfig, attempts = 20, delayMs = 150): Promise<pg.Client> {
+// Capped at 10 attempts x 150ms = 1.5s: long enough to ride out the compute_ctl readiness window
+// described above, short enough that a genuinely-wrong password fails the test in ~1.5s instead
+// of hanging. Tradeoff: a PERSISTENT auth failure (wrong password, not a timing race) burns the
+// full 1.5s window before surfacing, since every attempt looks identical from here — that's an
+// accepted test-helper cost, not a fix; the actual daemon-side readiness signal is tracked
+// separately rather than papered over by a longer client-side retry loop.
+async function connectWithRetry(config: pg.ClientConfig, attempts = 10, delayMs = 150): Promise<pg.Client> {
   let lastErr: unknown;
+  const start = Date.now();
   for (let i = 0; i < attempts; i++) {
     const client = new pg.Client(config);
     try {
       await client.connect();
+      if (i > 0) console.log(`connectWithRetry: succeeded after ${i + 1} attempt(s), ${Date.now() - start}ms elapsed`);
       return client;
     } catch (e) {
       lastErr = e;
@@ -32,6 +40,7 @@ async function connectWithRetry(config: pg.ClientConfig, attempts = 20, delayMs 
       await new Promise((res) => setTimeout(res, delayMs));
     }
   }
+  console.log(`connectWithRetry: exhausted ${attempts} attempts, ${Date.now() - start}ms elapsed`);
   throw lastErr;
 }
 

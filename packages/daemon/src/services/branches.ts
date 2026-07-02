@@ -10,6 +10,7 @@ import type { ProjectsDeps } from "./projects.js";
 
 export type BranchDetail = BranchRow & {
   endpointStatus: EndpointStatus;
+  endpointError: string | null;
   port: number | null;
   connectionString: string | null;
   lastRecordLsn: string | null;
@@ -125,6 +126,7 @@ export class BranchesService {
     return {
       ...branch,
       endpointStatus: status,
+      endpointError: branch.endpointError,
       port,
       connectionString: status === "running" && port ? this.connectionString(branch, port) : null,
       lastRecordLsn,

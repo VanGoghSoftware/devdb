@@ -27,6 +27,7 @@ export interface BranchDto {
   slug: string;
   timelineId: string;
   endpointStatus: EndpointStatus;
+  endpointError: string | null;
   port: number | null;
   connectionString: string | null;
   lastRecordLsn: string | null;
