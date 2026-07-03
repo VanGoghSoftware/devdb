@@ -5,6 +5,7 @@ import type { ProjectsService } from "../src/services/projects.js";
 import type { BranchesService } from "../src/services/branches.js";
 import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
+import type { SqlService } from "../src/services/sql.js";
 import { LogsService } from "../src/services/logs.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
@@ -57,6 +58,12 @@ function fakeTimetravel(): TimeTravelService {
   } as unknown as TimeTravelService;
 }
 
+// Same rationale as the fakes above — Deps.services.sql (T17) is typed against the concrete
+// SqlService class.
+function fakeSql(): SqlService {
+  return { run: vi.fn() } as unknown as SqlService;
+}
+
 function testCfg() {
   return loadConfig({
     DEVDB_DATA_DIR: "/tmp/devdb-api-test-only",
@@ -71,7 +78,7 @@ describe("buildServer error handling", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/projects", payload: { bogus: true } });
@@ -96,7 +103,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({
@@ -121,7 +128,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.list).mockResolvedValue(rows as unknown as Awaited<ReturnType<BranchesService["list"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/projects/project-1/branches" });
@@ -140,7 +147,7 @@ describe("buildServer branch routes", () => {
     });
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/does-not-exist" });
@@ -156,7 +163,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const okRes = await app.inject({ method: "DELETE", url: "/api/branches/branch-1" });
@@ -181,7 +188,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.start).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["start"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
@@ -200,7 +207,7 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/start" });
@@ -217,7 +224,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["stop"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/endpoint/stop" });
@@ -237,7 +244,7 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/endpoint" });
@@ -255,7 +262,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.lsnAtTimestamp).mockResolvedValue("0/1A2B3C");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn?timestamp=2026-07-02T10:00:00Z" });
@@ -270,7 +277,7 @@ describe("buildServer time travel routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn" });
@@ -288,7 +295,7 @@ describe("buildServer time travel routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/branches/branch-1/lsn?timestamp=2030-01-01T00:00:00Z" });
@@ -305,7 +312,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["restoreInPlace"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({
@@ -332,7 +339,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({
@@ -354,7 +361,7 @@ describe("buildServer time travel routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({
@@ -373,7 +380,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["resetToParent"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/reset" });
@@ -392,13 +399,87 @@ describe("buildServer time travel routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "POST", url: "/api/branches/branch-1/reset" });
 
     expect(res.statusCode).toBe(409);
     expect(res.json().error).toMatch(/grandchild/);
+  });
+});
+
+describe("buildServer /api/sql", () => {
+  it("POST /api/sql — 200 with the service's { rows, rowCount, fields } on success", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const sql = fakeSql();
+    const fakeResult = { rows: [{ n: 1 }], rowCount: 1, fields: ["n"] };
+    vi.mocked(sql.run).mockResolvedValue(fakeResult as unknown as Awaited<ReturnType<SqlService["run"]>>);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/sql",
+      payload: { branchId: "branch-1", query: "SELECT 1 AS n" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(sql.run).toHaveBeenCalledWith("branch-1", "SELECT 1 AS n");
+    expect(res.json()).toEqual(fakeResult);
+  });
+
+  it("POST /api/sql — 400 via the global ZodError handler when branchId is missing", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const sql = fakeSql();
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/sql", payload: { query: "SELECT 1" } });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("invalid request body");
+    expect(sql.run).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/sql — 400 via the global ZodError handler when query is missing", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const sql = fakeSql();
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/sql", payload: { branchId: "branch-1" } });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().issues[0]).toMatch(/query/);
+    expect(sql.run).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/sql — passes through the service's DevdbError status code (e.g. 400 empty query, 502 endpoint not running)", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const sql = fakeSql();
+    vi.mocked(sql.run).mockRejectedValue(new DevdbError(502, `endpoint for "main" is not running`));
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/sql",
+      payload: { branchId: "branch-1", query: "SELECT 1" },
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toMatch(/not running/);
   });
 });
 
@@ -411,7 +492,7 @@ describe("buildServer /api/status", () => {
     const engine = { status: () => ({ storcon_db: { state: "running", pid: 123 } }) } as unknown as EngineRuntime;
     const app = buildServer({
       cfg, state, engine, logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/status" });
@@ -434,7 +515,7 @@ describe("buildServer /api/status", () => {
     } as unknown as EngineRuntime;
     const app = buildServer({
       cfg, state, engine, logs: fakeLogs(),
-      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
     const res = await app.inject({ method: "GET", url: "/api/status" });
@@ -461,6 +542,7 @@ describe("buildServer SSE log routes", () => {
         branches: extra.branches ?? fakeBranches(),
         endpoints: extra.endpoints ?? fakeEndpoints(),
         timetravel: fakeTimetravel(),
+        sql: fakeSql(),
       },
     });
     await app.listen({ port: 0, host: "127.0.0.1" });

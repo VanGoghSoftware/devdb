@@ -13,6 +13,7 @@ import { ProjectsService } from "./services/projects.js";
 import { BranchesService } from "./services/branches.js";
 import { EndpointsService } from "./services/endpoints.js";
 import { TimeTravelService } from "./services/timetravel.js";
+import { SqlService } from "./services/sql.js";
 import { LogsService } from "./services/logs.js";
 import { BranchQueue } from "./state/queue.js";
 import { reconcileEndpointsOnBoot } from "./state/reconcile.js";
@@ -58,8 +59,9 @@ async function main(): Promise<void> {
     const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
     const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints });
+    const sql = new SqlService({ branches, endpoints });
 
-    const app = buildServer({ cfg, state, engine, logs, services: { projects, branches, endpoints, timetravel } });
+    const app = buildServer({ cfg, state, engine, logs, services: { projects, branches, endpoints, timetravel, sql } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —

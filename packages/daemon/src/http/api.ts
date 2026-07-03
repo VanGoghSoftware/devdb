@@ -11,6 +11,7 @@ import type { BranchesService } from "../services/branches.js";
 import type { EndpointsService } from "../services/endpoints.js";
 import type { TimeTravelService } from "../services/timetravel.js";
 import type { LogsService } from "../services/logs.js";
+import type { SqlService } from "../services/sql.js";
 import { DevdbError } from "../services/errors.js";
 
 // T16 rider (ledgered at Task 12, optional): /api/status's top-level "version" comes from this
@@ -31,7 +32,7 @@ export interface Deps {
   logs: LogsService;
   services: {
     projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService;
-    timetravel: TimeTravelService;
+    timetravel: TimeTravelService; sql: SqlService;
   };
 }
 
@@ -299,6 +300,16 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.post("/api/branches/:id/reset", async (req) => {
     const { id } = req.params as { id: string };
     return deps.services.timetravel.resetToParent(id);
+  });
+
+  // The SQL console executes arbitrary SQL as the postgres SUPERUSER on the branch's endpoint —
+  // that is the product intent (spec Sec.Auth's localhost trust model), not an oversight: phase 1
+  // has no auth gating anywhere in front of this daemon's REST API, and this route is not a
+  // special case carved out from that posture.
+  const SqlBody = z.object({ branchId: z.string(), query: z.string() });
+  app.post("/api/sql", async (req) => {
+    const body = SqlBody.parse(req.body);
+    return deps.services.sql.run(body.branchId, body.query);
   });
 
   return app;
