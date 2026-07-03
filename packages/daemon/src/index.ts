@@ -88,7 +88,10 @@ async function main(): Promise<void> {
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, logger });
     const sql = new SqlService({ branches, endpoints });
 
-    const app = buildServer({ cfg, state, engine, logs, services: { projects, branches, endpoints, timetravel, sql } });
+    // Task 9 fix wave: `logger` threaded into Deps so mcp/tools.ts's guard() can log an
+    // unexpected/non-DevdbError tool failure's stack somewhere other than a swallowed message —
+    // this is the SAME logger instance already wired into every service above (Task 4).
+    const app = buildServer({ cfg, state, engine, logs, logger, services: { projects, branches, endpoints, timetravel, sql } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —

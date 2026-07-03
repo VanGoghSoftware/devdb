@@ -76,6 +76,14 @@ export function fakes(): {
 export interface McpToolsHarness {
   deps: Deps;
   /**
+   * The SAME typed engine-api fakes (`storcon`/`pageserver`/`safekeeper`/`computes`/`logger`)
+   * wired into every service the harness builds — exposed so a test can reconfigure a mock's
+   * return value (e.g. `vi.mocked(engineFakes.computes.statusOf).mockReturnValue("running")`,
+   * mirroring branches-service.test.ts's own post-start fixture) or assert a call was made
+   * (`engineFakes.computes.start`), without needing a second, divergent set of fakes.
+   */
+  engineFakes: ReturnType<typeof fakes>;
+  /**
    * Calls a registered tool by name through the REAL SDK dispatch path — a real `McpServer` with
    * `registerTools()` applied, connected to a real `Client` over `InMemoryTransport.
    * createLinkedPair()` (the SDK's own same-process client<->server pairing primitive, used
@@ -109,6 +117,10 @@ export async function makeReadToolsHarness(): Promise<McpToolsHarness> {
     state,
     engine: fakeEngine(),
     logs,
+    // Fix 1 (task-9 fix wave): the same typed fake Logger from fakes() — so mcp-tools.test.ts can
+    // assert guard() actually logged a non-DevdbError failure through THIS instance, not just that
+    // some logger somewhere was called.
+    logger: f.logger,
     services: { projects, branches, endpoints, timetravel, sql },
   };
 
@@ -122,6 +134,7 @@ export async function makeReadToolsHarness(): Promise<McpToolsHarness> {
 
   return {
     deps,
+    engineFakes: f,
     async call(name, args) {
       // callTool()'s declared return type is a union of CallToolResult (content: [...]) and the
       // experimental task-based {toolResult: ...} shape (only reachable by passing a `task` param

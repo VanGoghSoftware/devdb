@@ -12,6 +12,7 @@ import type { EndpointsService } from "../services/endpoints.js";
 import type { TimeTravelService } from "../services/timetravel.js";
 import type { LogsService } from "../services/logs.js";
 import type { SqlService } from "../services/sql.js";
+import type { Logger } from "../logging/logger.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
 import { daemonLogChannel } from "../logging/logger.js";
@@ -33,6 +34,11 @@ export interface Deps {
   state: StateDb;
   engine: EngineRuntime;
   logs: LogsService;
+  // Task 9 fix wave: optional (not required) so the ~25 pre-existing inline Deps literals across
+  // api.test.ts/mcp-http.test.ts's fakeDeps() — none of which exercise anything logger-related —
+  // don't all need editing just to satisfy a new required field. Only mcp/tools.ts's guard()
+  // reads this, falling back to console.error when absent (see tools.ts's guard() comment).
+  logger?: Logger;
   services: {
     projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService;
     timetravel: TimeTravelService; sql: SqlService;

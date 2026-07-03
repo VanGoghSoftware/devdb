@@ -53,11 +53,18 @@ export class ProjectsService {
 
   async create(a: { name: string; pgVersion?: PgVersion }): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
     const name = a.name.trim();
+    // Fix 5 (task-9 fix wave): both DevdbError messages now NAME A REMEDIATION, not just the
+    // failure reason — improved here at the service layer (not just in the MCP tool) so
+    // REST (POST /api/projects) benefits identically, per this fix's stated preference. A bare
+    // "invalid project name"/"already exists" tells a caller WHAT happened but not what to do
+    // about it; an agent especially can't self-correct from the reason alone.
     if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,62}$/.test(name)) {
-      throw new DevdbError(400, `invalid project name: ${JSON.stringify(a.name)}`);
+      throw new DevdbError(400,
+        `invalid project name: ${JSON.stringify(a.name)} — names must start with a letter or digit and contain only letters, digits, spaces, underscores, or hyphens (max 63 characters)`);
     }
     if (this.deps.state.projects.byName(name)) {
-      throw new DevdbError(409, `project "${name}" already exists`);
+      throw new DevdbError(409,
+        `project "${name}" already exists — choose a different name, or use the existing project (call list_projects to see it)`);
     }
     const pgVersion = a.pgVersion ?? DEFAULT_PG_VERSION;
     const projectId = newHexId(); // doubles as tenant id — oracle: project.rs:83-84
