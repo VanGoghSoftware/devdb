@@ -426,4 +426,98 @@ describe("ComputeManager", () => {
     expect(() => opts.onLine("hello world", "stdout")).not.toThrow();
     expect(secondReceived).toEqual(["hello world"]);
   });
+
+  // Fix 1 (review, regression guard): the exact first-start SCRAM race this task exists to
+  // close. ManagedProcess.start() resolving flips proc.state to "running" (the readiness NEEDLE
+  // firing) strictly BEFORE waitReady's structural gate (apply_spec/SCRAM commit) resolves — the
+  // whole reason Task 5 added waitReady in the first place. A statusOf() that reads proc.state
+  // directly during this window hands a concurrent BranchesService.detail() caller a "running"
+  // status (and therefore a connection string) for a compute that has not finished authenticating
+  // yet. `waitReady` here is a manually-controlled deferred promise (not fakeWaitReady()'s
+  // auto-resolving stub) specifically so the test can inspect statusOf() DURING the window between
+  // "needle fired" and "waitReady resolved", not just before-or-after it.
+  it("statusOf reports 'starting' (not 'running') between the readiness needle and waitReady resolving", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    let resolveWaitReady!: () => void;
+    const deferredWaitReady = vi.fn(
+      () => new Promise<void>((resolve) => { resolveWaitReady = resolve; }),
+    );
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady);
+    const branch = fakeBranch();
+
+    const startPromise = manager.start({ branch, pgVersion: 17 });
+
+    // Wait for the mocked ManagedProcess.start() to resolve — the point at which the real
+    // ManagedProcess would have already flipped proc.state to "running" (the needle fired).
+    // The test double doesn't do that transition on its own, so drive it explicitly here to
+    // model exactly that moment, then assert BEFORE waitReady has been given a chance to settle.
+    await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
+    const constructedProc = ManagedProcessMock.mock.results[0]!.value as { state: string };
+    constructedProc.state = "running";
+
+    // deferredWaitReady is now pending (compute_ctl started, but apply_spec/SCRAM has not
+    // committed) — statusOf must NOT say "running" here, and start() must not have resolved yet.
+    expect(manager.statusOf(branch.id)).toBe("starting");
+    let startSettled = false;
+    void startPromise.then(() => { startSettled = true; });
+    await Promise.resolve(); // flush one microtask turn — still must not have settled
+    expect(startSettled).toBe(false);
+
+    resolveWaitReady();
+    await startPromise;
+
+    expect(manager.statusOf(branch.id)).toBe("running");
+  });
+
+  // Fix 1 (review, regression guard): a crash DURING the readiness window (proc dies before
+  // waitReady settles) must still read as "failed", not get stuck reporting "starting" forever.
+  it("statusOf reports 'failed' if the proc dies while waitReady is still pending", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    const deferredWaitReady = vi.fn(() => new Promise<void>(() => {})); // never settles
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady);
+    const branch = fakeBranch();
+
+    void manager.start({ branch, pgVersion: 17 }).catch(() => {});
+
+    await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
+    const constructedProc = ManagedProcessMock.mock.results[0]!.value as { state: string };
+    constructedProc.state = "running";
+    expect(manager.statusOf(branch.id)).toBe("starting");
+
+    constructedProc.state = "failed";
+    expect(manager.statusOf(branch.id)).toBe("failed");
+  });
+
+  // Fix 3 (review, regression guard): the readiness-failure catch must never let a rejecting
+  // proc.stop() mask the ORIGINAL readiness error or skip the cleanup lines after it. Before the
+  // fix, `if (entry.proc) await entry.proc.stop();` with no try/catch meant a rejecting stop()
+  // here would (a) surface the STOP error to the caller instead of the readiness timeout/failure,
+  // and (b) never reach the map-delete/dir-remove/port-release lines below it — a stale map entry
+  // (permanent "already ..." on every later start for this branch) plus leaked ports.
+  it("start() failure cleanup surfaces the READINESS error (not a rejecting proc.stop()) and still releases ports/map entry", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    stopMock.mockRejectedValueOnce(new Error("stop() exploded during cleanup"));
+    const readinessError = new Error("compute readiness timed out after 50000ms");
+    // Fails the FIRST start's readiness gate only — the second start() at the end (proving the
+    // branch stays restartable) must succeed, or this test couldn't tell "cleanup ran properly"
+    // apart from "waitReady always rejects."
+    const failingWaitReady = vi.fn()
+      .mockRejectedValueOnce(readinessError)
+      .mockResolvedValueOnce(undefined);
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54333-54333" });
+    const manager = new ComputeManager(cfg, fakeLogger(), failingWaitReady);
+    const branch = fakeBranch();
+
+    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute readiness timed out after 50000ms");
+
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+    expect(manager.portOf(branch.id)).toBeNull();
+
+    // Single-port range: this only resolves if the failed start released the reserved port
+    // despite proc.stop() having rejected during its cleanup.
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54333 });
+  });
 });

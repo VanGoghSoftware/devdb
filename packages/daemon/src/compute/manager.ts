@@ -41,6 +41,10 @@ export class ComputeManager {
     if (!c) return "stopped";
     if (c.phase === "stopping") return "stopping";
     if (!c.proc) return "starting";
+    // Readiness window: the needle has fired (proc.state "running") but apply_spec/SCRAM has not
+    // committed. Do NOT expose "running" (detail() would hand out a connection string into the
+    // first-start auth race). A crash during startup must still read as failed.
+    if (c.phase === "starting") return c.proc.state === "failed" ? "failed" : "starting";
     return c.proc.state as EndpointStatus;
   }
 
@@ -50,7 +54,7 @@ export class ComputeManager {
 
   runningPorts(): Array<{ branchId: string; port: number }> {
     return [...this.computes.entries()]
-      .filter(([, c]) => c.proc?.state === "running" && c.port !== null)
+      .filter(([, c]) => c.phase === "running" && c.port !== null)
       .map(([branchId, c]) => ({ branchId, port: c.port as number }));
   }
 
@@ -168,7 +172,18 @@ export class ComputeManager {
       // setup above); once constructed, proc.stop() is a safe no-op if compute_ctl already exited
       // on its own (e.g. ManagedProcess.start()'s OWN readiness-needle timeout already SIGKILLed
       // it — see process.ts's catch — so this call just observes an already-null child and returns).
-      if (entry.proc) await entry.proc.stop();
+      // Fix 3 (review): proc.stop() is idempotent today, but must never be trusted to stay that
+      // way — if it ever rejects, a bare `await` here would replace the original readiness/launch
+      // error `e` (masking WHY start() failed) AND skip every line of cleanup below it (stale map
+      // entry, leaked dir, leaked ports — the exact failures this whole catch exists to prevent).
+      // Swallow (loudly) so `e` always survives to the throw at the bottom and cleanup always runs.
+      if (entry.proc) {
+        try {
+          await entry.proc.stop();
+        } catch (stopErr) {
+          this.logger.error(`start() cleanup: compute_ctl stop failed for branch ${a.branch.id}`, stopErr);
+        }
+      }
       if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
       if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
