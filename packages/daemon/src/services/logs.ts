@@ -34,6 +34,28 @@ export class LogsService {
     let set = this.subs.get(channel);
     if (!set) { set = new Set(); this.subs.set(channel, set); }
     set.add(cb);
-    return () => { set!.delete(cb); };
+    // Fix 3 (review): drop the channel's Set entirely once its last subscriber unsubscribes,
+    // rather than leaving an empty Set sitting in the map forever. A long-lived daemon serving
+    // many short-lived branches (each with its own `branch:<id>:compute` channel that gets
+    // subscribed-to once per SSE client, then unsubscribed on disconnect) would otherwise
+    // accumulate one permanently-empty Set per distinct channel ever subscribed to, unbounded
+    // over the daemon's lifetime — a slow memory leak with no cap, distinct from (and in addition
+    // to) the ring-buffer eviction evict() below handles.
+    return () => {
+      set!.delete(cb);
+      if (set!.size === 0) this.subs.delete(channel);
+    };
+  }
+
+  // Fix 3 (review): removes BOTH the ring buffer and subscriber Set for a channel outright —
+  // called when the channel's underlying subject is gone for good (a deleted branch's
+  // `branch:<id>:compute` channel will never be ingested to or subscribed to again, since branch
+  // ids are never reused). Without this, every branch ever created (however briefly) leaves a
+  // ring buffer entry in `rings` permanently, even long after the branch — and the compute that
+  // produced those lines — no longer exist: an unbounded leak keyed by a strictly-growing set of
+  // historical branch ids, on a daemon that otherwise runs indefinitely.
+  evict(channel: string): void {
+    this.rings.delete(channel);
+    this.subs.delete(channel);
   }
 }

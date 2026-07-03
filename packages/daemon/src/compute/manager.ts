@@ -51,7 +51,19 @@ export class ComputeManager {
   }
 
   // oracle: src/mgmt/compute/mod.rs:121-289 launch()
-  async start(a: { branch: BranchRow; pgVersion: PgVersion }): Promise<{ port: number }> {
+  //
+  // Review fix (Fix 1): `onLine` is accepted here (not wired in by a caller after start()
+  // resolves) and pushed onto entry.listeners at RESERVATION time — before any `await` — so a
+  // caller's launch/failure output is never missed. Previously EndpointsService subscribed via
+  // computes.onLine(branchId, cb) only after computes.start() had already resolved successfully;
+  // every line printed during the launch itself (including the lines explaining WHY a launch
+  // failed — compute_ctl's stdout/stderr right up to the point it exits, surfaced in
+  // ManagedProcess's "exited before ready" error message) reached nobody but the bounded
+  // in-process ring inside ManagedProcess, never LogsService's `branch:<id>:compute` channel or
+  // any SSE client tailing it. Registering the listener in the SAME synchronous tick that reserves
+  // the map slot means it's live for the entire lifetime of this compute entry — launch, running,
+  // and (via ComputeManager's own listener fanout closure below) right up to the process exiting.
+  async start(a: { branch: BranchRow; pgVersion: PgVersion; onLine?: (line: string) => void }): Promise<{ port: number }> {
     const existing = this.computes.get(a.branch.id);
     if (existing) {
       throw new Error(`endpoint for branch ${a.branch.name} already ${this.statusOf(a.branch.id)}`);
@@ -61,6 +73,7 @@ export class ComputeManager {
     const entry: RunningCompute = {
       proc: null, port: null, metricsPort: null, internalHttpPort: null, dir: null, listeners: [], phase: "starting",
     };
+    if (a.onLine) entry.listeners.push(a.onLine);
     this.computes.set(a.branch.id, entry);
 
     let dirCreated: string | null = null;

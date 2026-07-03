@@ -15,6 +15,7 @@ import { EndpointsService } from "./services/endpoints.js";
 import { TimeTravelService } from "./services/timetravel.js";
 import { LogsService } from "./services/logs.js";
 import { BranchQueue } from "./state/queue.js";
+import { reconcileEndpointsOnBoot } from "./state/reconcile.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -42,26 +43,19 @@ async function main(): Promise<void> {
     engine = new EngineRuntime(cfg, state, logs);
     await engine.start();
 
-    // Boot reconciliation (T16): every branch row left at a non-"stopped" endpoint_status
-    // belongs to a compute process that died with the previous container — ComputeManager
-    // starts this run with an empty map, so nothing is actually running regardless of what the
-    // row says. Reset status/port only; endpoint_error is diagnostic history and is preserved
-    // (a branch that failed before the restart should still show why on next inspection).
-    for (const p of state.projects.list()) {
-      for (const b of state.branches.listByProject(p.id)) {
-        if (b.endpointStatus !== "stopped") {
-          state.branches.updateEndpoint(b.id, { status: "stopped", port: null, error: b.endpointError });
-        }
-      }
-    }
+    // Boot reconciliation (T16; extracted to state/reconcile.ts under Fix 4 for direct unit
+    // coverage — see that module's doc comment for the full rationale).
+    reconcileEndpointsOnBoot(state);
 
     const storcon = new StorconClient();
     const pageserver = new PageserverClient();
     const safekeeper = new SafekeeperClient();
     computes = new ComputeManager(cfg);
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes });
+    // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
+    // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, logs });
     const queue = new BranchQueue();
-    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue });
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
     const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints });
 

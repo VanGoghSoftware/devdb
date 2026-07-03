@@ -30,7 +30,10 @@ export interface SafekeeperApi {
 }
 
 export interface ComputesApi {
-  start(a: { branch: BranchRow; pgVersion: PgVersion }): Promise<{ port: number }>;
+  // Fix 1: `onLine`, when supplied, is registered as a listener at map-reservation time (before
+  // any await inside ComputeManager.start()) so launch/failure output is never missed — see the
+  // doc comment on ComputeManager.start() for the full rationale.
+  start(a: { branch: BranchRow; pgVersion: PgVersion; onLine?: (line: string) => void }): Promise<{ port: number }>;
   stop(branchId: string): Promise<void>;
   statusOf(branchId: string): EndpointStatus;
   portOf(branchId: string): number | null;

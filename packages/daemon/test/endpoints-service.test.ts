@@ -131,33 +131,62 @@ describe("EndpointsService", () => {
     expect(detail.port).toBeNull();
   });
 
-  // T16: a successful start wires computes.onLine(branchId, cb) so the compute's stdout/stderr
-  // feeds LogsService's `branch:<id>:compute` channel (consumed by the SSE route in api.ts).
-  it("start wires computes.onLine to logs.ingest under the branch:<id>:compute channel", async () => {
+  // Fix 1 (restructure of the T16 wiring): start() now passes `onLine` straight into
+  // computes.start()'s args object rather than subscribing after the fact via a separate
+  // computes.onLine() call once start() has already resolved — the real ComputeManager
+  // registers this listener at map-reservation time (before its own first await), so output
+  // from the ENTIRE launch (including a launch that fails before ever reaching "running")
+  // reaches LogsService's `branch:<id>:compute` channel, not just output after the compute is
+  // already up.
+  it("start passes onLine into computes.start(), wired to logs.ingest under the branch:<id>:compute channel", async () => {
     const { f, mainBranch, endpoints, logs } = await seeded();
     vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
     vi.mocked(f.computes.portOf).mockReturnValue(54300);
     await endpoints.start(mainBranch.id);
 
-    expect(f.computes.onLine).toHaveBeenCalledWith(mainBranch.id, expect.any(Function));
-    // Drive the exact callback wired to onLine, as the real ComputeManager would when the
-    // compute prints a line, and confirm it lands on the expected LogsService channel.
-    const onLineCb = vi.mocked(f.computes.onLine).mock.calls[0]![1];
-    onLineCb("compute log line");
+    expect(f.computes.start).toHaveBeenCalledWith(expect.objectContaining({ onLine: expect.any(Function) }));
+    // Drive the exact callback passed to computes.start(), as the real ComputeManager would when
+    // the compute prints a line (at any point during its lifetime, including mid-launch), and
+    // confirm it lands on the expected LogsService channel.
+    const { onLine } = vi.mocked(f.computes.start).mock.calls[0]![0];
+    onLine!("compute log line");
     expect(logs.recent(`branch:${mainBranch.id}:compute`)).toEqual(["compute log line"]);
   });
 
-  // T16 self-review: computes.onLine's real implementation discards the whole listeners array
-  // on stop() (map entry deleted), so a leaked subscriber closure is moot on the manager side —
-  // but EndpointsService also tracks its own unsub and must call it, not just rely on that.
-  it("stop unsubscribes the compute-log listener returned by computes.onLine", async () => {
-    const { f, mainBranch, endpoints } = await seeded();
-    const unsub = vi.fn();
-    vi.mocked(f.computes.onLine).mockReturnValueOnce(unsub);
+  // Fix 1: lines emitted BEFORE the compute reaches "running" (i.e. during an in-flight launch)
+  // must still reach the logs channel — this is the whole point of registering onLine at
+  // reservation time inside ComputeManager rather than after start() resolves. Simulated here by
+  // invoking the captured onLine callback from inside a still-unresolved computes.start() mock,
+  // mirroring exactly how the real manager would call it mid-launch.
+  it("onLine passed into computes.start() reaches the logs channel for lines emitted before start() resolves", async () => {
+    const { f, mainBranch, endpoints, logs } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    let capturedOnLine!: (line: string) => void;
+    vi.mocked(f.computes.start).mockImplementationOnce(async (a) => {
+      capturedOnLine = a.onLine!;
+      capturedOnLine("line printed while still starting");
+      return { port: 54300 };
+    });
+
     await endpoints.start(mainBranch.id);
-    expect(unsub).not.toHaveBeenCalled();
-    await endpoints.stop(mainBranch.id);
-    expect(unsub).toHaveBeenCalledOnce();
+
+    expect(logs.recent(`branch:${mainBranch.id}:compute`)).toEqual(["line printed while still starting"]);
+  });
+
+  // Fix 1: a launch FAILURE's output must also reach the logs channel — this is exactly the case
+  // the old post-hoc computes.onLine() subscription (only wired after a SUCCESSFUL start()) could
+  // never cover, since a rejected start() never reached that subscribe call.
+  it("onLine passed into computes.start() reaches the logs channel even when the launch fails", async () => {
+    const { f, mainBranch, endpoints, logs } = await seeded();
+    vi.mocked(f.computes.start).mockImplementationOnce(async (a) => {
+      a.onLine!("compute_ctl: fatal error before ready");
+      throw new Error("compute_ctl exited before ready");
+    });
+
+    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/compute_ctl exited before ready/);
+
+    expect(logs.recent(`branch:${mainBranch.id}:compute`)).toEqual(["compute_ctl: fatal error before ready"]);
   });
 
   it("ensureRunning starts when not running", async () => {

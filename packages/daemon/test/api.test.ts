@@ -497,14 +497,37 @@ describe("buildServer SSE log routes", () => {
     }
   });
 
-  it("GET /api/daemon/logs/:component — a channel with no ingested lines still opens a 200 stream with an empty replay", async () => {
+  // Fix 3 (review) changed the component-name contract for this route from "any string" to an
+  // explicit allowlist (see the DAEMON_LOG_COMPONENTS check in api.ts) — a genuinely nonexistent
+  // component (this test's original "never-touched") is now correctly a 404, covered separately
+  // below. "pageserver" is a real allowlisted component that simply hasn't had anything ingested
+  // to it YET in this particular LogsService instance — that's the actual case this test targets:
+  // an empty recent() replay must still open a 200 stream, not that any arbitrary string does.
+  it("GET /api/daemon/logs/:component — an allowlisted channel with no ingested lines yet still opens a 200 stream with an empty replay", async () => {
     const logs = new LogsService();
     const { app, base } = await listening(logs);
     try {
       const ac = new AbortController();
-      const res = await fetch(`${base}/api/daemon/logs/never-touched`, { signal: ac.signal });
+      const res = await fetch(`${base}/api/daemon/logs/pageserver`, { signal: ac.signal });
       expect(res.status).toBe(200);
       ac.abort();
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Fix 3 (review): the daemon logs route now 404s for any component NOT in the fixed allowlist
+  // (storcon_db, storage_broker, storage_controller, safekeeper, pageserver — the exact set
+  // EngineRuntime ever ingests under `daemon:<component>`, see engine/boot.ts and engine/
+  // configs.ts's *Spec() functions). Before this fix, any string opened an indefinite 200 SSE
+  // stream against a channel LogsService had never heard of and never would.
+  it("GET /api/daemon/logs/:component — 404s for a component outside the fixed allowlist", async () => {
+    const logs = new LogsService();
+    const { app, base } = await listening(logs);
+    try {
+      const res = await fetch(`${base}/api/daemon/logs/never-touched`);
+      expect(res.status).toBe(404);
+      expect((await res.json()).error).toMatch(/never-touched/);
     } finally {
       await app.close();
     }

@@ -29,12 +29,13 @@ export async function buildImage(): Promise<void> {
 // container is actually healthy again within about a second; a bare retry of restart() does not
 // reliably route around this either (reproduced 3 consecutive throws on a second restart round
 // in the same process). Two mitigations follow: retryStart() below retries the ENTIRE
-// GenericContainer(...).start() chain (a fresh container each attempt — a container orphaned by
-// a failed attempt is still labeled for testcontainers' own reaper/Ryuk cleanup, so it does not
-// leak past this process's lifetime), and Devdb.restart() treats the specific throw as
-// informational rather than fatal, confirming the container is actually back via a live
-// `docker port` + /api/status poll and refreshing THIS Devdb instance's own `ports` map (never
-// testcontainers' internal one, which the restart failure path leaves stale).
+// GenericContainer(...).start() chain (a fresh, uniquely-named container each attempt — best-
+// effort stopped immediately on a caught failure rather than left for testcontainers' own
+// reaper/Ryuk to eventually clean up at session end, see retryStart()'s own doc comment for why
+// and how), and Devdb.restart() treats the specific throw as informational rather than fatal,
+// confirming the container is actually back via a live `docker port` + /api/status poll and
+// refreshing THIS Devdb instance's own `ports` map (never testcontainers' internal one, which the
+// restart failure path leaves stale).
 async function livePort(containerId: string, containerPort: number): Promise<number> {
   const { stdout } = await execa("docker", ["port", containerId, `${containerPort}/tcp`]);
   // Typical output: "0.0.0.0:55599\n[::]:55599" — take the first line's port number.
@@ -49,14 +50,46 @@ function isPortRace(e: unknown): boolean {
   return message.includes("No host port found for host IP");
 }
 
-async function retryStart(build: () => Promise<StartedTestContainer>, attempts = 3): Promise<StartedTestContainer> {
+// Fix 5 (review): traced through generic-container.js's startContainer() (testcontainers@10.28.0)
+// to confirm exactly where this throw lands — client.container.create() and client.container.
+// start() (the actual `docker create`+`docker start`) both run and SUCCEED before
+// BoundPorts.fromInspectResult() throws "No host port found for host IP"; the throw is purely in
+// testcontainers' own post-start port-binding bookkeeping. That means every failed attempt here
+// leaves a REAL, running Docker container behind — GenericContainer's `.start()` promise rejects
+// with no return value, so its container id is never exposed to this function; the only prior
+// safety net was testcontainers' own Ryuk reaper, which cleans up labeled containers but only at
+// session end (or on an explicit signal), not immediately. With 3 retry attempts possible per
+// startDevdb() call and this helper used by 6+ integration test files, a flaky CI run could
+// accumulate several live (if useless) `devdb:dev` containers for the lifetime of the whole test
+// run before Ryuk ever reaps them.
+//
+// Fix: assign each attempt a predictable name via .withName() BEFORE calling build() — a
+// reference to "the failed attempt" testcontainers itself never had to hand back — so that on a
+// caught port-race throw, this function can `docker stop` that exact container immediately
+// instead of waiting on Ryuk. Best-effort and guarded: `docker stop` on a container that doesn't
+// exist (the throw happened before `docker create` for some OTHER reason we don't fully
+// understand) or is already gone must never mask the real port-race error being retried around.
+async function retryStart(
+  build: (attemptName: string) => Promise<StartedTestContainer>, attempts = 3,
+): Promise<StartedTestContainer> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
+    const attemptName = `devdb-integration-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`;
     try {
-      return await build();
+      return await build(attemptName);
     } catch (e) {
       if (!isPortRace(e)) throw e;
       lastErr = e;
+      // Best-effort: stop the container this failed attempt actually created and started in
+      // Docker (confirmed live above the throw) so it isn't left running until Ryuk eventually
+      // reaps it. Never let a failure HERE (container already gone, name mismatch, docker CLI
+      // hiccup) mask or replace the port-race error this loop is retrying around — swallow and
+      // move on to the retry regardless.
+      try {
+        await execa("docker", ["stop", attemptName]);
+      } catch (stopErr) {
+        console.error(`retryStart: best-effort stop of failed attempt "${attemptName}" also failed (non-fatal, continuing retry):`, stopErr);
+      }
       // A short pause before retrying the whole start() chain — the race is a timing window,
       // not a persistent condition, so giving Docker a moment before the next attempt (which
       // creates and starts an entirely new container) is cheap insurance against re-hitting it
@@ -86,8 +119,9 @@ export async function startDevdb(env: Record<string, string> = {}): Promise<Devd
   await buildImage();
   const endpointPorts = Array.from({ length: 10 }, (_, i) => 54300 + i);
   const exposedPorts = [4400, ...endpointPorts];
-  const container = await retryStart(() =>
+  const container = await retryStart((attemptName) =>
     new GenericContainer(IMAGE)
+      .withName(attemptName)
       .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
       .withExposedPorts(...exposedPorts)
       .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))

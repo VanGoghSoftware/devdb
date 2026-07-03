@@ -18,13 +18,6 @@ export interface EndpointsLockedApi {
 }
 
 export class EndpointsService {
-  // One live compute-log subscription per branch, tracked so stopLocked can proactively
-  // unsubscribe. Not strictly load-bearing for correctness — ComputeManager.stop() discards
-  // the whole compute entry (including its listeners array) on stop, so an un-called unsub
-  // closure becomes unreachable garbage regardless — but explicit cleanup avoids relying on
-  // that as the only backstop and keeps this service's own bookkeeping honest.
-  private computeLogSubs = new Map<string, () => void>();
-
   constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService; logs: LogsService }) {}
 
   // Queued body shared by start()/ensureRunning() — see the comment on ensureRunning() for why
@@ -43,14 +36,18 @@ export class EndpointsService {
     }
     this.deps.state.branches.updateEndpoint(branch.id, { status: "starting", port: null });
     try {
-      const { port } = await this.deps.computes.start({ branch, pgVersion: project.pgVersion });
-      // Wire this compute's stdout/stderr into LogsService's `branch:<id>:compute` channel —
-      // feeds both recent() replay and the live SSE tail. Registered only once per successful
-      // launch (statusOf()'s early-return above prevents re-entry into this block for an
-      // already-running compute, so this can't double-subscribe onto the same live entry).
-      const unsub = this.deps.computes.onLine(branch.id, (line) =>
-        this.deps.logs.ingest(`branch:${branch.id}:compute`, line));
-      this.computeLogSubs.set(branch.id, unsub);
+      // Fix 1: `onLine` is passed straight into computes.start() rather than subscribed after
+      // the fact via a separate computes.onLine() call once start() resolves. ComputeManager
+      // registers this listener at map-reservation time — before its own first await — so
+      // output from the ENTIRE launch (including a failed launch's last lines, which is exactly
+      // what a caller most wants to see in the logs channel to understand why) reaches
+      // LogsService's `branch:<id>:compute` channel. The manager's own entry lifecycle (stop(),
+      // delete(), or a failed start()'s cleanup) now owns this listener's cleanup — there is
+      // nothing left for this service to unsubscribe on any stop path.
+      const { port } = await this.deps.computes.start({
+        branch, pgVersion: project.pgVersion,
+        onLine: (line) => this.deps.logs.ingest(`branch:${branch.id}:compute`, line),
+      });
       try {
         this.deps.state.branches.updateEndpoint(branch.id, { status: "running", port });
       } catch (persistErr) {
@@ -58,10 +55,6 @@ export class EndpointsService {
         // worse, a half-written "running") would strand a running process the daemon no longer
         // believes exists. Best-effort tear the compute back down and mark the branch failed
         // before surfacing the original persist error.
-        // computes.stop() discards the whole entry (incl. its listeners), so the subscription
-        // above is moot on the manager side either way — drop our own tracking entry too so
-        // this map doesn't accumulate a stale reference across this failure path.
-        this.computeLogSubs.delete(branch.id);
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           console.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure:`, stopErr));
         try {
@@ -105,11 +98,11 @@ export class EndpointsService {
   async stopLocked(branchId: string): Promise<BranchDetail> {
     const branch = this.deps.branches.byIdOr404(branchId);
     this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
-    // computes.stop() discards the whole compute entry (including its listeners array), so this
-    // is not the only thing standing between a stopped compute and a leaked subscription — but
-    // it retires our own bookkeeping proactively rather than leaning on that as the sole backstop.
-    this.computeLogSubs.get(branch.id)?.();
-    this.computeLogSubs.delete(branch.id);
+    // Fix 1: no separate unsub bookkeeping here anymore — computes.stop() discards the whole
+    // compute entry (including its listeners array, which now includes the onLine callback
+    // passed into computes.start() above) unconditionally in its own finally block, so listener
+    // cleanup is owned entirely by ComputeManager's entry lifecycle on every stop path (stop,
+    // delete, or a failed start's own cleanup).
     try {
       await this.deps.computes.stop(branch.id);
     } finally {

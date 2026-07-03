@@ -2,6 +2,7 @@ import { DEFAULT_PG_VERSION, type PgVersion } from "@devdb/shared";
 import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
+import type { LogsService } from "./logs.js";
 import { newHexId } from "../engine/ids.js";
 import { generatePassword } from "../compute/scram.js";
 import { DevdbError } from "./errors.js";
@@ -29,7 +30,13 @@ export const TENANT_CONFIG = {
 };
 
 export class ProjectsService {
-  constructor(private deps: ProjectsDeps) {}
+  // Fix 3 (review): `logs` is an OPTIONAL extra dep, not added to the shared ProjectsDeps
+  // interface — ProjectsDeps is also the base type BranchesService/EndpointsService extend for
+  // their OWN deps, and this eviction concern is specific to ProjectsService's delete() leaves
+  // loop (mirrors BranchesService's own optional `logs?: LogsService`, same rationale: plenty of
+  // existing tests construct this service without a LogsService, and evict() here is cleanup, not
+  // something delete()'s correctness depends on).
+  constructor(private deps: ProjectsDeps & { logs?: LogsService }) {}
 
   async create(a: { name: string; pgVersion?: PgVersion }): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
     const name = a.name.trim();
@@ -120,6 +127,10 @@ export class ProjectsService {
         await this.deps.pageserver.timelineDelete(project.id, leaf.timelineId);
         await this.deps.safekeeper.timelineDelete(project.id, leaf.timelineId);
         this.deps.state.branches.delete(leaf.id);
+        // Fix 3 (review): same rationale as BranchesService.delete()'s own evict() call — this
+        // leaf's branch id is gone for good, so its `branch:<id>:compute` channel (ring + subs)
+        // should go with it rather than accumulating in LogsService for the life of the daemon.
+        this.deps.logs?.evict(`branch:${leaf.id}:compute`);
         remaining.delete(leaf.id);
       }
     }

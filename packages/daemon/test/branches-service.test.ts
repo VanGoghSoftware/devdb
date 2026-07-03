@@ -3,6 +3,7 @@ import { openState } from "../src/state/db.js";
 import { BranchQueue } from "../src/state/queue.js";
 import { BranchesService } from "../src/services/branches.js";
 import { ProjectsService } from "../src/services/projects.js";
+import { LogsService } from "../src/services/logs.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
@@ -91,6 +92,33 @@ describe("BranchesService", () => {
     await branches.delete(dev.id);
     expect(f.pageserver.timelineDelete).toHaveBeenCalledWith(project.id, dev.timelineId);
     expect(f.safekeeper.timelineDelete).toHaveBeenCalledWith(project.id, dev.timelineId);
+  });
+
+  // Fix 3 (review): delete() evicts the deleted branch's `branch:<id>:compute` channel — a
+  // deleted branch id is never reused, so its logs channel (ring buffer + any subscribers) has
+  // nothing left to serve and would otherwise sit in LogsService forever.
+  it("delete evicts the branch's logs channel", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const projects = new ProjectsService({ state, ...f });
+    const { project } = await projects.create({ name: "acme" });
+    const logs = new LogsService();
+    const branches = new BranchesService({ state, queue: new BranchQueue(), logs, ...f });
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+    logs.ingest(`branch:${dev.id}:compute`, "some compute output");
+    expect(logs.recent(`branch:${dev.id}:compute`)).toEqual(["some compute output"]);
+
+    await branches.delete(dev.id);
+
+    expect(logs.recent(`branch:${dev.id}:compute`)).toEqual([]);
+  });
+
+  // `logs` is an OPTIONAL dep (see the constructor's doc comment) — delete() must not throw when
+  // it's simply omitted, which is exactly what every OTHER test in this file (via seeded()) does.
+  it("delete works without throwing when logs is omitted from deps", async () => {
+    const { project, branches } = await seeded();
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+    await expect(branches.delete(dev.id)).resolves.toBeUndefined();
   });
 
   // Amendment A11 (controller): connectionString percent-encodes the password via

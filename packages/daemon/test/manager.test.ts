@@ -162,6 +162,63 @@ describe("ComputeManager", () => {
     await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: expect.any(Number) });
   });
 
+  // Fix 1 (review): `onLine` supplied to start()'s args must be registered at map-reservation
+  // time — before the first await — so it captures every line printed DURING the launch itself,
+  // not just once start() has already resolved. Drives the exact in-flight pattern the
+  // "throws on a double-start" test above uses (an unresolved startMock) so this exercises a
+  // real "launch is still in progress" window, not a race against microtasks.
+  it("onLine passed to start() receives lines emitted BEFORE the launch resolves (readiness)", async () => {
+    let releaseStart!: () => void;
+    startMock.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { releaseStart = resolve; }),
+    );
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+    const received: string[] = [];
+
+    const startPromise = manager.start({ branch, pgVersion: 17, onLine: (line) => received.push(line) });
+
+    // Wait for the ManagedProcess constructor call (setup — port alloc, dir/file writes — has
+    // completed) so the fanout closure passed to ManagedProcess's `onLine` opt actually exists,
+    // then drive it directly to simulate compute_ctl printing output while still starting
+    // (unresolved startMock == "not yet ready").
+    await vi.waitFor(() => expect(ManagedProcessMock).toHaveBeenCalledTimes(1));
+    const opts = ManagedProcessMock.mock.calls[0]![0] as { onLine: (line: string, stream: "stdout" | "stderr") => void };
+    opts.onLine("compute_ctl: starting up", "stdout");
+    expect(received).toEqual(["compute_ctl: starting up"]);
+
+    releaseStart();
+    await startPromise;
+  });
+
+  // Fix 1 (review): the specific failure-path counterpart to the test above — a launch that
+  // FAILS must still have surfaced its output to the caller's onLine before the rejection, since
+  // that output (compute_ctl's last lines before it exited) is exactly what explains WHY the
+  // launch failed. Previously EndpointsService only subscribed via computes.onLine() AFTER
+  // computes.start() resolved — which a rejected start() never does — so this class of output
+  // never reached the logs channel at all.
+  it("onLine passed to start() receives lines emitted before a launch FAILURE", async () => {
+    let rejectStart!: (e: Error) => void;
+    startMock.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => { rejectStart = reject; }),
+    );
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+    const received: string[] = [];
+
+    const startPromise = manager.start({ branch, pgVersion: 17, onLine: (line) => received.push(line) });
+
+    await vi.waitFor(() => expect(ManagedProcessMock).toHaveBeenCalledTimes(1));
+    const opts = ManagedProcessMock.mock.calls[0]![0] as { onLine: (line: string, stream: "stdout" | "stderr") => void };
+    opts.onLine("compute_ctl: fatal: could not bind port", "stderr");
+    rejectStart(new Error("compute_ctl exited before ready"));
+
+    await expect(startPromise).rejects.toThrow("compute_ctl exited before ready");
+    expect(received).toEqual(["compute_ctl: fatal: could not bind port"]);
+  });
+
   it("reports 'stopping' status while stop() is in flight, then 'stopped' with the dir removed", async () => {
     startMock.mockResolvedValueOnce(undefined);
     let releaseStop!: () => void;

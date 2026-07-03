@@ -7,6 +7,7 @@ import { EngineApiError } from "../engine/http.js";
 import { DevdbError } from "./errors.js";
 import { slugify } from "./slug.js";
 import type { ProjectsDeps } from "./projects.js";
+import type { LogsService } from "./logs.js";
 
 export type BranchDetail = BranchRow & {
   endpointStatus: EndpointStatus;
@@ -21,7 +22,13 @@ export type BranchDetail = BranchRow & {
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9 /._-]{0,62}$/;
 
 export class BranchesService {
-  constructor(private deps: ProjectsDeps & { queue: BranchQueue }) {}
+  // Fix 3 (review): `logs` is OPTIONAL — unlike EndpointsService's required `logs` dep, plenty of
+  // existing unit tests construct BranchesService directly without a LogsService in hand (it has
+  // nothing to do with the compute-startup log wiring Fix 1 touches), and evict() on delete is a
+  // cleanup nicety, not something delete()'s correctness depends on. Optional-chained at the one
+  // call site below rather than forcing every existing test/caller to thread a real or fake
+  // LogsService through just for this.
+  constructor(private deps: ProjectsDeps & { queue: BranchQueue; logs?: LogsService }) {}
 
   byIdOr404(id: string): BranchRow {
     const b = this.deps.state.branches.byId(id);
@@ -153,6 +160,11 @@ export class BranchesService {
       await this.deps.pageserver.timelineDelete(branch.projectId, branch.timelineId);
       await this.deps.safekeeper.timelineDelete(branch.projectId, branch.timelineId);
       this.deps.state.branches.delete(branch.id);
+      // Fix 3 (review): this branch id is gone for good (never reused) — its
+      // `branch:<id>:compute` channel will never be ingested to or subscribed to again, so drop
+      // both the ring buffer and any subscriber Set for it now rather than letting LogsService
+      // hold onto them forever.
+      this.deps.logs?.evict(`branch:${branch.id}:compute`);
     });
   }
 }

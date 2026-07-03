@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { openState } from "../src/state/db.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { slugify } from "../src/services/slug.js";
+import { LogsService } from "../src/services/logs.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { BranchRow } from "../src/state/repos.js";
 import type { EndpointStatus } from "@devdb/shared";
@@ -102,6 +103,39 @@ describe("ProjectsService", () => {
     expect(order.indexOf("c".repeat(32))).toBeLessThan(order.indexOf(mainBranch.timelineId));
     expect(f.pageserver.tenantDelete).toHaveBeenCalledWith(project.id);
     expect(f.safekeeper.tenantDelete).toHaveBeenCalledWith(project.id);
+  });
+
+  // Fix 3 (review): the leaves loop in delete() evicts EVERY branch's `branch:<id>:compute`
+  // channel as it's removed (children first, same as the timeline/tenant cleanup order above) —
+  // mirrors BranchesService.delete()'s own single-branch evict(), applied per-leaf here since a
+  // project delete can remove many branches in one call.
+  it("delete evicts every removed branch's logs channel", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const logs = new LogsService();
+    const svc = new ProjectsService({ state, logs, ...f });
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+    const dev = state.branches.create({
+      id: crypto.randomUUID(), projectId: project.id, parentBranchId: mainBranch.id,
+      name: "dev", slug: "acme-dev", timelineId: "c".repeat(32), password: "x", createdBy: "api",
+    });
+    logs.ingest(`branch:${mainBranch.id}:compute`, "main output");
+    logs.ingest(`branch:${dev.id}:compute`, "dev output");
+
+    await svc.delete(project.id);
+
+    expect(logs.recent(`branch:${mainBranch.id}:compute`)).toEqual([]);
+    expect(logs.recent(`branch:${dev.id}:compute`)).toEqual([]);
+  });
+
+  // `logs` is an OPTIONAL dep (see the constructor's doc comment) — delete() must not throw when
+  // it's simply omitted, which is exactly what every OTHER test in this file (fakes()-only) does.
+  it("delete works without throwing when logs is omitted from deps", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const svc = new ProjectsService({ state, ...f });
+    const { project } = await svc.create({ name: "acme" });
+    await expect(svc.delete(project.id)).resolves.toBeUndefined();
   });
 
   it("compensates the tenant when bootstrap fails", async () => {

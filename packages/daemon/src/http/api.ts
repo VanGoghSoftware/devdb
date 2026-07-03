@@ -92,6 +92,18 @@ export function buildServer(deps: Deps): FastifyInstance {
   // never observed as sent, until the FIRST live line arrives (which may be never, for a daemon
   // component that hasn't logged anything yet, or a freshly-started compute). Every client must
   // see its 200 + headers immediately on connect regardless of whether there's backlog to replay.
+  // Fix 2 (review): backpressure + write-safety hardening. Node's http.ServerResponse.write()
+  // returns `false` when the socket's internal buffer is over its highWaterMark — this is the
+  // documented signal that the client (or its network path) is reading slower than this server is
+  // producing lines. Buffering unboundedly in that case (the pre-fix code did: every write() call
+  // site ignored the return value) would let one slow SSE client's kernel/user-space write buffer
+  // grow forever for as long as ingest() keeps producing lines, an unbounded per-connection memory
+  // leak with no cap. The policy adopted here is intentionally simple and bounded: on the FIRST
+  // slow-write signal (or a write that throws, or a write attempted against an already-
+  // ended/destroyed socket), tear the connection down and unsubscribe — never buffer past that
+  // point. The client's EventSource/fetch reconnects on its own (SSE's standard behavior) and
+  // replays via recent() from the top, so no lines are silently lost forever — just re-delivered
+  // on the next connection, which is a far safer failure mode than an unbounded write buffer.
   function sse(reply: FastifyReply, channel: string): void {
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -100,11 +112,77 @@ export function buildServer(deps: Deps): FastifyInstance {
       connection: "keep-alive",
     });
     reply.raw.flushHeaders();
-    for (const line of deps.logs.recent(channel)) {
-      reply.raw.write(`data: ${JSON.stringify(line)}\n\n`);
+
+    // A write against a socket that's already erroring (e.g. an ECONNRESET from a client that
+    // vanished mid-write) would otherwise surface as an uncaught "error" event on reply.raw and
+    // crash the process — Node's EventEmitter contract treats an "error" event with zero
+    // listeners as fatal. This handler exists solely to prevent that; the actual teardown for a
+    // dead connection happens through safeWrite()'s own destroyed/writableEnded check and the
+    // "close" handler below, not through this listener's body.
+    reply.raw.on("error", () => {});
+
+    // Mutable + assigned a real no-op up front (rather than left as a `const` declared only after
+    // the replay loop below) so that safeWrite() failing on the very FIRST replayed line — before
+    // logs.subscribe() ever runs — can still call teardown() safely instead of throwing a
+    // temporal-dead-zone ReferenceError. Reassigned to the real unsubscribe closure once
+    // logs.subscribe() is actually called, further down.
+    let unsub: () => void = () => {};
+
+    // teardown() is idempotent-safe to call more than once (write failures can cascade across
+    // the replay loop and a live callback firing in the same tick) — end()/unsub() on an
+    // already-ended/unsubscribed reply.raw is harmless, and deleting from openSseResponses twice
+    // is a no-op Set.delete().
+    function teardown(): void {
+      unsub();
+      openSseResponses.delete(reply.raw);
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) reply.raw.end();
     }
-    const unsub = deps.logs.subscribe(channel, (line) => {
-      reply.raw.write(`data: ${JSON.stringify(line)}\n\n`);
+
+    // Returns false (and tears the connection down) if the write did not go through — either
+    // because the socket was already gone, the write threw, or Node's own backpressure signal
+    // fired. Every call site (replay loop below, and the live subscribe() callback) must check
+    // this return value and stop writing further lines once it's false — the socket is being
+    // torn down and any subsequent write would either throw or buffer onto a dead connection.
+    function safeWrite(line: string): boolean {
+      if (reply.raw.writableEnded || reply.raw.destroyed) {
+        teardown();
+        return false;
+      }
+      try {
+        const ok = reply.raw.write(`data: ${JSON.stringify(line)}\n\n`);
+        if (!ok) {
+          // Slow client (backpressure) — bounded policy: drop the connection rather than buffer
+          // unboundedly. The client's own reconnect + recent()-replay makes this a safe drop.
+          teardown();
+          return false;
+        }
+        return true;
+      } catch {
+        // A write against a socket mid-teardown (e.g. a race between this write and the
+        // "close" event firing) must never crash log ingestion for other subscribers on this
+        // channel — same swallow contract as LogsService.ingest's per-subscriber try/catch.
+        teardown();
+        return false;
+      }
+    }
+
+    let replayFailed = false;
+    for (const line of deps.logs.recent(channel)) {
+      // Abort the replay loop on the first failed write — teardown() has already unsubscribed
+      // and ended the response, so continuing to iterate would just call write() again against
+      // an already-ended socket for no benefit.
+      if (!safeWrite(line)) { replayFailed = true; break; }
+    }
+
+    // If the replay loop above already tore this connection down (dead socket, or backpressure
+    // on the very first replayed line), skip subscribing entirely — there is nothing live left to
+    // feed, and registering a subscriber here just to have its very next callback immediately
+    // hit safeWrite()'s writableEnded/destroyed check and call teardown() again would be pure
+    // waste (and a — harmless but pointless — brief live entry in LogsService's subscriber Set).
+    if (replayFailed) return;
+
+    unsub = deps.logs.subscribe(channel, (line) => {
+      safeWrite(line);
     });
     openSseResponses.add(reply.raw);
     reply.raw.on("close", () => {
@@ -113,8 +191,21 @@ export function buildServer(deps: Deps): FastifyInstance {
     });
   }
 
+  // Fix 3 (review): allowlist the exact set of components EngineRuntime ever ingests under a
+  // `daemon:<component>` channel (see engine/boot.ts and engine/configs.ts's *Spec() functions'
+  // `name` fields) — storcon_db (embedded postgres), the four ManagedProcess-supervised engine
+  // components. Before this, any string in the :component path param opened an SSE stream (200,
+  // headers flushed, indefinite hang) against a channel LogsService had never heard of and never
+  // would — an unauthenticated way to hold open arbitrarily many never-closing connections against
+  // this daemon by hitting distinct nonsense component names, each backed by nothing.
+  const DAEMON_LOG_COMPONENTS = new Set([
+    "storcon_db", "storage_broker", "storage_controller", "safekeeper", "pageserver",
+  ]);
   app.get("/api/daemon/logs/:component", async (req, reply) => {
     const { component } = req.params as { component: string };
+    if (!DAEMON_LOG_COMPONENTS.has(component)) {
+      throw new DevdbError(404, `unknown daemon component: ${JSON.stringify(component)}`);
+    }
     sse(reply, `daemon:${component}`);
   });
 
