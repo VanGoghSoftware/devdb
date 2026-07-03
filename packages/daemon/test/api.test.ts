@@ -7,6 +7,7 @@ import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
 import type { SqlService } from "../src/services/sql.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
@@ -43,6 +44,12 @@ function fakeEngine(): EngineRuntime {
 // there's no external system boundary to stand in for).
 function fakeLogs(): LogsService {
   return new LogsService();
+}
+
+// EventsService (Task 1) — same rationale as fakeLogs(): a plain in-process fanout class with no
+// external dependencies, so a real instance is used rather than a mock.
+function fakeEvents(): EventsService {
+  return new EventsService();
 }
 
 // Only the methods api.ts's routes actually call need to exist for these tests; the rest of
@@ -95,7 +102,7 @@ describe("buildServer error handling", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -120,7 +127,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.create).mockResolvedValue(fakeBranch as unknown as Awaited<ReturnType<BranchesService["create"]>>);
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -155,7 +162,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.create).mockResolvedValue(fakeBranch as unknown as Awaited<ReturnType<BranchesService["create"]>>);
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -182,7 +189,7 @@ describe("buildServer branch routes", () => {
     const rows = [fakeBranchDetail({ id: "branch-1" }), fakeBranchDetail({ id: "branch-2" })];
     vi.mocked(branches.list).mockResolvedValue(rows);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -204,7 +211,7 @@ describe("buildServer branch routes", () => {
     );
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -229,7 +236,7 @@ describe("buildServer branch routes", () => {
       throw new DevdbError(404, "branch does-not-exist not found");
     });
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -245,7 +252,7 @@ describe("buildServer branch routes", () => {
     const branches = fakeBranches();
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -273,7 +280,7 @@ describe("buildServer endpoint routes", () => {
     });
     vi.mocked(endpoints.start).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -295,7 +302,7 @@ describe("buildServer endpoint routes", () => {
       new DevdbError(409, "no free endpoint port in range — running endpoints: main, dev. Stop one or widen DEVDB_PORT_RANGE."),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -312,7 +319,7 @@ describe("buildServer endpoint routes", () => {
     const fakeDetail = fakeBranchDetail({ id: "branch-1", endpointStatus: "stopped", port: null, connectionString: null });
     vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -334,7 +341,7 @@ describe("buildServer endpoint routes", () => {
       { endpointStatus: "running", port: 54300 } as unknown as Awaited<ReturnType<BranchesService["detail"]>>,
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -352,7 +359,7 @@ describe("buildServer time travel routes", () => {
     const timetravel = fakeTimetravel();
     vi.mocked(timetravel.lsnAtTimestamp).mockResolvedValue("0/1A2B3C");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -367,7 +374,7 @@ describe("buildServer time travel routes", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -385,7 +392,7 @@ describe("buildServer time travel routes", () => {
       new DevdbError(400, `cannot resolve 2030-01-01T00:00:00Z on "main": that timestamp is ahead of this branch's history (kind=future)`),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -402,7 +409,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = fakeBranchDetail({ id: "branch-2", name: "main", endpointStatus: "stopped", port: null, connectionString: null });
     vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -431,7 +438,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = fakeBranchDetail({ id: "branch-3", name: "rescued", endpointStatus: "stopped", port: null, connectionString: null });
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -455,7 +462,7 @@ describe("buildServer time travel routes", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -474,7 +481,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = fakeBranchDetail({ id: "branch-4", name: "dev", endpointStatus: "stopped", port: null, connectionString: null });
     vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -495,7 +502,7 @@ describe("buildServer time travel routes", () => {
       new DevdbError(409, `branch "dev" has child branches: grandchild — delete them first`),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -514,7 +521,7 @@ describe("buildServer /api/sql", () => {
     const fakeResult = { rows: [{ n: 1 }], rowCount: 1, fields: ["n"] };
     vi.mocked(sql.run).mockResolvedValue(fakeResult as unknown as Awaited<ReturnType<SqlService["run"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -533,7 +540,7 @@ describe("buildServer /api/sql", () => {
     const state = openState(":memory:");
     const sql = fakeSql();
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -549,7 +556,7 @@ describe("buildServer /api/sql", () => {
     const state = openState(":memory:");
     const sql = fakeSql();
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -566,7 +573,7 @@ describe("buildServer /api/sql", () => {
     const sql = fakeSql();
     vi.mocked(sql.run).mockRejectedValue(new DevdbError(502, `endpoint for "main" is not running`));
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -588,7 +595,7 @@ describe("buildServer /api/status", () => {
     const state = openState(":memory:");
     const engine = { status: () => ({ storcon_db: { state: "running", pid: 123 } }) } as unknown as EngineRuntime;
     const app = buildServer({
-      cfg, state, engine, logs: fakeLogs(),
+      cfg, state, engine, logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -611,7 +618,7 @@ describe("buildServer /api/status", () => {
       }),
     } as unknown as EngineRuntime;
     const app = buildServer({
-      cfg, state, engine, logs: fakeLogs(),
+      cfg, state, engine, logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -629,11 +636,14 @@ describe("buildServer /api/status", () => {
 // its cleanup-on-disconnect behavior, and doubles as a closer approximation of how a real SSE
 // client (browser EventSource, or restart.test.ts's polling) actually interacts with the route.
 describe("buildServer SSE log routes", () => {
-  async function listening(logs: LogsService, extra: Partial<{ endpoints: EndpointsService; branches: BranchesService }> = {}) {
+  async function listening(
+    logs: LogsService,
+    extra: Partial<{ endpoints: EndpointsService; branches: BranchesService; events: EventsService }> = {},
+  ) {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs,
+      cfg, state, engine: fakeEngine(), logs, events: extra.events ?? fakeEvents(),
       services: {
         projects: fakeProjects(),
         branches: extra.branches ?? fakeBranches(),
@@ -782,6 +792,54 @@ describe("buildServer SSE log routes", () => {
       // exact event ordering between an aborted fetch and the server observing socket close
       // isn't instantaneous, but this must land well within a couple of event-loop turns.
       await vi.waitFor(() => expect(unsubSpy).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/events — text/event-stream; delivers ONLY post-connect events as JSON (no replay)", async () => {
+    const events = new EventsService();
+    const { app, base } = await listening(fakeLogs(), { events });
+    try {
+      events.publish({ type: "project.created", projectId: "before" }); // pre-connect: must NOT arrive
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/events`, { signal: ac.signal });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/event-stream");
+      const reader = res.body!.getReader();
+      events.publish({ type: "branch.created", projectId: "p1", branchId: "b1" });
+      const { value } = await reader.read();
+      const text = new TextDecoder().decode(value);
+      expect(text).toContain("data: ");
+      const evt = JSON.parse(text.split("data: ")[1]!.split("\n")[0]!);
+      expect(evt).toMatchObject({ type: "branch.created", projectId: "p1", branchId: "b1" });
+      expect(text).not.toContain("before");
+      ac.abort();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/events — client disconnect unsubscribes from EventsService (no leak)", async () => {
+    const events = new EventsService();
+    const { app, base } = await listening(fakeLogs(), { events });
+    try {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/events`, { signal: ac.signal });
+      // Self-review fix: /api/events' replay is ALWAYS `[]` by contract (see the route), so —
+      // unlike the logs routes' tests, which seed a line first — there are no body bytes for
+      // reader.read() to resolve on until either a publish() or this abort() happens. Awaiting
+      // the read BEFORE calling abort() (as in an earlier draft of this test) deadlocks: the read
+      // has nothing to settle on, and abort() — the only thing that settles it (rejects it; see
+      // empirical verification in the self-review) — is the very next statement, unreachable
+      // while still awaiting. Fire off the read without awaiting it, so it's pending when abort()
+      // runs and gets rejected by it, exactly like a real client's stream teardown.
+      const pendingRead = res.body!.getReader().read().catch(() => {});
+      ac.abort();
+      await pendingRead;
+      // Publish after abort settles; delivery to a torn-down socket must not throw the publish.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(() => events.publish({ type: "engine.health" })).not.toThrow();
     } finally {
       await app.close();
     }

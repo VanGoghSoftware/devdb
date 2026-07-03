@@ -53,3 +53,22 @@ export interface StatusDto {
   healthy: boolean;
   engine: Record<string, { state: "running" | "stopped" | "failed"; pid: number | null }>;
 }
+
+// Phase 3: /api/events wire schema. Events are coarse INVALIDATION HINTS, never data — the UI
+// refetches via REST on receipt (spec 2026-07-03-devdb-phase-3-web-ui-design.md, Decision 1).
+// branch.updated covers every branch-row mutation that isn't create/delete: rename, reset,
+// in-place restore (timeline swap). LSN/size churn is deliberately NOT an event.
+export const DevdbEventTypeSchema = z.enum([
+  "project.created", "project.deleted",
+  "branch.created", "branch.updated", "branch.deleted",
+  "endpoint.status", "engine.health",
+]);
+export type DevdbEventType = z.infer<typeof DevdbEventTypeSchema>;
+
+export const DevdbEventSchema = z.object({
+  type: DevdbEventTypeSchema,
+  projectId: z.string().optional(),
+  branchId: z.string().optional(),
+  at: z.string(), // ISO-8601 with timezone (server-stamped)
+});
+export type DevdbEvent = z.infer<typeof DevdbEventSchema>;

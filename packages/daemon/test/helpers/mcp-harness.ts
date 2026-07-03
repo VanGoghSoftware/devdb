@@ -12,6 +12,7 @@ import { EndpointsService } from "../../src/services/endpoints.js";
 import { TimeTravelService } from "../../src/services/timetravel.js";
 import { SqlService } from "../../src/services/sql.js";
 import { LogsService } from "../../src/services/logs.js";
+import { EventsService } from "../../src/services/events.js";
 import { registerTools } from "../../src/mcp/tools.js";
 import type { ToolCtx } from "../../src/mcp/server.js";
 import type { Deps } from "../../src/http/api.js";
@@ -126,6 +127,7 @@ export async function makeReadToolsHarness(opts?: {
     state,
     engine: fakeEngine(),
     logs,
+    events: new EventsService(),
     // Fix 1 (task-9 fix wave): the same typed fake Logger from fakes() — so mcp-tools.test.ts can
     // assert guard() actually logged a non-DevdbError failure through THIS instance, not just that
     // some logger somewhere was called.

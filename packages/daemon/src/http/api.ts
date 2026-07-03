@@ -11,6 +11,7 @@ import type { BranchesService } from "../services/branches.js";
 import type { EndpointsService } from "../services/endpoints.js";
 import type { TimeTravelService } from "../services/timetravel.js";
 import type { LogsService } from "../services/logs.js";
+import type { EventsService } from "../services/events.js";
 import type { SqlService } from "../services/sql.js";
 import type { Logger } from "../logging/logger.js";
 import { DevdbError } from "../services/errors.js";
@@ -34,6 +35,11 @@ export interface Deps {
   state: StateDb;
   engine: EngineRuntime;
   logs: LogsService;
+  // Phase 3 Task 1: required (unlike logger? below) — GET /api/events depends on it
+  // unconditionally, and there is exactly one deps-construction helper per test file to update
+  // (api.test.ts's per-call-site literals plus its listening() helper; mcp-http.test.ts's
+  // fakeDeps()), unlike logger's ~25 scattered inline literals.
+  events: EventsService;
   // Task 9 fix wave: optional (not required) so the ~25 pre-existing inline Deps literals across
   // api.test.ts/mcp-http.test.ts's fakeDeps() — none of which exercise anything logger-related —
   // don't all need editing just to satisfy a new required field. Only mcp/tools.ts's guard()
@@ -43,6 +49,16 @@ export interface Deps {
     projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService;
     timetravel: TimeTravelService; sql: SqlService;
   };
+}
+
+// The generalized shape sseStream() (below, inside buildServer) fans out over: a channel-agnostic
+// replay-then-live SSE source. `replay` is already-serialized SSE payload strings (oldest-first);
+// `subscribe` wires the live tail and returns an unsubscribe function. The logs SSE routes adapt
+// LogsService's recent()/subscribe() to this shape; /api/events adapts EventsService with an
+// always-empty replay (see that route's own comment for why that's a contract, not a gap).
+interface SseSource {
+  replay: string[];
+  subscribe: (cb: (payload: string) => void) => () => void;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
@@ -93,37 +109,40 @@ export function buildServer(deps: Deps): FastifyInstance {
     await mcp.closeAll();
   });
 
-  // Replays recent() (bounded ring, oldest-first) as one SSE event per line, then subscribes for
-  // the live tail. reply.hijack() is Fastify's documented mechanism for handing a reply fully
-  // over to raw Node writes (see Reply.md's .hijack() section): without it, this being an async
-  // route handler means Fastify calls reply.send() on whatever the handler eventually returns
-  // once its promise settles — which would race/conflict with the raw writes already in flight
-  // on the same socket. Unsubscribes AND drops the openSseResponses entry on the underlying
-  // response socket's "close" — fires on an explicit client disconnect, a dropped connection, or
-  // reply.raw.end() (including the preClose hook's own end() call above) — so a client that
-  // simply stops reading (tab closed, curl killed) doesn't leak a subscriber callback inside
-  // LogsService forever, and a long-disconnected client doesn't linger in this Set either.
+  // Replays source.replay (already-serialized SSE payload strings, oldest-first) as one SSE event
+  // per entry, then subscribes for the live tail. reply.hijack() is Fastify's documented mechanism
+  // for handing a reply fully over to raw Node writes (see Reply.md's .hijack() section): without
+  // it, this being an async route handler means Fastify calls reply.send() on whatever the handler
+  // eventually returns once its promise settles — which would race/conflict with the raw writes
+  // already in flight on the same socket. Unsubscribes AND drops the openSseResponses entry on the
+  // underlying response socket's "close" — fires on an explicit client disconnect, a dropped
+  // connection, or reply.raw.end() (including the preClose hook's own end() call above) — so a
+  // client that simply stops reading (tab closed, curl killed) doesn't leak a subscriber callback
+  // inside the source forever, and a long-disconnected client doesn't linger in this Set either.
   //
   // flushHeaders() is load-bearing, not defensive: verified empirically (Node's http.
   // ServerResponse can leave writeHead()'s headers sitting in its internal buffer until the
-  // first body write() or end()) that a channel with nothing yet in recent() — no backlog
-  // write() follows writeHead() — leaves the client's fetch()/EventSource hanging with headers
-  // never observed as sent, until the FIRST live line arrives (which may be never, for a daemon
-  // component that hasn't logged anything yet, or a freshly-started compute). Every client must
-  // see its 200 + headers immediately on connect regardless of whether there's backlog to replay.
+  // first body write() or end()) that a source with an empty replay — no backlog write() follows
+  // writeHead() — leaves the client's fetch()/EventSource hanging with headers never observed as
+  // sent, until the FIRST live entry arrives (which may be never, for a daemon component that
+  // hasn't logged anything yet, a freshly-started compute, or the no-replay /api/events channel).
+  // Every client must see its 200 + headers immediately on connect regardless of whether there's
+  // backlog to replay.
   // Fix 2 (review): backpressure + write-safety hardening. Node's http.ServerResponse.write()
   // returns `false` when the socket's internal buffer is over its highWaterMark — this is the
   // documented signal that the client (or its network path) is reading slower than this server is
   // producing lines. Buffering unboundedly in that case (the pre-fix code did: every write() call
   // site ignored the return value) would let one slow SSE client's kernel/user-space write buffer
-  // grow forever for as long as ingest() keeps producing lines, an unbounded per-connection memory
-  // leak with no cap. The policy adopted here is intentionally simple and bounded: on the FIRST
-  // slow-write signal (or a write that throws, or a write attempted against an already-
+  // grow forever for as long as the source keeps producing entries, an unbounded per-connection
+  // memory leak with no cap. The policy adopted here is intentionally simple and bounded: on the
+  // FIRST slow-write signal (or a write that throws, or a write attempted against an already-
   // ended/destroyed socket), tear the connection down and unsubscribe — never buffer past that
   // point. The client's EventSource/fetch reconnects on its own (SSE's standard behavior) and
-  // replays via recent() from the top, so no lines are silently lost forever — just re-delivered
-  // on the next connection, which is a far safer failure mode than an unbounded write buffer.
-  function sse(reply: FastifyReply, channel: string): void {
+  // replays via source.replay from the top, so no lines are silently lost forever — just re-
+  // delivered on the next connection, which is a far safer failure mode than an unbounded write
+  // buffer. (The /api/events source's replay is always `[]` by contract — see its route — so this
+  // reconnect-and-replay safety net doesn't apply there; see that route's own comment.)
+  function sseStream(reply: FastifyReply, source: SseSource): void {
     reply.hijack();
     reply.raw.writeHead(200, {
       "content-type": "text/event-stream",
@@ -142,9 +161,9 @@ export function buildServer(deps: Deps): FastifyInstance {
 
     // Mutable + assigned a real no-op up front (rather than left as a `const` declared only after
     // the replay loop below) so that safeWrite() failing on the very FIRST replayed line — before
-    // logs.subscribe() ever runs — can still call teardown() safely instead of throwing a
+    // source.subscribe() ever runs — can still call teardown() safely instead of throwing a
     // temporal-dead-zone ReferenceError. Reassigned to the real unsubscribe closure once
-    // logs.subscribe() is actually called, further down.
+    // source.subscribe() is actually called, further down.
     let unsub: () => void = () => {};
 
     // teardown() is idempotent-safe to call more than once (write failures can cascade across
@@ -162,13 +181,25 @@ export function buildServer(deps: Deps): FastifyInstance {
     // fired. Every call site (replay loop below, and the live subscribe() callback) must check
     // this return value and stop writing further lines once it's false — the socket is being
     // torn down and any subsequent write would either throw or buffer onto a dead connection.
-    function safeWrite(line: string): boolean {
+    //
+    // `payload` is interpolated as-is — it is ALREADY the exact SSE `data:` text the source wants
+    // on the wire (see SseSource's doc comment: "already-serialized"). Each adapter is responsible
+    // for its own encoding: the logs adapter JSON.stringify()s a raw log line (producing a quoted
+    // JSON string on the wire, e.g. `data: "live line"`), while the /api/events adapter
+    // JSON.stringify()s the event OBJECT (producing an unquoted JSON object on the wire, e.g.
+    // `data: {"type":"branch.created",...}` — the wire contract GET /api/events promises). Doing
+    // the encoding here unconditionally (the pre-Task-1 code did, when this only ever served
+    // LogsService) would double-encode the object case — verified empirically while building this
+    // route: a naive `JSON.stringify(payload)` here on an already-JSON.stringify'd object turns it
+    // into a JSON STRING containing escaped JSON text, which a single JSON.parse() on the client
+    // unwraps to a string, not the event object.
+    function safeWrite(payload: string): boolean {
       if (reply.raw.writableEnded || reply.raw.destroyed) {
         teardown();
         return false;
       }
       try {
-        const ok = reply.raw.write(`data: ${JSON.stringify(line)}\n\n`);
+        const ok = reply.raw.write(`data: ${payload}\n\n`);
         if (!ok) {
           // Slow client (backpressure) — bounded policy: drop the connection rather than buffer
           // unboundedly. The client's own reconnect + recent()-replay makes this a safe drop.
@@ -186,7 +217,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     }
 
     let replayFailed = false;
-    for (const line of deps.logs.recent(channel)) {
+    for (const line of source.replay) {
       // Abort the replay loop on the first failed write — teardown() has already unsubscribed
       // and ended the response, so continuing to iterate would just call write() again against
       // an already-ended socket for no benefit.
@@ -197,16 +228,28 @@ export function buildServer(deps: Deps): FastifyInstance {
     // on the very first replayed line), skip subscribing entirely — there is nothing live left to
     // feed, and registering a subscriber here just to have its very next callback immediately
     // hit safeWrite()'s writableEnded/destroyed check and call teardown() again would be pure
-    // waste (and a — harmless but pointless — brief live entry in LogsService's subscriber Set).
+    // waste (and a — harmless but pointless — brief live entry in the source's subscriber Set).
     if (replayFailed) return;
 
-    unsub = deps.logs.subscribe(channel, (line) => {
+    unsub = source.subscribe((line) => {
       safeWrite(line);
     });
     openSseResponses.add(reply.raw);
     reply.raw.on("close", () => {
       unsub();
       openSseResponses.delete(reply.raw);
+    });
+  }
+
+  // Logs SSE keeps replay-then-live semantics, now as a thin adapter over sseStream(). Each raw
+  // log line is JSON.stringify()'d here — this adapter's own encoding step, per SseSource's
+  // "already-serialized" contract (sseStream/safeWrite interpolates payloads as-is; see its
+  // comment) — reproducing the exact wire bytes (`data: "<line>"\n\n`) the pre-existing logs-SSE
+  // tests assert.
+  function sse(reply: FastifyReply, channel: string): void {
+    sseStream(reply, {
+      replay: deps.logs.recent(channel).map((line) => JSON.stringify(line)),
+      subscribe: (cb) => deps.logs.subscribe(channel, (line) => cb(JSON.stringify(line))),
     });
   }
 
@@ -226,6 +269,16 @@ export function buildServer(deps: Deps): FastifyInstance {
       throw new DevdbError(404, `unknown daemon component: ${JSON.stringify(component)}`);
     }
     sse(reply, daemonLogChannel(component));
+  });
+
+  // Phase 3 (spec Decision 1): state-change invalidation hints. NO replay — `replay: []` is the
+  // contract, not an optimization: clients blanket-invalidate on every (re)connect, which is what
+  // makes lost events and reconnects free of correctness concerns.
+  app.get("/api/events", async (_req, reply) => {
+    sseStream(reply, {
+      replay: [],
+      subscribe: (cb) => deps.events.subscribe((e) => cb(JSON.stringify(e))),
+    });
   });
 
   const CreateProject = z.object({ name: z.string(), pgVersion: PgVersionSchema.optional() });

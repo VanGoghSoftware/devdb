@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { createLogger, daemonLogChannel } from "../src/logging/logger.js";
 import { buildServer } from "../src/http/api.js";
 import { loadConfig } from "../src/config.js";
@@ -137,6 +138,7 @@ describe("logger -> SSE channel wiring (end-to-end)", () => {
       state: openState(":memory:"),
       engine: { status: () => ({}) } as unknown as EngineRuntime,
       logs,
+      events: new EventsService(),
       services: {
         projects: {} as unknown as ProjectsService,
         branches: {} as unknown as BranchesService,

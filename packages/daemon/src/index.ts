@@ -15,6 +15,7 @@ import { EndpointsService } from "./services/endpoints.js";
 import { TimeTravelService } from "./services/timetravel.js";
 import { SqlService } from "./services/sql.js";
 import { LogsService } from "./services/logs.js";
+import { EventsService } from "./services/events.js";
 import { createLogger } from "./logging/logger.js";
 import { BranchQueue } from "./state/queue.js";
 import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js";
@@ -52,6 +53,10 @@ async function main(): Promise<void> {
   try {
     const state = openState(join(cfg.dataDir, "state.db"));
     const logs = new LogsService();
+    // Phase 3 Task 1: constructed here (not yet published to by anything — Tasks 2-3 wire
+    // publish() calls into the mutation services below) so GET /api/events has a live
+    // EventsService to subscribe against from daemon boot.
+    const events = new EventsService();
     const logger = createLogger(logs);
     engine = new EngineRuntime(cfg, state, logs);
     await engine.start();
@@ -91,7 +96,7 @@ async function main(): Promise<void> {
     // Task 9 fix wave: `logger` threaded into Deps so mcp/tools.ts's guard() can log an
     // unexpected/non-DevdbError tool failure's stack somewhere other than a swallowed message —
     // this is the SAME logger instance already wired into every service above (Task 4).
-    const app = buildServer({ cfg, state, engine, logs, logger, services: { projects, branches, endpoints, timetravel, sql } });
+    const app = buildServer({ cfg, state, engine, logs, events, logger, services: { projects, branches, endpoints, timetravel, sql } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —

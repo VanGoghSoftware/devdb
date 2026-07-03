@@ -11,6 +11,7 @@ import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
 import type { SqlService } from "../src/services/sql.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
 
@@ -30,6 +31,7 @@ function fakeDeps(env: Record<string, string> = {}) {
     state: openState(":memory:"),
     engine: { status: () => ({}) } as unknown as EngineRuntime,
     logs: new LogsService(),
+    events: new EventsService(),
     services: {
       projects: {} as unknown as ProjectsService,
       branches: {} as unknown as BranchesService,
