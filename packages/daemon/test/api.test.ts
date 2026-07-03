@@ -160,6 +160,33 @@ describe("buildServer branch routes", () => {
     expect(branches.list).toHaveBeenCalledWith("project-1");
   });
 
+  it("GET /api/branches/:id — 200 with the service's BranchDetail mapped to BranchDto (password/internal fields dropped)", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const branches = fakeBranches();
+    const fakeDetail = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "dev" });
+    vi.mocked(branches.byIdOr404).mockReturnValue(
+      { id: "branch-1" } as unknown as ReturnType<BranchesService["byIdOr404"]>,
+    );
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/branches/branch-1" });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
+    expect(body.stickyPort).toBeUndefined();
+    expect(body.importStatus).toBeUndefined();
+    expect(body.importError).toBeUndefined();
+    expect(body.connectionString).toBeDefined();
+    expect(body.context).toBeDefined();
+  });
+
   it("GET /api/branches/:id — 404s when the service throws DevdbError(404)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");

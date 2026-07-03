@@ -18,6 +18,13 @@ describe("projects", () => {
     // agents use mainBranch.connectionString instead.
     expect(mainBranch.password).toBeUndefined();
     expect(mainBranch.connectionString === null || typeof mainBranch.connectionString === "string").toBe(true);
+    // Fix 3 (task-3 coverage): the other internal-only columns (BranchRow's stickyPort/
+    // importStatus/importError) must be equally absent from the real REST response, not just
+    // password — proves toBranchDto's redaction end-to-end against the live daemon, not only
+    // against unit-level fakes.
+    expect((mainBranch as Record<string, unknown>).stickyPort).toBeUndefined();
+    expect((mainBranch as Record<string, unknown>).importStatus).toBeUndefined();
+    expect((mainBranch as Record<string, unknown>).importError).toBeUndefined();
 
     const del = await fetch(`${dev.base}/api/projects/${project.id}`, { method: "DELETE" });
     expect(del.status).toBe(204);

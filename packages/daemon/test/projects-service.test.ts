@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { openState } from "../src/state/db.js";
 import { ProjectsService } from "../src/services/projects.js";
+import { DevdbError } from "../src/services/errors.js";
 import { slugify } from "../src/services/slug.js";
 import { LogsService } from "../src/services/logs.js";
 import { BranchQueue } from "../src/state/queue.js";
@@ -270,7 +271,23 @@ describe("ProjectsService", () => {
       return original(a);
     }) as typeof original;
     try {
-      await expect(svc.create({ name: "acme" })).rejects.toMatchObject({ statusCode: 409 });
+      // Fix 2 (task-3 coverage): pin the EXACT generic message, not just the 409 status — a
+      // regression reintroducing `${(e as Error).message}` (leaking raw SQLite text like the
+      // "UNIQUE constraint failed: branches.slug" thrown above) would still pass a status-only
+      // check. Assert equality on the message AND explicitly that none of the SQLite internals
+      // from the stubbed error (its code, table name, or the `.slug` column) leaked through.
+      let caught: DevdbError | undefined;
+      try {
+        await svc.create({ name: "acme" });
+      } catch (e) {
+        caught = e as DevdbError;
+      }
+      expect(caught).toBeInstanceOf(DevdbError);
+      expect(caught?.statusCode).toBe(409);
+      expect(caught?.message).toBe("project or branch identity conflicts with an existing one");
+      expect(caught?.message).not.toContain("SQLITE_CONSTRAINT");
+      expect(caught?.message).not.toContain("branches");
+      expect(caught?.message).not.toContain(".slug");
       const projectId = vi.mocked(f.storcon.tenantCreate).mock.calls[0]![0];
       expect(f.pageserver.tenantDelete).toHaveBeenCalledWith(projectId);
       expect(f.safekeeper.tenantDelete).toHaveBeenCalledWith(projectId);
