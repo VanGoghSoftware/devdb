@@ -161,6 +161,28 @@ export class BranchesService {
     return Promise.all(rows.map((b) => this.detail(b)));
   }
 
+  // Phase 3 Task 4 (spec §Daemon additions): rename mutates NAME only — slug is immutable (it
+  // feeds compute naming and directories; a rename must never touch engine artifacts). The root
+  // branch is not renameable: skills and agent conventions reference "main" by name.
+  async rename(id: string, newName: string): Promise<BranchRow> {
+    const name = newName.trim();
+    const branch = this.byIdOr404(id);
+    if (!NAME_RE.test(name)) throw new DevdbError(400, `invalid branch name: ${JSON.stringify(newName)}`);
+    if (branch.parentBranchId === null) {
+      throw new DevdbError(400, `the root branch cannot be renamed — agent skills and workflows reference it by name`);
+    }
+    return this.deps.queue.run(id, async () => {
+      const current = this.deps.state.branches.byId(id);
+      if (!current) throw new DevdbError(404, `branch ${id} not found`);
+      if (current.name !== name && this.deps.state.branches.byProjectAndName(current.projectId, name)) {
+        throw new DevdbError(409, `branch "${name}" already exists in this project`);
+      }
+      this.deps.state.branches.updateName(id, name);
+      this.deps.events?.publish({ type: "branch.updated", projectId: current.projectId, branchId: id });
+      return this.deps.state.branches.byId(id)!;
+    });
+  }
+
   // oracle: src/mgmt/service/branch.rs:416-519 delete()
   async delete(id: string): Promise<void> {
     return this.deps.queue.run(id, async () => {

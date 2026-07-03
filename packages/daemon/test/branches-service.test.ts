@@ -351,4 +351,51 @@ describe("BranchesService", () => {
     const b = await branches.create({ projectId: project.id, name: "dev", context: ctx });
     expect(state.branches.byId(b.id)!.context).toEqual(ctx);
   });
+
+  // Task 4 (Phase 3): PATCH /api/branches/:id rename — slug is IMMUTABLE (it feeds compute
+  // naming and directories), the root branch is not renameable, duplicate names 409 (except
+  // renaming to one's own current name, a no-op success), and a rename announces branch.updated
+  // through the events channel Tasks 1-3 built.
+  describe("rename", () => {
+    it("renames a child branch, bumps updatedAt, keeps slug, emits branch.updated", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const queue = new BranchQueue();
+      const events = new EventsService();
+      const seen: DevdbEvent[] = [];
+      events.subscribe((e) => seen.push(e));
+      const projects = new ProjectsService({ state, queue, ...f });
+      const { project } = await projects.create({ name: "acme" });
+      const branches = new BranchesService({ state, queue, events, ...f });
+      const b = await branches.create({ projectId: project.id, name: "dev" });
+      const out = await branches.rename(b.id, "dev-renamed");
+      expect(out.name).toBe("dev-renamed");
+      expect(out.slug).toBe(b.slug); // immutable — feeds compute naming/dirs
+      expect(out.updatedAt >= b.updatedAt).toBe(true);
+      expect(seen.filter((e) => e.type === "branch.updated")).toEqual([
+        expect.objectContaining({ projectId: project.id, branchId: b.id }),
+      ]);
+    });
+
+    it("refuses to rename the root branch with a 400 naming the reason", async () => {
+      const { project, mainBranch, branches } = await seeded();
+      expect(mainBranch.parentBranchId).toBeNull();
+      await expect(branches.rename(mainBranch.id, "primary")).rejects.toMatchObject({ statusCode: 400 });
+      expect(project.id).toBe(mainBranch.projectId);
+    });
+
+    it("409s on a duplicate name in the same project; renaming to its own name is a no-op success", async () => {
+      const { project, branches } = await seeded();
+      const a = await branches.create({ projectId: project.id, name: "a" });
+      await branches.create({ projectId: project.id, name: "b" });
+      await expect(branches.rename(a.id, "b")).rejects.toMatchObject({ statusCode: 409 });
+      await expect(branches.rename(a.id, "a")).resolves.toMatchObject({ name: "a" });
+    });
+
+    it("400s on a name failing NAME_RE", async () => {
+      const { project, branches } = await seeded();
+      const b = await branches.create({ projectId: project.id, name: "ok" });
+      await expect(branches.rename(b.id, "  ")).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
 });

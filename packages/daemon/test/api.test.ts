@@ -63,7 +63,7 @@ function fakeProjects(): ProjectsService {
 function fakeBranches(): BranchesService {
   return {
     create: vi.fn(), list: vi.fn(), byIdOr404: vi.fn(), delete: vi.fn(),
-    detail: vi.fn(), connectionString: vi.fn(),
+    detail: vi.fn(), connectionString: vi.fn(), rename: vi.fn(),
   } as unknown as BranchesService;
 }
 
@@ -266,6 +266,41 @@ describe("buildServer branch routes", () => {
     expect(blockedRes.statusCode).toBe(409);
     expect(blockedRes.json().error).toMatch(/dev-child/);
     expect(blockedRes.json().error).toMatch(/dev-child-2/);
+  });
+
+  // Task 4 (Phase 3): PATCH /api/branches/:id rename — the route delegates validation/semantics
+  // entirely to BranchesService.rename (covered service-side in branches-service.test.ts); this
+  // route test proves only the HTTP wiring: body -> service call -> detail() -> BranchDto.
+  it("PATCH /api/branches/:id — 200 with the renamed branch DTO", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const branches = fakeBranches();
+    const fakeRow = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "renamed" });
+    vi.mocked(branches.rename).mockResolvedValue(fakeRow);
+    vi.mocked(branches.detail).mockResolvedValue(fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "renamed" }));
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "PATCH", url: "/api/branches/branch-1", payload: { name: "renamed" } });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().name).toBe("renamed");
+    expect(branches.rename).toHaveBeenCalledWith("branch-1", "renamed");
+  });
+
+  it("PATCH /api/branches/:id — zod 400 on a missing name", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "PATCH", url: "/api/branches/branch-1", payload: {} });
+
+    expect(res.statusCode).toBe(400);
   });
 });
 

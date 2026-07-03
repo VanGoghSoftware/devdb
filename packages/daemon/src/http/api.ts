@@ -332,6 +332,16 @@ export function buildServer(deps: Deps): FastifyInstance {
     return reply.status(204).send();
   });
 
+  // Phase 3 Task 4: rename. `slug` never changes (see BranchesService.rename's own comment) —
+  // this route is a thin HTTP wrapper; all validation/semantics live service-side.
+  const RenameBranch = z.object({ name: z.string() });
+  app.patch("/api/branches/:id", async (req) => {
+    const { id } = req.params as { id: string };
+    const body = RenameBranch.parse(req.body);
+    const row = await deps.services.branches.rename(id, body.name);
+    return toBranchDto(await deps.services.branches.detail(row));
+  });
+
   app.post("/api/branches/:id/endpoint/start", async (req) => {
     const { id } = req.params as { id: string };
     return toBranchDto(await deps.services.endpoints.start(id));

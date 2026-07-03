@@ -99,6 +99,13 @@ export class BranchesRepo {
   setStickyPort(id: string, port: number): void {
     this.db.prepare("UPDATE branches SET sticky_port = ? WHERE id = ?").run(port, id);
   }
+  // Phase 3 Task 4: rename mutates NAME only — `slug` is untouched (it feeds compute naming and
+  // directories; a rename must never touch engine artifacts). Same strftime idiom as updateEndpoint.
+  updateName(id: string, name: string): void {
+    this.db.prepare(
+      "UPDATE branches SET name = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+    ).run(name, id);
+  }
   // Throws SQLITE_CONSTRAINT (FOREIGN KEY) if referencing rows exist — services guard ordering (children first).
   delete(id: string): void {
     this.db.prepare("DELETE FROM branches WHERE id = ?").run(id);
