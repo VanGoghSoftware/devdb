@@ -98,7 +98,16 @@ export interface McpToolsHarness {
   close(): Promise<void>;
 }
 
-export async function makeReadToolsHarness(): Promise<McpToolsHarness> {
+export async function makeReadToolsHarness(opts?: {
+  /**
+   * Overrides the session's captured `clientInfo` (what `ToolCtx.clientInfo()` returns) — the
+   * default `{ name: "harness-client", version: "1.0.0" }` is fine for tests that don't care, but
+   * create_branch's fork-context-merge test (Task 10) needs to assert a SPECIFIC client identity
+   * (e.g. `{ name: "claude-code", version: "9.9" }`) shows up folded into the stored branch
+   * context, so it must be settable per-test rather than hardcoded.
+   */
+  clientInfo?: { name: string; version: string };
+}): Promise<McpToolsHarness> {
   const f = fakes();
   const state = openState(":memory:");
   const queue = new BranchQueue();
@@ -125,7 +134,8 @@ export async function makeReadToolsHarness(): Promise<McpToolsHarness> {
   };
 
   const server = new McpServer({ name: "devdb-test", version: "0.0.0-test" });
-  const clientInfo: ToolCtx["clientInfo"] = () => ({ name: "harness-client", version: "1.0.0" });
+  const resolvedClientInfo = opts?.clientInfo ?? { name: "harness-client", version: "1.0.0" };
+  const clientInfo: ToolCtx["clientInfo"] = () => resolvedClientInfo;
   registerTools(server, { deps, clientInfo });
 
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();

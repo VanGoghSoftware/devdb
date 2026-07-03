@@ -286,4 +286,119 @@ describe("MCP read tools", () => {
       expect(firstText(res)).not.toMatch(/password/i);
     });
   });
+
+  // Task 10: the flagship "new worktree" move — create an isolated branch, auto-start its
+  // endpoint, and return a connection string. The engine `fakes()` default (computes.start
+  // resolves {port: 1}, statusOf() returns "stopped" always) doesn't make ensureRunning() observe
+  // "running" post-start — mirrors branches-service.test.ts's own post-start fixture: statusOf
+  // must flip to "running" once start() has actually been called, so connectionString() renders.
+  describe("create_branch", () => {
+    function primeRunningAfterStart(h: McpToolsHarness, port = 54301): void {
+      vi.mocked(h.engineFakes.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+      vi.mocked(h.engineFakes.computes.portOf).mockReturnValue(port);
+    }
+
+    it("creates a branch off main, auto-starts it, and returns a connection string with a next-step hint", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("create_branch", { project: "shop", name: "agent/try-index" });
+
+      expect(res.isError).toBeFalsy();
+      expect(h.engineFakes.computes.start).toHaveBeenCalled();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstLine(firstText(res))).toMatch(/branch "agent\/try-index"/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res).toLowerCase()).toMatch(/next:/);
+    });
+
+    // The task brief's headline scenario: fork context supplied by the caller must be recorded
+    // ALONGSIDE the session's own captured clientInfo — an agent's context (git_branch/workdir/
+    // purpose) plus a durable record of WHICH client/version actually made the fork, without the
+    // caller ever being able to spoof the `client` field itself (it's server-added, not accepted
+    // as caller input — see the client-less input schema in tools.ts).
+    it("records fork context: caller fields AND the session's client are both folded into storage", async () => {
+      h = await makeReadToolsHarness({ clientInfo: { name: "claude-code", version: "9.9" } });
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("create_branch", {
+        project: "shop", name: "agent/try-index",
+        context: { git_branch: "feat/idx", workdir: "/w", purpose: "add an index" },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(firstText(res)).toMatch(/postgresql:\/\//);
+
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/claude-code/); // session client folded into stored context
+      expect(firstText(list)).toMatch(/add an index/); // caller's own context field preserved
+      expect(firstText(list)).toMatch(/feat\/idx/);
+      expect(firstText(list)).toMatch(/\/w/);
+    });
+
+    it("a bare call with no context still works (client-only context is stored)", async () => {
+      h = await makeReadToolsHarness({ clientInfo: { name: "claude-code", version: "9.9" } });
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("create_branch", { project: "shop", name: "bare-fork" });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstText(res)).toMatch(/postgresql:\/\//);
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/claude-code/);
+    });
+
+    it("forks off a named parent (not main) and names it in the context line", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      await h.call("create_branch", { project: "shop", name: "feature" });
+
+      const res = await h.call("create_branch", { project: "shop", name: "feature-child", parent: "feature" });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstLine(firstText(res))).toMatch(/forked from "feature"/);
+    });
+
+    it("resolves at_timestamp to an LSN on the parent (main) before creating", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      const project = h.deps.services.projects.byNameOr404("shop");
+      const spy = vi.spyOn(h.deps.services.timetravel, "lsnAtTimestamp");
+
+      const res = await h.call("create_branch", {
+        project: "shop", name: "pitr-fork", at_timestamp: "2026-07-01T00:00:00Z",
+      });
+
+      expect(res.isError).toBeFalsy();
+      const main = h.deps.services.branches.byProjectAndNameOr404(project.id, "main");
+      expect(spy).toHaveBeenCalledWith(main.id, "2026-07-01T00:00:00Z");
+    });
+
+    it("on a missing project returns an actionable error naming list_projects", async () => {
+      h = await makeReadToolsHarness();
+      const res = await h.call("create_branch", { project: "nope", name: "x" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_projects/);
+    });
+
+    it("on a missing named parent returns an actionable error naming list_branches", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("create_branch", { project: "shop", name: "x", parent: "nope" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_branches/);
+    });
+
+    it("does not leak a password field into the response text", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      const res = await h.call("create_branch", { project: "shop", name: "agent/try-index" });
+      expect(firstText(res)).not.toMatch(/password/i);
+    });
+  });
 });

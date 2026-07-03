@@ -195,4 +195,53 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
       : "Next: pass ensure_running=true (default) to start it.";
     return text(`${contextLine({ project: p.name, branch: b.name })}\n${renderBranch(dto, 0, null)}\n${next}`);
   }));
+
+  // Client-less fork-context input: the four CALLER-supplied fields from shared's
+  // BranchContextSchema, minus `client` — `client` is populated server-side from the connected
+  // MCP session's own captured clientInfo (ctx.clientInfo(), below), never accepted as caller
+  // input. Accepting it here would let a caller spoof which agent/version actually made the fork,
+  // defeating the whole point of recording it.
+  const BranchContextInputShape = {
+    git_branch: z.string().optional(),
+    workdir: z.string().optional(),
+    agent: z.string().optional(),
+    purpose: z.string().optional(),
+  };
+  const BranchContextInputSchema = z.object(BranchContextInputShape);
+
+  const CreateBranchShape = {
+    project: z.string(), name: z.string(),
+    parent: z.string().optional(), at_timestamp: z.string().optional(),
+    context: BranchContextInputSchema.optional(),
+  };
+  server.registerTool("create_branch", {
+    description: "Create an isolated branch (the 'new worktree' move), optionally at a past timestamp. Auto-starts an endpoint and returns a connection string. Pass fork context (git_branch/workdir/agent/purpose) so other agents can see why this branch exists.",
+    inputSchema: CreateBranchShape,
+  }, guard("create_branch", deps, async ({ project, name, parent, at_timestamp, context }: z.infer<z.ZodObject<typeof CreateBranchShape>>) => {
+    const p = deps.services.projects.byNameOr404(project);
+    const parentRow = parent ? deps.services.branches.byProjectAndNameOr404(p.id, parent) : undefined;
+
+    let atLsn: string | undefined;
+    if (at_timestamp) {
+      const src = parentRow ?? deps.services.branches.byProjectAndNameOr404(p.id, "main");
+      atLsn = await deps.services.timetravel.lsnAtTimestamp(src.id, at_timestamp);
+    }
+
+    // Merges the caller's own fork context with the session's captured clientInfo — clientInfo()
+    // is undefined-safe (a client that skipped a proper `initialize` handshake yields undefined,
+    // see server.ts's ToolCtx.clientInfo doc), so `client` simply comes out undefined in that
+    // case rather than throwing.
+    const merged = { ...(context ?? {}), client: ctx.clientInfo() };
+
+    const branch = await deps.services.branches.create({
+      projectId: p.id, name, parentBranchId: parentRow?.id, atLsn, createdBy: "mcp", context: merged,
+    });
+    const detail = await deps.services.endpoints.ensureRunning(branch.id);
+    const dto = toBranchDto(detail);
+    return text(
+      `${contextLine({ project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" })}\n` +
+      `${renderBranch(dto, 0, null)}\n` +
+      `Next: wire the connection string into your worktree env; delete_branch when the task is done.`,
+    );
+  }));
 }
