@@ -3,6 +3,7 @@ import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
 import type { LogsService } from "./logs.js";
+import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
 import { generatePassword } from "../compute/scram.js";
 import { DevdbError } from "./errors.js";
@@ -12,12 +13,22 @@ import { slugify } from "./slug.js";
 // engine-api.ts (containing exactly the methods this service calls), not the concrete engine
 // client / ComputeManager classes. Production wiring passes the real classes (they satisfy
 // these interfaces structurally); unit tests pass plainly-typed fakes — no `as never` casts.
+//
+// Fix 1 (review): `queue` joins the lane model every other cross-branch mutation already uses
+// (BranchesService.create/delete, EndpointsService.start/stop all serialize per branchId through
+// this SAME BranchQueue instance). Before this fix, ProjectsService.delete() tore down each leaf
+// branch's compute/timelines completely OUTSIDE that lane — so a concurrent
+// endpoint.start(leafId) or branches.create() under that leaf could interleave with delete()'s own
+// stop()/timelineDelete()/branches.delete() sequence with no ordering guarantee at all. Delete()
+// now runs each leaf's teardown via `queue.run(leaf.id, ...)`, joining the same serialization
+// point as every other operation on that branch id.
 export interface ProjectsDeps {
   state: StateDb;
   storcon: StorconApi;
   pageserver: PageserverApi;
   safekeeper: SafekeeperApi;
   computes: ComputesApi;
+  queue: BranchQueue;
 }
 
 // oracle: tenant config values src/mgmt/service/project.rs:95-108
@@ -110,33 +121,94 @@ export class ProjectsService {
     return p;
   }
 
-  async delete(id: string): Promise<void> {
-    const project = this.byIdOr404(id);
-    const branches = this.deps.state.branches.listByProject(project.id);
-    // children before parents: repeatedly remove leaves
-    const remaining = new Map(branches.map((b) => [b.id, b]));
-    while (remaining.size > 0) {
-      const leaves = [...remaining.values()].filter(
-        (b) => ![...remaining.values()].some((o) => o.parentBranchId === b.id),
-      );
+  // One children-before-parents "sweep": compute a fresh leaves snapshot, tear each down (inside
+  // its own queue lane), repeat until nothing remains for this project. Shared by delete()'s main
+  // loop and its bounded final-sweep retry below so there is exactly one place that knows how to
+  // safely drain a project's branches — no second, divergent copy of this logic to keep in sync.
+  private async drainBranches(projectId: string): Promise<void> {
+    while (true) {
+      const remaining = this.deps.state.branches.listByProject(projectId);
+      if (remaining.length === 0) return;
+      const leaves = remaining.filter((b) => !remaining.some((o) => o.parentBranchId === b.id));
       if (leaves.length === 0) {
         throw new DevdbError(500, "branch tree has a cycle or dangling parent — aborting project delete");
       }
       for (const leaf of leaves) {
-        await this.deps.computes.stop(leaf.id);
-        await this.deps.pageserver.timelineDelete(project.id, leaf.timelineId);
-        await this.deps.safekeeper.timelineDelete(project.id, leaf.timelineId);
-        this.deps.state.branches.delete(leaf.id);
-        // Fix 3 (review): same rationale as BranchesService.delete()'s own evict() call — this
-        // leaf's branch id is gone for good, so its `branch:<id>:compute` channel (ring + subs)
-        // should go with it rather than accumulating in LogsService for the life of the daemon.
-        this.deps.logs?.evict(`branch:${leaf.id}:compute`);
-        remaining.delete(leaf.id);
+        await this.deps.queue.run(leaf.id, async () => {
+          const b = this.deps.state.branches.byId(leaf.id);
+          if (!b) return; // already torn down by a racing round/caller — nothing left to do
+          // Re-check for children right here, inside the lane, mirroring
+          // BranchesService.delete()'s own re-check at the top of its queued closure: `leaves`
+          // was computed from a snapshot taken BEFORE this job reached the front of leaf.id's
+          // queue, so a concurrent branches.create() parented under this exact leaf could have
+          // landed in the interim (either before queue.run() was even called, or while this job
+          // was waiting behind another job already occupying the lane). Deleting `b` now would
+          // orphan that child's parent_branch_id / throw the FK constraint this whole restructure
+          // exists to avoid — skip it for this round instead; the next fresh snapshot (next `while`
+          // iteration) will pick both rows up again once the child is gone (or surface the child
+          // itself as a leaf first).
+          if (this.deps.state.branches.listByParent(b.id).length > 0) return;
+          await this.deps.computes.stop(b.id);
+          await this.deps.pageserver.timelineDelete(projectId, b.timelineId);
+          await this.deps.safekeeper.timelineDelete(projectId, b.timelineId);
+          this.deps.state.branches.delete(b.id);
+          // Fix 3 (review): same rationale as BranchesService.delete()'s own evict() call — this
+          // leaf's branch id is gone for good, so its `branch:<id>:compute` channel (ring + subs)
+          // should go with it rather than accumulating in LogsService for the life of the daemon.
+          this.deps.logs?.evict(`branch:${b.id}:compute`);
+        });
       }
     }
+  }
+
+  // Fix 1 (review): restructured around two things the previous one-shot-snapshot version got
+  // wrong under concurrency:
+  //
+  // 1. **Fresh snapshot every round, not once up front** (now inside drainBranches() above). The
+  //    old version computed `remaining` ONCE from a single listByProject() call, then only ever
+  //    removed entries from that in-memory Map — a branch created by a concurrent request AFTER
+  //    that snapshot (but before this loop finished) was invisible to it for the rest of the call,
+  //    silently surviving the project delete and then throwing an FK constraint on the final
+  //    projects.delete() below (or worse, succeeding in some interleaving and orphaning a branch
+  //    row against a now-gone project). `state.branches.listByProject()` is now re-queried at the
+  //    TOP of every `while` iteration, so a branch that appears mid-delete is simply picked up as
+  //    a leaf in a later round — no special-casing needed, the loop is naturally self-correcting.
+  // 2. **Per-leaf teardown now runs inside `queue.run(leaf.id, ...)`** — the exact same lane
+  //    BranchesService.create/delete and EndpointsService.start/stop already serialize through for
+  //    that branch id. Previously this loop's stop()/timelineDelete()/branches.delete() sequence
+  //    ran completely outside any lane, so it could interleave arbitrarily with a concurrent
+  //    endpoint start/stop or a child create() on the same branch. Every mutation now happens with
+  //    that branch's lane held, so a concurrent operation on the same leaf either finishes first
+  //    or waits its turn — never both touching the branch at once.
+  async delete(id: string): Promise<void> {
+    const project = this.byIdOr404(id);
+    await this.drainBranches(project.id);
     // oracle: src/mgmt/service/project.rs:351-395
     await this.deps.pageserver.tenantDelete(project.id);
     await this.deps.safekeeper.tenantDelete(project.id);
-    this.deps.state.projects.delete(project.id);
+    // Fix 1 (review): bounded retry (3 sweeps) around the final row-delete. drainBranches() above
+    // re-snapshots on every round, so by the time we reach here the project's branches should be
+    // gone — but a branch created in the narrow window between drainBranches()'s LAST empty
+    // snapshot and this very line (e.g. a create() that slipped in after that loop observed zero
+    // remaining branches, but before this statement runs) would make projects.delete() throw an FK
+    // constraint. Rather than surface that as a raw SQLite error, re-run the exact same
+    // children-first drain a few more times — cheap in the common case (an immediate empty
+    // listByProject() inside drainBranches()) and only does real work in the rare case a row
+    // genuinely appeared at the last second.
+    const MAX_FINAL_SWEEPS = 3;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        this.deps.state.projects.delete(project.id);
+        return;
+      } catch (e) {
+        const isFkViolation = (e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT");
+        if (!isFkViolation || attempt >= MAX_FINAL_SWEEPS) throw e;
+        console.error(
+          `projects.delete(${project.id}): FK constraint on final row-delete (attempt ${attempt}/${MAX_FINAL_SWEEPS}) — a branch likely appeared after the last sweep; re-draining:`,
+          e,
+        );
+        await this.drainBranches(project.id);
+      }
+    }
   }
 }

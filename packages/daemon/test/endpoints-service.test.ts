@@ -45,9 +45,11 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
 async function seeded() {
   const f = fakes();
   const state = openState(":memory:");
-  const projects = new ProjectsService({ state, ...f });
-  const { project, mainBranch } = await projects.create({ name: "acme" });
+  // Fix 1 (review): ProjectsDeps now requires `queue` — declared up front and shared with the
+  // sibling services below (mirrors how they already share one queue instance with each other).
   const queue = new BranchQueue();
+  const projects = new ProjectsService({ state, queue, ...f });
+  const { project, mainBranch } = await projects.create({ name: "acme" });
   const branches = new BranchesService({ state, queue, ...f });
   const logs = new LogsService();
   const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
@@ -77,6 +79,30 @@ describe("EndpointsService", () => {
     vi.mocked(f.computes.portOf).mockReturnValue(54300);
     await endpoints.start(mainBranch.id);
     expect(f.computes.start).not.toHaveBeenCalled();
+  });
+
+  // Fix 2 (review, final wave): a crashed compute leaves a "failed" entry in ComputeManager's map
+  // — a dead compute_ctl/postgres the manager still believes exists, occupying that branch's slot.
+  // Before this fix, startLocked()'s only special case was the "running" short-circuit above; a
+  // "failed" status fell through to computes.start(), which throws `endpoint for branch X already
+  // failed` (ComputeManager.start()'s own `existing` guard) — so an agent polling /api/sql after a
+  // crash could never recover the branch via the API, only by restarting the whole daemon. Now
+  // startLocked() calls computes.stop() first to reap the orphaned entry (ports, dir, map slot)
+  // before proceeding to computes.start() as normal.
+  it("start recovers a crashed (failed) compute by calling computes.stop() before computes.start()", async () => {
+    const { f, mainBranch, state, endpoints } = await seeded();
+    const order: string[] = [];
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("failed").mockReturnValue("running");
+    vi.mocked(f.computes.stop).mockImplementation(async () => { order.push("stop"); });
+    vi.mocked(f.computes.start).mockImplementation(async () => { order.push("start"); return { port: 54300 }; });
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+
+    const detail = await endpoints.start(mainBranch.id);
+
+    expect(order).toEqual(["stop", "start"]);
+    expect(f.computes.stop).toHaveBeenCalledWith(mainBranch.id);
+    expect(detail.endpointStatus).toBe("running");
+    expect(state.branches.byId(mainBranch.id)!.endpointStatus).toBe("running");
   });
 
   it("start maps PortExhaustedError to a 409 naming running endpoints (project-qualified) and DEVDB_PORT_RANGE", async () => {

@@ -39,6 +39,24 @@ Time travel:
     # discard a branch's changes (back to parent state)
     curl -X POST http://localhost:4400/api/branches/<id>/reset
 
+## Troubleshooting
+
+**"lockfile /data/.lock exists" on startup.** DevDB uses an exclusive-create
+lockfile in its data volume to stop two instances from sharing one data dir.
+An unclean shutdown (host reboot, `docker kill`, an OOM kill) skips the normal
+cleanup that removes it, so the NEXT startup finds it still there and refuses
+to boot — a safety check, not a crash. If you're sure no other devdb
+container is using this volume, clear it with:
+
+    docker compose -f docker/compose.yaml run --rm devdb rm /data/.lock
+
+Then start normally (`docker compose -f docker/compose.yaml up -d`).
+
+**Where did my logs go?** `docker compose logs devdb` carries all engine and
+compute output (storage controller, pageserver, safekeeper, and every
+compute's `compute_ctl`/postgres) — it's the container's own stdout/stderr,
+so no separate log file to find.
+
 Status: Phase 1 is complete — engine, branching, endpoints, time travel, logs
 (SSE), and restart resilience are all live and integration-proven end to end.
 Web UI, an MCP server for agents, import/export, and S3/Azure durability land

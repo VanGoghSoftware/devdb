@@ -45,7 +45,10 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
 async function seeded() {
   const f = fakes();
   const state = openState(":memory:");
-  const projects = new ProjectsService({ state, ...f });
+  // Fix 1 (review): ProjectsDeps now requires `queue` (delete()'s per-leaf teardown runs inside
+  // it) — a fresh instance is fine here since this helper only ever calls projects.create(),
+  // which never touches the queue.
+  const projects = new ProjectsService({ state, queue: new BranchQueue(), ...f });
   const { project, mainBranch } = await projects.create({ name: "acme" });
   const branches = new BranchesService({ state, queue: new BranchQueue(), ...f });
   return { f, state, project, mainBranch, branches };
@@ -100,7 +103,7 @@ describe("BranchesService", () => {
   it("delete evicts the branch's logs channel", async () => {
     const f = fakes();
     const state = openState(":memory:");
-    const projects = new ProjectsService({ state, ...f });
+    const projects = new ProjectsService({ state, queue: new BranchQueue(), ...f });
     const { project } = await projects.create({ name: "acme" });
     const logs = new LogsService();
     const branches = new BranchesService({ state, queue: new BranchQueue(), logs, ...f });
@@ -198,7 +201,7 @@ describe("BranchesService", () => {
     // exercising the cross-project 400 guard this test targets.
     const f = fakes();
     const state = openState(":memory:");
-    const projects = new ProjectsService({ state, ...f });
+    const projects = new ProjectsService({ state, queue: new BranchQueue(), ...f });
     const branches = new BranchesService({ state, queue: new BranchQueue(), ...f });
     const { project } = await projects.create({ name: "acme" });
     const { mainBranch: otherMain } = await projects.create({ name: "other" });
@@ -241,8 +244,8 @@ describe("BranchesService", () => {
     // BranchQueue instance the service uses — needed to occupy the parent's queue lane by hand.
     const f = fakes();
     const state = openState(":memory:");
-    const projects = new ProjectsService({ state, ...f });
     const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
     const branches = new BranchesService({ state, queue, ...f });
     const { project, mainBranch } = await projects.create({ name: "acme" });
 

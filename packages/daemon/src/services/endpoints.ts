@@ -31,8 +31,27 @@ export class EndpointsService {
   async startLocked(branchId: string): Promise<BranchDetail> {
     const branch = this.deps.branches.byIdOr404(branchId);
     const project = this.deps.state.projects.byId(branch.projectId)!;
-    if (this.deps.computes.statusOf(branch.id) === "running") {
+    // Read the status once and branch on that single snapshot below — calling statusOf() a
+    // second time for the "failed" check would observe a DIFFERENT call than the "running" check
+    // above against a fake/mock that returns different values per call (and is simply confusing
+    // style against the real ComputeManager, even though that one is synchronous/stable per call).
+    const status = this.deps.computes.statusOf(branch.id);
+    if (status === "running") {
       return this.deps.branches.detail(branch);
+    }
+    // Fix 2 (review, final wave): a crashed compute leaves a "failed" manager entry — dead
+    // compute_ctl/postgres that ComputeManager still believes occupies this branch's slot (map
+    // entry, reserved ports, temp dir). Left alone, computes.start() below would throw `endpoint
+    // for branch X already failed` (its own `existing` guard), so an agent polling /api/sql after
+    // a crash could never recover the branch via the API — only a full daemon restart (which runs
+    // reconcileEndpointsOnBoot) would clear it. stop() reaps the orphaned postgres, releases the
+    // ports, removes the compute dir, and clears the map slot — verified clean on a "failed" entry
+    // (ManagedProcess.stop() no-ops instantly since `this.child` is already null by the time a
+    // process has transitioned to "failed" — see process.ts's exit handler) — so this start can
+    // proceed exactly like a normal cold start right after. This is the recovery path for agents
+    // polling /api/sql: a crashed branch becomes startable again through the same endpoint.
+    if (status === "failed") {
+      await this.deps.computes.stop(branch.id);
     }
     this.deps.state.branches.updateEndpoint(branch.id, { status: "starting", port: null });
     try {

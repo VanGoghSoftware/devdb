@@ -59,9 +59,11 @@ function fakeEndpointsLocked(): EndpointsLockedApi {
 async function seeded() {
   const f = fakes();
   const state = openState(":memory:");
-  const projects = new ProjectsService({ state, ...f });
-  const { project, mainBranch } = await projects.create({ name: "acme" });
+  // Fix 1 (review): ProjectsDeps now requires `queue` — declared up front and shared with the
+  // sibling services below (mirrors how they already share one queue instance with each other).
   const queue = new BranchQueue();
+  const projects = new ProjectsService({ state, queue, ...f });
+  const { project, mainBranch } = await projects.create({ name: "acme" });
   const branches = new BranchesService({ state, queue, ...f });
   const logs = new LogsService();
   const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
@@ -127,9 +129,9 @@ describe("TimeTravelService", () => {
     // seeded() default wires a real EndpointsService, which is exercised by the test above;
     // this test targets TimeTravelService's own orchestration of the *Locked calls.
     const state = openState(":memory:");
-    const projects = new ProjectsService({ state, ...f });
-    const { mainBranch: main2 } = await projects.create({ name: "acme2" });
     const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { mainBranch: main2 } = await projects.create({ name: "acme2" });
     const branches = new BranchesService({ state, queue, ...f });
     const tt2 = new TimeTravelService({
       state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
@@ -154,9 +156,9 @@ describe("TimeTravelService", () => {
     const startLocked = vi.fn(async () => ({}) as never);
     const stopLocked = vi.fn(async () => ({}) as never);
     const state = openState(":memory:");
-    const projects = new ProjectsService({ state, ...f });
-    const { mainBranch: main2 } = await projects.create({ name: "acme3" });
     const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { mainBranch: main2 } = await projects.create({ name: "acme3" });
     const branches = new BranchesService({ state, queue, ...f });
     const tt2 = new TimeTravelService({
       state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
@@ -274,8 +276,8 @@ describe("TimeTravelService", () => {
     vi.mocked(f.computes.statusOf).mockReturnValue("running");
     const startLocked = vi.fn(async () => ({}) as never);
     const stopLocked = vi.fn(async () => ({}) as never);
-    const project2 = await new ProjectsService({ state, ...f }).create({ name: "swapfail" });
     const queue = new BranchQueue();
+    const project2 = await new ProjectsService({ state, queue, ...f }).create({ name: "swapfail" });
     const branches = new BranchesService({ state, queue, ...f });
     const tt2 = new TimeTravelService({
       state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,

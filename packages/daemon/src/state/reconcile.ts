@@ -1,3 +1,5 @@
+import { readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { StateDb } from "./db.js";
 
 // Fix 4 (review): extracted from index.ts's boot sequence into its own testable function.
@@ -21,4 +23,33 @@ export function reconcileEndpointsOnBoot(state: StateDb): void {
       }
     }
   }
+}
+
+// Fix 4 (review, final wave): a compute mid-launch or mid-teardown at the moment the daemon
+// container died unexpectedly (host reboot, `docker kill`, OOM — anything that skips the SIGTERM
+// shutdown path's own ComputeManager.stopAll()) leaves its mkdtemp'd directory under computesDir
+// behind on disk: pg_data, config.json, pg_hba.conf, all orphaned. Exactly like
+// reconcileEndpointsOnBoot() above, ComputeManager always starts a fresh boot with an EMPTY
+// in-memory map — nothing tracks these leftover directories, and no other code path ever revisits
+// or cleans them, so they accumulate across restarts as pure disk waste. Placed beside
+// reconcileEndpointsOnBoot() for the same reason: both are one-shot boot-time cleanup that must
+// run before anything is live to race against — index.ts calls this immediately after
+// reconcileEndpointsOnBoot(state), a point at which nothing can legitimately be running
+// in-container (ComputeManager hasn't been constructed yet, let alone started anything).
+//
+// Deliberately tolerant of a missing computesDir (a fresh data volume with no computes ever
+// started has no computes/ directory at all yet — not an error, just nothing to sweep) — every
+// OTHER unexpected error (permissions, a genuinely corrupt path) is left to propagate rather than
+// silently swallowed, since a boot-time cleanup step failing for a non-ENOENT reason is exactly
+// the kind of thing that should surface loudly rather than be masked.
+export async function sweepComputesDir(computesDir: string): Promise<number> {
+  let entries: string[];
+  try {
+    entries = await readdir(computesDir);
+  } catch (e) {
+    if ((e as { code?: string }).code === "ENOENT") return 0;
+    throw e;
+  }
+  await Promise.all(entries.map((name) => rm(join(computesDir, name), { recursive: true, force: true })));
+  return entries.length;
 }

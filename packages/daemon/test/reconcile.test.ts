@@ -1,6 +1,9 @@
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
-import { reconcileEndpointsOnBoot } from "../src/state/reconcile.js";
+import { reconcileEndpointsOnBoot, sweepComputesDir } from "../src/state/reconcile.js";
 
 function freshState() {
   return openState(":memory:");
@@ -118,5 +121,46 @@ describe("reconcileEndpointsOnBoot", () => {
     reconcileEndpointsOnBoot(s);
 
     expect(s.branches.byId(b.id)!.endpointError).toBeNull();
+  });
+});
+
+// Fix 4 (review, final wave): a compute that was mid-launch or mid-teardown at the moment the
+// daemon/container died (unclean shutdown — host reboot, `docker kill`, OOM) leaves its temp dir
+// under computesDir behind on disk. ComputeManager always boots with an empty in-memory map (see
+// reconcileEndpointsOnBoot's own doc comment above), so nothing is tracking these directories any
+// longer — they're pure disk waste that accumulates across restarts with no code path that ever
+// cleans them up otherwise. Placed beside reconcileEndpointsOnBoot() since both run once, at boot,
+// before anything is live to race against (index.ts calls this immediately after
+// reconcileEndpointsOnBoot(state) — nothing can be running at that point in-container).
+describe("sweepComputesDir", () => {
+  it("removes every entry under computesDir and returns the count", async () => {
+    const computesDir = mkdtempSync(join(tmpdir(), "devdb-sweep-test-"));
+    const first = join(computesDir, "compute_aaaa_1");
+    const second = join(computesDir, "compute_bbbb_2");
+    mkdirSync(first);
+    writeFileSync(join(first, "config.json"), "{}");
+    mkdirSync(second);
+    writeFileSync(join(second, "pg_hba.conf"), "local all all trust\n");
+
+    const count = await sweepComputesDir(computesDir);
+
+    expect(count).toBe(2);
+    expect(readdirSync(computesDir)).toEqual([]);
+    expect(existsSync(first)).toBe(false);
+    expect(existsSync(second)).toBe(false);
+  });
+
+  it("tolerates a missing computesDir, returning 0 without throwing", async () => {
+    const computesDir = join(mkdtempSync(join(tmpdir(), "devdb-sweep-test-")), "never-created");
+    expect(existsSync(computesDir)).toBe(false);
+
+    await expect(sweepComputesDir(computesDir)).resolves.toBe(0);
+  });
+
+  it("returns 0 for an existing but empty computesDir", async () => {
+    const computesDir = mkdtempSync(join(tmpdir(), "devdb-sweep-test-"));
+
+    await expect(sweepComputesDir(computesDir)).resolves.toBe(0);
+    expect(existsSync(computesDir)).toBe(true); // the dir itself is left in place, only cleared
   });
 });

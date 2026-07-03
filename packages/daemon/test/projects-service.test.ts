@@ -3,6 +3,7 @@ import { openState } from "../src/state/db.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { slugify } from "../src/services/slug.js";
 import { LogsService } from "../src/services/logs.js";
+import { BranchQueue } from "../src/state/queue.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { BranchRow } from "../src/state/repos.js";
 import type { EndpointStatus } from "@devdb/shared";
@@ -15,7 +16,16 @@ import { loadConfig } from "../src/config.js";
 // Amendment A2: typed fakes satisfying the narrow service-facing interfaces from
 // services/engine-api.ts — no `as never` casts. Every method the interfaces declare must
 // exist on the fake (even ones a given test never exercises) or this file fails to typecheck.
-function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi } {
+//
+// Fix 1 (review): `queue` is a fresh BranchQueue per call — ProjectsDeps now requires one so
+// delete() can serialize each leaf's teardown against concurrent start()/stop()/create() lane
+// jobs for that branch. Bundled here (not threaded through every call site individually) so
+// every existing `new ProjectsService({ state, ...f })` call keeps working unchanged; tests that
+// need to occupy a lane by hand destructure `f.queue` directly (see the two tests below).
+function fakes(): {
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
+  queue: BranchQueue;
+} {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
     getLsnByTimestamp: vi.fn(async () => ({ lsn: "0/0", kind: "present" })),
@@ -40,7 +50,7 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
-  return { storcon, pageserver, safekeeper, computes };
+  return { storcon, pageserver, safekeeper, computes, queue: new BranchQueue() };
 }
 
 describe("slugify", () => {
@@ -136,6 +146,93 @@ describe("ProjectsService", () => {
     const svc = new ProjectsService({ state, ...f });
     const { project } = await svc.create({ name: "acme" });
     await expect(svc.delete(project.id)).resolves.toBeUndefined();
+  });
+
+  // Fix 1 (review): delete() now recomputes `remaining` from state on EVERY `while` iteration
+  // (not once up front) specifically so a branch created mid-delete — after the initial
+  // listByProject() snapshot but before the loop finishes — still gets caught in a later round
+  // instead of silently surviving the project delete (which would then throw an FK constraint
+  // on the final projects.delete() call, or worse, leave an orphaned branch row referencing a
+  // now-gone project). Simulated here by monkey-patching listByProject to inject a new leaf row
+  // the FIRST time it's called after main has already been created — i.e. exactly the "state
+  // changed after our snapshot" case a naive one-shot snapshot would miss.
+  it("a branch created between rounds still gets deleted", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const svc = new ProjectsService({ state, ...f });
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+
+    const original = state.branches.listByProject.bind(state.branches);
+    let calls = 0;
+    let injected: BranchRow | null = null;
+    state.branches.listByProject = ((projectId: string) => {
+      calls++;
+      const rows = original(projectId);
+      // On the very first snapshot (round 1), main is the only row and is about to be deleted as
+      // a leaf. Inject a second branch directly into state right then — simulating a create()
+      // that lands in the window between this snapshot and delete()'s next iteration — so it is
+      // ABSENT from round 1's snapshot but present in state by the time round 2 re-queries.
+      if (calls === 1 && !injected) {
+        injected = state.branches.create({
+          id: crypto.randomUUID(), projectId: project.id, parentBranchId: mainBranch.id,
+          name: "late-arrival", slug: "acme-late-arrival", timelineId: "d".repeat(32),
+          password: "x", createdBy: "api",
+        });
+      }
+      return rows;
+    }) as typeof original;
+
+    try {
+      await svc.delete(project.id);
+    } finally {
+      state.branches.listByProject = original;
+    }
+
+    expect(state.projects.byId(project.id)).toBeNull();
+    expect(state.branches.countAll()).toBe(0);
+    expect(calls).toBeGreaterThan(1); // proves re-snapshotting actually happened across rounds
+  });
+
+  // Fix 1 (review): each leaf's teardown now runs inside `queue.run(leaf.id, ...)` — the SAME
+  // per-branch lane that start()/stop()/create() use — so a project delete can never race a
+  // concurrent endpoint operation on one of its branches. Proven here by occupying the leaf's
+  // lane with a slow, still-pending job BEFORE calling delete(), then asserting computes.stop()
+  // (delete's first teardown step for that leaf) is only invoked after the slow job's own body
+  // has run to completion — i.e. delete() waited its turn in line rather than reaching straight
+  // into computes.stop() while the lane was busy.
+  it("delete serializes with an in-flight endpoint lane job", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const svc = new ProjectsService({ state, ...f });
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+
+    const order: string[] = [];
+    let releaseSlowJob!: () => void;
+    const slowJobStarted = new Promise<void>((resolveStarted) => {
+      const blocker = f.queue.run(mainBranch.id, () => {
+        order.push("slow-job-start");
+        resolveStarted();
+        return new Promise<void>((resolve) => { releaseSlowJob = resolve; }).then(() => {
+          order.push("slow-job-end");
+        });
+      });
+      void blocker;
+    });
+    vi.mocked(f.computes.stop).mockImplementation(async () => {
+      order.push("delete-stop");
+    });
+
+    await slowJobStarted; // the lane job is now occupying mainBranch.id's queue slot
+    const deletePromise = svc.delete(project.id);
+    // Give delete() a chance to reach queue.run() and enqueue behind the slow job — it must not
+    // proceed to computes.stop() yet, since the lane is still occupied.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["slow-job-start"]);
+
+    releaseSlowJob();
+    await deletePromise;
+
+    expect(order).toEqual(["slow-job-start", "slow-job-end", "delete-stop"]);
   });
 
   it("compensates the tenant when bootstrap fails", async () => {

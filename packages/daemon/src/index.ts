@@ -16,7 +16,8 @@ import { TimeTravelService } from "./services/timetravel.js";
 import { SqlService } from "./services/sql.js";
 import { LogsService } from "./services/logs.js";
 import { BranchQueue } from "./state/queue.js";
-import { reconcileEndpointsOnBoot } from "./state/reconcile.js";
+import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js";
+import { engineDirs } from "./engine/configs.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -28,7 +29,16 @@ async function main(): Promise<void> {
     const fh = await open(lockPath, "wx");
     await fh.close();
   } catch {
-    console.error(`lockfile ${lockPath} exists — another devdb owns this data dir, or it crashed. Remove the file if you are sure no other instance runs.`);
+    // Fix 3 (review, final wave): name the exact recovery command rather than leaving "remove the
+    // file if you are sure" as an exercise for the reader — an unclean shutdown (host reboot,
+    // `docker kill`, OOM) skips the SIGTERM handler's `rm(lockPath)` above, leaving this stale
+    // lockfile as the only symptom. The command targets the SAME named volume this data dir is
+    // mounted from (docker/compose.yaml's `devdb-data:/data`), via a scratch `run --rm` container
+    // so no long-lived devdb process needs to be up to clear it.
+    console.error(
+      `lockfile ${lockPath} exists — another devdb owns this data dir, or it crashed without cleaning up.\n` +
+      `Remove it with: docker compose -f docker/compose.yaml run --rm devdb rm /data/.lock — only if no other devdb container is using this volume.`,
+    );
     process.exit(1);
   }
 
@@ -48,14 +58,27 @@ async function main(): Promise<void> {
     // coverage — see that module's doc comment for the full rationale).
     reconcileEndpointsOnBoot(state);
 
+    // Fix 4 (review, final wave): sweep any compute directories left behind by a compute that was
+    // mid-launch/mid-teardown when the container died uncleanly. Runs immediately after
+    // reconcileEndpointsOnBoot() and before ComputeManager is even constructed below — nothing can
+    // legitimately be running in-container yet, so it's safe to unconditionally rm -rf every entry
+    // under computesDir without needing to cross-reference against any in-memory state.
+    const sweptComputeDirs = await sweepComputesDir(engineDirs(cfg).computesDir);
+    if (sweptComputeDirs > 0) {
+      console.error(`boot: swept ${sweptComputeDirs} crash-orphaned compute director${sweptComputeDirs === 1 ? "y" : "ies"} from a previous unclean shutdown`);
+    }
+
     const storcon = new StorconClient();
     const pageserver = new PageserverClient();
     const safekeeper = new SafekeeperClient();
     computes = new ComputeManager(cfg);
+    const queue = new BranchQueue();
     // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
     // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, logs });
-    const queue = new BranchQueue();
+    // Fix 1 (final review wave): `queue` wired into ProjectsService too — delete()'s per-leaf
+    // teardown now runs inside queue.run(leaf.id, ...), the SAME lane BranchesService/
+    // EndpointsService already serialize start()/stop()/create()/delete() through for a branch id.
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
     const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
     const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints });
