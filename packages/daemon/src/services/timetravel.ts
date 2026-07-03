@@ -166,28 +166,33 @@ export class TimeTravelService {
         throw new DevdbError(409, "endpoint is mid-transition — retry when it settles");
       }
       const wasRunning = status === "running";
-      // Stop through EndpointsLockedApi (not raw computes.stop) so the old row's endpoint_status
-      // persists the same starting/stopping/stopped bookkeeping a normal stop() would — this row
-      // is about to be renamed to its archived identity, but its endpoint lifecycle history
-      // should stay coherent up to that point.
-      if (wasRunning) await this.deps.endpoints.stopLocked(lane, branch.id);
-
       const newTimelineId = newHexId();
       // Review fix: the ORIGINAL failure-handling only compensated a failed detachAncestor call.
-      // ANY failure in this block — timelineCreate, detachAncestor, or restoreSwap — now gets the
-      // identical compensation: best-effort delete the (possibly never fully created) new
-      // timeline on both engine components, restart the original endpoint if it was running,
-      // rethrow. `newTimelineCreated` tracks whether the delete calls even need to run (skip them
-      // if timelineCreate itself never succeeded — nothing to delete yet). Deliberately scoped to
-      // stop at restoreSwap: once restoreSwap has returned, branch.id IS the archived identity and
-      // newTimelineId IS the live swapped branch's timeline — a failure in the startLocked() call
-      // AFTER this block (below) is a different failure domain entirely (the swap already
+      // ANY failure in this block — the initial endpoint stop, timelineCreate, detachAncestor, or
+      // restoreSwap — now gets the identical compensation: best-effort delete the (possibly never
+      // fully created) new timeline on both engine components, restart the original endpoint if it
+      // was running, rethrow. `newTimelineCreated` tracks whether the delete calls even need to run
+      // (skip them if timelineCreate itself never succeeded — nothing to delete yet; an initial-
+      // stop failure skips them too, since no timeline exists at that point). Deliberately scoped
+      // to stop at restoreSwap: once restoreSwap has returned, branch.id IS the archived identity
+      // and newTimelineId IS the live swapped branch's timeline — a failure in the startLocked()
+      // call AFTER this block (below) is a different failure domain entirely (the swap already
       // succeeded) and must not trigger "delete newTimelineId" / "restart branch.id" compensation,
       // which would target the wrong (now-archived) identity and the wrong (now-live) timeline.
       // See the crash-window comment below for that separate, currently-unhandled gap.
       let newTimelineCreated = false;
       let swapped: BranchRow;
       try {
+        // Stop through EndpointsLockedApi (not raw computes.stop) so the old row's endpoint_status
+        // persists the same starting/stopping/stopped bookkeeping a normal stop() would — this row
+        // is about to be renamed to its archived identity, but its endpoint lifecycle history
+        // should stay coherent up to that point. INSIDE the try (was outside it): a stop failure
+        // here must land in the same compensation path as every later step, or a failed stop would
+        // strand a previously-running branch stopped even though the restore/reset never happened
+        // and ultimately failed. `lane` is this queued body's own capability for branchId — the
+        // same lane the compensation's startLocked(lane, branch.id) below presents.
+        if (wasRunning) await this.deps.endpoints.stopLocked(lane, branch.id);
+
         const req: { new_timeline_id: string } & Record<string, unknown> = {
           new_timeline_id: newTimelineId,
           ancestor_timeline_id: ancestorTimelineId,
