@@ -1,0 +1,9 @@
+# Everything in this repo gets COPYed into a Linux image (docker/Dockerfile),
+# so working trees must always check out with LF: CRLF bash scripts fail
+# in-build ("set: pipefail: invalid option name"), and a machine with global
+# core.autocrlf=true would otherwise smudge fresh checkouts/worktrees to CRLF.
+* text=auto eol=lf
+
+# Belt and braces: shell scripts are always text, always LF, even if the
+# catch-all rule above ever changes.
+*.sh text eol=lf
