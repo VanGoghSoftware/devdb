@@ -130,3 +130,10 @@ Findings: 7 new findings. The highest-risk areas are reset/create serialization,
 Scope: whole-surface code scan; no tests were run.
 
 Found 6 new issues: SSE backpressure can buffer without bound, compute startup logs are missed, compute log subscriptions leak through branch deletion, LogsService channel maps are unbounded, the testcontainers retry workaround can leave live failed-attempt containers during the run, and boot reconciliation lacks coverage for failed/error-preservation cases.
+
+
+## 2026-07-03 03:51 CEST - Model-backed whole-surface scan
+
+Scope: whole-surface code scan over the supplied source bundle; no tests were run.
+
+Found 6 new issues. The highest-risk items are that the SQL execution deadline is only a server-side setting that submitted SQL can disable, and the 1000-row cap happens after pg has already loaded the entire result into daemon memory. I also found result-shape problems for multi-statement queries and duplicate column names, plus weaker acceptance coverage around child-branch mutation and a README quickstart gap around endpoint connection details and the new SQL route.
