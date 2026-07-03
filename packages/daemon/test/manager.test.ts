@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,18 @@ vi.mock("../src/engine/process.js", () => ({
   })),
 }));
 
+// rm is the only fs call stop() retries (compute-dir removal races the orphaned-postgres
+// shutdown — see reapOrphanedPostgres/stop() in src/compute/manager.ts), so it is the only
+// one mocked; everything else (including reapOrphanedPostgres's /proc readdir/readFile)
+// passes through to the real module. The default implementation (restored in beforeEach) is
+// the real rm, so tests that don't care about the race exercise real deletion.
+const rmMock = vi.hoisted(() => vi.fn());
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rm: rmMock };
+});
+const realFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+
 import { loadConfig } from "../src/config.js";
 import { newHexId } from "../src/engine/ids.js";
 import { ComputeManager } from "../src/compute/manager.js";
@@ -25,12 +37,13 @@ import type { BranchRow } from "../src/state/repos.js";
 
 const ManagedProcessMock = vi.mocked(ManagedProcess);
 
-function freshCfg() {
+function freshCfg(extraEnv: Record<string, string> = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), "devdb-manager-test-"));
   return loadConfig({
     DEVDB_DATA_DIR: dataDir,
     NEON_BINARIES_DIR: "/usr/local/share/neon/bin",
     PG_INSTALL_DIR: "/usr/local/share/neon/pg_install",
+    ...extraEnv,
   });
 }
 
@@ -60,6 +73,8 @@ describe("ComputeManager", () => {
     startMock.mockReset();
     stopMock.mockReset();
     stopMock.mockImplementation(async () => {});
+    rmMock.mockReset();
+    rmMock.mockImplementation(realFs.rm);
     ManagedProcessMock.mockClear();
   });
 
@@ -243,6 +258,71 @@ describe("ComputeManager", () => {
 
     expect(manager.statusOf(branch.id)).toBe("stopped");
     expect(existsSync(dir)).toBe(false);
+  });
+
+  // Unit-level counterpart of the Task 15 live repro: the recursive rm can lose the race with a
+  // still-live orphaned postgres and fail ENOTEMPTY on the final rmdir. stop()'s catch retries
+  // reap+rm exactly once — this drives that path at the fs layer (reapOrphanedPostgres itself
+  // no-ops here: no /proc on macOS, no cmdline matching the tmpdir path on Linux CI).
+  it("stop() retries reap+rm once when pg_data is repopulated behind the first rm (ENOTEMPTY)", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+    await manager.start({ branch, pgVersion: 17 });
+
+    const computesDir = join(cfg.dataDir, "computes");
+    const children = await readdir(computesDir);
+    const dir = join(computesDir, children[0]!);
+
+    // First attempt: postgres wrote into pg_data behind rm's tree walk, and the rmdir failed
+    // the way node reports it. The straggler file left behind proves the retry re-walks the
+    // tree rather than repeating a doomed bare rmdir.
+    rmMock.mockImplementationOnce(async () => {
+      await mkdir(join(dir, "pg_data"), { recursive: true });
+      await writeFile(join(dir, "pg_data", "straggler.tmp"), "written behind the rm walk");
+      throw Object.assign(
+        new Error(`ENOTEMPTY: directory not empty, rmdir '${join(dir, "pg_data")}'`),
+        { code: "ENOTEMPTY" },
+      );
+    });
+
+    await manager.stop(branch.id);
+
+    expect(rmMock).toHaveBeenCalledTimes(2);
+    expect(existsSync(dir)).toBe(false);
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+  });
+
+  it("stop() never rethrows rm failures, bounds the retry at one, and still releases the ports", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    // Single-port range: if the failing stop() below leaked the reserved endpoint port, the
+    // restart at the end would have nowhere to allocate and throw PortExhaustedError instead
+    // of reusing it.
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54331-54331" });
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54331 });
+    const computesDir = join(cfg.dataDir, "computes");
+    const [child] = await readdir(computesDir);
+    const dir = join(computesDir, child!);
+
+    rmMock.mockImplementation(async () => {
+      throw Object.assign(new Error("ENOTEMPTY: directory not empty"), { code: "ENOTEMPTY" });
+    });
+
+    // The live repro surfaced this as a spurious stop 500 — rm failures must stay inside
+    // stop() (logged loud, dir accepted as leaked) or the throw would skip the port release
+    // running after it inside the same finally.
+    await expect(manager.stop(branch.id)).resolves.toBeUndefined();
+    expect(rmMock).toHaveBeenCalledTimes(2);
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+    expect(existsSync(dir)).toBe(true); // the accepted trade-off: dir leaks rather than 500s
+
+    rmMock.mockReset();
+    rmMock.mockImplementation(realFs.rm);
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54331 });
   });
 
   it("isolates onLine listeners: a throwing listener does not prevent later listeners from receiving the line", async () => {
