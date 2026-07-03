@@ -820,26 +820,29 @@ describe("buildServer SSE log routes", () => {
     }
   });
 
+  // Fix wave 1 (self-review): the prior version of this test only aborted the fetch and asserted
+  // a LATER publish() didn't throw — that passes even if the route's close handler failed to
+  // unsubscribe, because publish() swallows subscriber errors and a subsequent publish's own
+  // teardown-on-throw would silently remove the leaked subscriber anyway. This version proves the
+  // unsubscribe fires on disconnect directly, without relying on any later publish: spy on
+  // EventsService.subscribe, wrap the real unsub in a counter, and vi.waitFor the counter — same
+  // pattern as the logs-route disconnect test above ("client disconnect calls the unsub function
+  // returned by LogsService.subscribe").
   it("GET /api/events — client disconnect unsubscribes from EventsService (no leak)", async () => {
     const events = new EventsService();
+    let unsubCalls = 0;
+    const realSubscribe = events.subscribe.bind(events);
+    vi.spyOn(events, "subscribe").mockImplementation((cb) => {
+      const unsub = realSubscribe(cb);
+      return () => { unsubCalls++; unsub(); };
+    });
     const { app, base } = await listening(fakeLogs(), { events });
     try {
       const ac = new AbortController();
       const res = await fetch(`${base}/api/events`, { signal: ac.signal });
-      // Self-review fix: /api/events' replay is ALWAYS `[]` by contract (see the route), so —
-      // unlike the logs routes' tests, which seed a line first — there are no body bytes for
-      // reader.read() to resolve on until either a publish() or this abort() happens. Awaiting
-      // the read BEFORE calling abort() (as in an earlier draft of this test) deadlocks: the read
-      // has nothing to settle on, and abort() — the only thing that settles it (rejects it; see
-      // empirical verification in the self-review) — is the very next statement, unreachable
-      // while still awaiting. Fire off the read without awaiting it, so it's pending when abort()
-      // runs and gets rejected by it, exactly like a real client's stream teardown.
-      const pendingRead = res.body!.getReader().read().catch(() => {});
+      expect(res.status).toBe(200); // subscription established (headers flush on connect)
       ac.abort();
-      await pendingRead;
-      // Publish after abort settles; delivery to a torn-down socket must not throw the publish.
-      await new Promise((r) => setTimeout(r, 50));
-      expect(() => events.publish({ type: "engine.health" })).not.toThrow();
+      await vi.waitFor(() => expect(unsubCalls).toBe(1)); // close handler unsubscribed — no publish needed
     } finally {
       await app.close();
     }

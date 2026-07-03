@@ -70,5 +70,5 @@ export const DevdbEventSchema = z.object({
   projectId: z.string().optional(),
   branchId: z.string().optional(),
   at: z.string(), // ISO-8601 with timezone (server-stamped)
-});
+}).strict();
 export type DevdbEvent = z.infer<typeof DevdbEventSchema>;

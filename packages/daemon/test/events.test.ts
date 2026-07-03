@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DevdbEventSchema } from "@devdb/shared";
 import { EventsService } from "../src/services/events.js";
 
 describe("EventsService", () => {
@@ -39,5 +40,10 @@ describe("EventsService", () => {
     svc.subscribe(() => seen.push("other"));
     svc.publish({ type: "engine.health" });
     expect(seen).toEqual(["self", "other"]);
+  });
+
+  it("DevdbEventSchema rejects non-contract fields and accepts a valid event", () => {
+    expect(DevdbEventSchema.safeParse({ type: "engine.health", at: "t" }).success).toBe(true);
+    expect(DevdbEventSchema.safeParse({ type: "engine.health", at: "t", data: "leak" }).success).toBe(false);
   });
 });

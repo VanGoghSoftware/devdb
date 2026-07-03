@@ -8,7 +8,9 @@ export class EventsService {
   private subs = new Set<(e: DevdbEvent) => void>();
 
   publish(e: { type: DevdbEventType; projectId?: string; branchId?: string }): void {
-    const evt: DevdbEvent = { ...e, at: new Date().toISOString() };
+    // Explicit field whitelist (not `{ ...e, at }`) — no extra runtime property on the caller
+    // object can ever reach the wire, regardless of what a future caller accidentally passes in.
+    const evt: DevdbEvent = { type: e.type, projectId: e.projectId, branchId: e.branchId, at: new Date().toISOString() };
     // Snapshot before iterating — a subscriber unsubscribing (itself or another) mid-publish
     // must not mutate the Set out from under this loop. Same shape as LogsService.ingest.
     for (const cb of [...this.subs]) {
