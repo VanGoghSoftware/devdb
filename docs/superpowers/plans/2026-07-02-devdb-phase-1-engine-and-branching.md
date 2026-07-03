@@ -3781,6 +3781,8 @@ git add -A && git commit -m "feat: time travel — lsn lookup, branch-at-point, 
 
 ### Task 16: Logs (SSE), full status, boot reconciliation, restart resilience
 
+> **AMENDED (A22, post-review):** beyond the blocks below — compute log sinks are passed INTO `ComputeManager.start()` and registered at slot-reservation time, so launch/failure output reaches the branch channel and entry lifecycle owns cleanup on every stop path; SSE writes go through a backpressure-aware `safeWrite` (slow/dead clients are dropped; replay aborts on first failure); daemon log components are allowlisted; `LogsService.evict()` fires on branch/project deletion and empty subscriber sets are pruned; reconciliation lives in `reconcileEndpointsOnBoot(state)` with unit coverage incl. endpoint_error preservation; the status endpoint surfaces real storcon_db state (T8 rider closed); the integration helper works around a root-caused testcontainers@10.28.0 port-cache race (upstream chip pending). See commits 0d7740b + 6b6d517.
+
 **Files:**
 - Create: `packages/daemon/src/services/logs.ts`
 - Modify: `packages/daemon/src/engine/boot.ts` (wire `onLine` → LogsService), `packages/daemon/src/compute/manager.ts` (already exposes `onLine`), `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
