@@ -10,6 +10,14 @@ export interface ManagedProcessOpts {
   readyNeedle: string;
   readyTimeoutMs?: number;
   onLine?: (line: string, stream: "stdout" | "stderr") => void;
+  // When true, spawn as its own process-group leader (setsid-equivalent via Node's `detached`)
+  // and signal the whole group (`process.kill(-pid, sig)`) on stop — not just the direct child.
+  // compute_ctl orphans its postgres child on SIGTERM (never waits for it, never sets
+  // PDEATHSIG/setpgid on it — handover §4.4/§8.6, confirmed live); without group semantics that
+  // child is reparented to PID 1 and outlives stop() entirely. Only ComputeManager passes this;
+  // the engine binaries (broker/storcon/pageserver/safekeeper) keep the default `false` — they
+  // don't fork surviving children, so plain child-pid signaling is correct for them.
+  detached?: boolean;
 }
 
 const RING_SIZE = 500;
@@ -49,6 +57,7 @@ export class ManagedProcess {
         env: this.opts.env ?? {},
         cwd: this.opts.cwd,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: this.opts.detached ?? false,
       });
     } catch (e) {
       this.state = "failed";
@@ -130,6 +139,7 @@ export class ManagedProcess {
 
   async stop(timeoutMs = 10_000): Promise<void> {
     const child = this.child;
+    const pid = this.pid;
     this.state = "stopped";
     if (!child) return;
     this.child = null;
@@ -139,8 +149,21 @@ export class ManagedProcess {
       child.once("exit", () => res());
       child.once("error", () => res());
     });
-    child.kill("SIGTERM");
-    const killer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    // When detached, signal the whole process group (negative pid) so compute_ctl's orphaned
+    // postgres child (R3: it never waits for/reparents-away its own child on SIGTERM) dies too,
+    // instead of surviving as a PID-1 orphan. Wrapped in try/catch: a group that's already gone
+    // (ESRCH) or a signal we're not permitted to send (EPERM, e.g. group leader already reaped)
+    // must never make stop() itself throw — this method's contract is total.
+    const signal = (sig: NodeJS.Signals) => {
+      try {
+        if (this.opts.detached && pid) process.kill(-pid, sig);
+        else child.kill(sig);
+      } catch {
+        // already gone
+      }
+    };
+    signal("SIGTERM");
+    const killer = setTimeout(() => signal("SIGKILL"), timeoutMs);
     await exited;
     clearTimeout(killer);
   }

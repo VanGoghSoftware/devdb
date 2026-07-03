@@ -139,6 +139,11 @@ export class ComputeManager {
         env: {},
         readyNeedle: "listening on IPv4 address",
         readyTimeoutMs: 50_000,
+        // Own process group: compute_ctl orphans its postgres child on SIGTERM instead of
+        // waiting for it (R3 — handover §4.4/§8.6, confirmed live) — group-kill on stop() is the
+        // structural fix; reapOrphanedPostgres below stays as a Linux-only backstop for whatever
+        // it doesn't structurally prevent (e.g. daemon crash before stop() ever runs).
+        detached: true,
         onLine: (line) => {
           // Fan out over a snapshot so one listener throwing doesn't stop the rest, and so
           // unsubscribes during the callback don't mutate the array we're iterating.
