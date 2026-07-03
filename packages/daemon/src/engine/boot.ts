@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import type { DevdbConfig } from "../config.js";
 import type { StateDb } from "../state/db.js";
+import type { LogsService } from "../services/logs.js";
 import { ManagedProcess } from "./process.js";
 import { EmbeddedPostgres } from "./embedded-postgres.js";
 import {
@@ -15,7 +16,7 @@ export class EngineRuntime {
   private procs = new Map<string, ManagedProcess>();
   storconDbUri: string;
 
-  constructor(private cfg: DevdbConfig, private state: StateDb) {
+  constructor(private cfg: DevdbConfig, private state: StateDb, private logs: LogsService) {
     let pw = state.settings.get("storcon_db_password");
     if (!pw) {
       pw = randomBytes(24).toString("hex");
@@ -27,17 +28,26 @@ export class EngineRuntime {
       pgInstallDir: cfg.pgInstallDir,
       port: cfg.engine.storconDbPort,
       password: pw,
-      onLine: (line) => console.log(`[storcon_db] ${line}`),
+      // Route through LogsService (feeds SSE + recent() replay via `daemon:storcon_db`) while
+      // KEEPING the stdout emission Task 8 established — `docker logs` must still carry every
+      // supervised process's output unconditionally, LogsService is additive, not a replacement.
+      onLine: (line) => {
+        console.log(`[storcon_db] ${line}`);
+        this.logs.ingest("daemon:storcon_db", line);
+      },
     });
     this.storconDbUri = this.storconDb.connectionUri();
   }
 
   private async launch(spec: { name: string; bin: string; args: string[]; readyNeedle: string }): Promise<void> {
-    // onLine → stdout so `docker logs` carries every supervised process's output.
+    // onLine → stdout (docker logs) AND LogsService (SSE + recent() replay, `daemon:<name>`).
     const proc = new ManagedProcess({
       ...spec,
       readyTimeoutMs: 120_000,
-      onLine: (line) => console.log(`[${spec.name}] ${line}`),
+      onLine: (line) => {
+        console.log(`[${spec.name}] ${line}`);
+        this.logs.ingest(`daemon:${spec.name}`, line);
+      },
     });
     this.procs.set(spec.name, proc);
     await proc.start();
@@ -107,7 +117,8 @@ export class EngineRuntime {
 
   status(): Record<string, { state: string; pid: number | null }> {
     const out: Record<string, { state: string; pid: number | null }> = {};
-    out.storcon_db = { state: "running", pid: null };
+    // T16 rider (ledgered at Task 8): real EmbeddedPostgres state/pid, not a hardcoded "running".
+    out.storcon_db = { state: this.storconDb.state, pid: this.storconDb.pid };
     for (const [name, proc] of this.procs) {
       out[name] = { state: proc.state, pid: proc.pid };
     }

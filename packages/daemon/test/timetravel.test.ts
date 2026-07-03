@@ -5,6 +5,7 @@ import { ProjectsService } from "../src/services/projects.js";
 import { BranchesService } from "../src/services/branches.js";
 import { EndpointsService, type EndpointsLockedApi } from "../src/services/endpoints.js";
 import { TimeTravelService } from "../src/services/timetravel.js";
+import { LogsService } from "../src/services/logs.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
@@ -62,7 +63,8 @@ async function seeded() {
   const { project, mainBranch } = await projects.create({ name: "acme" });
   const queue = new BranchQueue();
   const branches = new BranchesService({ state, queue, ...f });
-  const endpoints = new EndpointsService({ state, queue, branches, ...f });
+  const logs = new LogsService();
+  const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
   const tt = new TimeTravelService({ state, queue, branches, endpoints, ...f });
   return { f, state, project, mainBranch, branches, endpoints, tt, queue };
 }

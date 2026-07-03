@@ -13,6 +13,7 @@ import { ProjectsService } from "./services/projects.js";
 import { BranchesService } from "./services/branches.js";
 import { EndpointsService } from "./services/endpoints.js";
 import { TimeTravelService } from "./services/timetravel.js";
+import { LogsService } from "./services/logs.js";
 import { BranchQueue } from "./state/queue.js";
 
 async function main(): Promise<void> {
@@ -37,8 +38,22 @@ async function main(): Promise<void> {
   let computes: ComputeManager | undefined;
   try {
     const state = openState(join(cfg.dataDir, "state.db"));
-    engine = new EngineRuntime(cfg, state);
+    const logs = new LogsService();
+    engine = new EngineRuntime(cfg, state, logs);
     await engine.start();
+
+    // Boot reconciliation (T16): every branch row left at a non-"stopped" endpoint_status
+    // belongs to a compute process that died with the previous container — ComputeManager
+    // starts this run with an empty map, so nothing is actually running regardless of what the
+    // row says. Reset status/port only; endpoint_error is diagnostic history and is preserved
+    // (a branch that failed before the restart should still show why on next inspection).
+    for (const p of state.projects.list()) {
+      for (const b of state.branches.listByProject(p.id)) {
+        if (b.endpointStatus !== "stopped") {
+          state.branches.updateEndpoint(b.id, { status: "stopped", port: null, error: b.endpointError });
+        }
+      }
+    }
 
     const storcon = new StorconClient();
     const pageserver = new PageserverClient();
@@ -47,10 +62,10 @@ async function main(): Promise<void> {
     const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes });
     const queue = new BranchQueue();
     const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue });
-    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints });
 
-    const app = buildServer({ cfg, state, engine, services: { projects, branches, endpoints, timetravel } });
+    const app = buildServer({ cfg, state, engine, logs, services: { projects, branches, endpoints, timetravel } });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —

@@ -5,6 +5,7 @@ import type { ProjectsService } from "../src/services/projects.js";
 import type { BranchesService } from "../src/services/branches.js";
 import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
+import { LogsService } from "../src/services/logs.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
@@ -16,6 +17,13 @@ import { openState } from "../src/state/db.js";
 // exercised in this file.
 function fakeEngine(): EngineRuntime {
   return { status: () => ({}) } as unknown as EngineRuntime;
+}
+
+// LogsService (T16) is a plain in-process class with no external dependencies — a real instance
+// is cheaper and more honest here than a typed fake (unlike the engine-client interfaces above,
+// there's no external system boundary to stand in for).
+function fakeLogs(): LogsService {
+  return new LogsService();
 }
 
 // Only the methods api.ts's routes actually call need to exist for these tests; the rest of
@@ -62,7 +70,7 @@ describe("buildServer error handling", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -87,7 +95,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.create).mockResolvedValue(fakeBranch as unknown as Awaited<ReturnType<BranchesService["create"]>>);
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -112,7 +120,7 @@ describe("buildServer branch routes", () => {
     const rows = [{ id: "branch-1" }, { id: "branch-2" }];
     vi.mocked(branches.list).mockResolvedValue(rows as unknown as Awaited<ReturnType<BranchesService["list"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -131,7 +139,7 @@ describe("buildServer branch routes", () => {
       throw new DevdbError(404, "branch does-not-exist not found");
     });
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -147,7 +155,7 @@ describe("buildServer branch routes", () => {
     const branches = fakeBranches();
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -172,7 +180,7 @@ describe("buildServer endpoint routes", () => {
     const fakeDetail = { id: "branch-1", endpointStatus: "running", port: 54300, connectionString: "postgresql://..." };
     vi.mocked(endpoints.start).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["start"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
@@ -191,7 +199,7 @@ describe("buildServer endpoint routes", () => {
       new DevdbError(409, "no free endpoint port in range — running endpoints: main, dev. Stop one or widen DEVDB_PORT_RANGE."),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
@@ -208,7 +216,7 @@ describe("buildServer endpoint routes", () => {
     const fakeDetail = { id: "branch-1", endpointStatus: "stopped", port: null, connectionString: null };
     vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["stop"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel() },
     });
 
@@ -228,7 +236,7 @@ describe("buildServer endpoint routes", () => {
       { endpointStatus: "running", port: 54300 } as unknown as Awaited<ReturnType<BranchesService["detail"]>>,
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -246,7 +254,7 @@ describe("buildServer time travel routes", () => {
     const timetravel = fakeTimetravel();
     vi.mocked(timetravel.lsnAtTimestamp).mockResolvedValue("0/1A2B3C");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -261,7 +269,7 @@ describe("buildServer time travel routes", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -279,7 +287,7 @@ describe("buildServer time travel routes", () => {
       new DevdbError(400, `cannot resolve 2030-01-01T00:00:00Z on "main": that timestamp is ahead of this branch's history (kind=future)`),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -296,7 +304,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = { id: "branch-2", name: "main", endpointStatus: "stopped", port: null, connectionString: null };
     vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["restoreInPlace"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -323,7 +331,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = { id: "branch-3", name: "rescued", endpointStatus: "stopped", port: null, connectionString: null };
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -345,7 +353,7 @@ describe("buildServer time travel routes", () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
     });
 
@@ -364,7 +372,7 @@ describe("buildServer time travel routes", () => {
     const fakeDetail = { id: "branch-4", name: "dev", endpointStatus: "stopped", port: null, connectionString: null };
     vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["resetToParent"]>>);
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -383,7 +391,7 @@ describe("buildServer time travel routes", () => {
       new DevdbError(409, `branch "dev" has child branches: grandchild — delete them first`),
     );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(),
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel },
     });
 
@@ -391,5 +399,189 @@ describe("buildServer time travel routes", () => {
 
     expect(res.statusCode).toBe(409);
     expect(res.json().error).toMatch(/grandchild/);
+  });
+});
+
+describe("buildServer /api/status", () => {
+  // T16 rider (ledgered at Task 12, optional): version comes from THIS package's own
+  // package.json (currently "0.1.0"), not a hand-maintained literal in api.ts.
+  it("GET /api/status — version matches packages/daemon/package.json, healthy reflects engine.status()", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const engine = { status: () => ({ storcon_db: { state: "running", pid: 123 } }) } as unknown as EngineRuntime;
+    const app = buildServer({
+      cfg, state, engine, logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/status" });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.version).toBe("0.1.0");
+    expect(body.healthy).toBe(true);
+    expect(body.engine).toEqual({ storcon_db: { state: "running", pid: 123 } });
+  });
+
+  it("GET /api/status — healthy is false when any engine component isn't 'running'", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const engine = {
+      status: () => ({
+        storcon_db: { state: "running", pid: 123 },
+        pageserver: { state: "failed", pid: null },
+      }),
+    } as unknown as EngineRuntime;
+    const app = buildServer({
+      cfg, state, engine, logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/status" });
+
+    expect(res.json().healthy).toBe(false);
+  });
+});
+
+// The SSE routes hijack the reply and never call reply.raw.end() on their own (only on client
+// disconnect, or the preClose hook on shutdown) — app.inject() resolves only once a response is
+// considered complete, so a plain inject() call here would hang forever (verified empirically
+// against the installed fastify/light-my-request versions before writing this). A real
+// listen()+fetch()+AbortController is the reliable way to exercise a still-open SSE stream and
+// its cleanup-on-disconnect behavior, and doubles as a closer approximation of how a real SSE
+// client (browser EventSource, or restart.test.ts's polling) actually interacts with the route.
+describe("buildServer SSE log routes", () => {
+  async function listening(logs: LogsService, extra: Partial<{ endpoints: EndpointsService; branches: BranchesService }> = {}) {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs,
+      services: {
+        projects: fakeProjects(),
+        branches: extra.branches ?? fakeBranches(),
+        endpoints: extra.endpoints ?? fakeEndpoints(),
+        timetravel: fakeTimetravel(),
+      },
+    });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const address = app.server.address();
+    if (address === null || typeof address === "string") throw new Error("expected an AddressInfo");
+    return { app, base: `http://127.0.0.1:${address.port}` };
+  }
+
+  it("GET /api/daemon/logs/:component — text/event-stream, replays recent() then streams live ingests", async () => {
+    const logs = new LogsService();
+    logs.ingest("daemon:pageserver", "line from before the client connected");
+    const { app, base } = await listening(logs);
+    try {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/daemon/logs/pageserver`, { signal: ac.signal });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/event-stream");
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const { value: replay } = await reader.read();
+      expect(decoder.decode(replay)).toBe(`data: ${JSON.stringify("line from before the client connected")}\n\n`);
+
+      // A line ingested AFTER the client connected must also reach the open stream — proves
+      // subscribe(), not just the recent() replay, is wired.
+      logs.ingest("daemon:pageserver", "live line");
+      const { value: live } = await reader.read();
+      expect(decoder.decode(live)).toBe(`data: ${JSON.stringify("live line")}\n\n`);
+
+      ac.abort();
+      await reader.cancel().catch(() => {});
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/daemon/logs/:component — a channel with no ingested lines still opens a 200 stream with an empty replay", async () => {
+    const logs = new LogsService();
+    const { app, base } = await listening(logs);
+    try {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/daemon/logs/never-touched`, { signal: ac.signal });
+      expect(res.status).toBe(200);
+      ac.abort();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/branches/:id/logs — 404s via byIdOr404 for an unknown branch id (never opens the stream)", async () => {
+    const logs = new LogsService();
+    const branches = fakeBranches();
+    vi.mocked(branches.byIdOr404).mockImplementation(() => {
+      throw new DevdbError(404, "branch does-not-exist not found");
+    });
+    const { app, base } = await listening(logs, { branches });
+    try {
+      const res = await fetch(`${base}/api/branches/does-not-exist/logs`);
+      expect(res.status).toBe(404);
+      expect((await res.json()).error).toMatch(/not found/);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/branches/:id/logs — streams the branch:<id>:compute channel, not the daemon namespace", async () => {
+    const logs = new LogsService();
+    logs.ingest("branch:branch-1:compute", "compute output");
+    logs.ingest("daemon:branch-1", "must not leak onto the branch channel");
+    const branches = fakeBranches();
+    vi.mocked(branches.byIdOr404).mockReturnValue({ id: "branch-1" } as unknown as ReturnType<BranchesService["byIdOr404"]>);
+    const { app, base } = await listening(logs, { branches });
+    try {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/branches/branch-1/logs`, { signal: ac.signal });
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader();
+      const { value } = await reader.read();
+      expect(new TextDecoder().decode(value)).toBe(`data: ${JSON.stringify("compute output")}\n\n`);
+      ac.abort();
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Self-review: an SSE client that disconnects must not leak its subscriber callback inside
+  // LogsService forever. Spies on LogsService.subscribe to capture the unsub function api.ts's
+  // sse() helper receives, then proves the HTTP-layer "close" event actually invokes it — the
+  // concrete regression test for that concern (logs.test.ts covers subscribe()/unsub() in
+  // isolation; this proves api.ts's route wires real socket-close events to it).
+  it("client disconnect calls the unsub function returned by LogsService.subscribe", async () => {
+    const logs = new LogsService();
+    // A line to replay so reader.read() below has an actual body chunk to resolve on — fetch()
+    // itself only waits for headers (flushHeaders() covers that, see the "empty replay" test
+    // above), but ReadableStreamDefaultReader.read() waits for real body bytes.
+    logs.ingest("daemon:pageserver", "seed line so the stream has something to read");
+    const unsubSpy = vi.fn();
+    const originalSubscribe = logs.subscribe.bind(logs);
+    vi.spyOn(logs, "subscribe").mockImplementation((channel, cb) => {
+      const realUnsub = originalSubscribe(channel, cb);
+      return () => {
+        unsubSpy();
+        realUnsub();
+      };
+    });
+    const { app, base } = await listening(logs);
+    try {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/api/daemon/logs/pageserver`, { signal: ac.signal });
+      const reader = res.body!.getReader();
+      await reader.read(); // establish the stream (replays the seed line)
+      expect(unsubSpy).not.toHaveBeenCalled();
+
+      ac.abort();
+      await reader.cancel().catch(() => {});
+      // Poll briefly for the server's "close" event to fire and run the unsub callback — the
+      // exact event ordering between an aborted fetch and the server observing socket close
+      // isn't instantaneous, but this must land well within a couple of event-loop turns.
+      await vi.waitFor(() => expect(unsubSpy).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    } finally {
+      await app.close();
+    }
   });
 });

@@ -4,6 +4,7 @@ import { BranchQueue } from "../src/state/queue.js";
 import { BranchesService } from "../src/services/branches.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { EndpointsService } from "../src/services/endpoints.js";
+import { LogsService } from "../src/services/logs.js";
 import { PortExhaustedError } from "../src/compute/ports.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
@@ -48,8 +49,9 @@ async function seeded() {
   const { project, mainBranch } = await projects.create({ name: "acme" });
   const queue = new BranchQueue();
   const branches = new BranchesService({ state, queue, ...f });
-  const endpoints = new EndpointsService({ state, queue, branches, ...f });
-  return { f, state, project, mainBranch, branches, endpoints, queue };
+  const logs = new LogsService();
+  const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
+  return { f, state, project, mainBranch, branches, endpoints, queue, logs };
 }
 
 describe("EndpointsService", () => {
@@ -127,6 +129,35 @@ describe("EndpointsService", () => {
     expect(f.computes.stop).toHaveBeenCalledWith(mainBranch.id);
     expect(detail.endpointStatus).toBe("stopped");
     expect(detail.port).toBeNull();
+  });
+
+  // T16: a successful start wires computes.onLine(branchId, cb) so the compute's stdout/stderr
+  // feeds LogsService's `branch:<id>:compute` channel (consumed by the SSE route in api.ts).
+  it("start wires computes.onLine to logs.ingest under the branch:<id>:compute channel", async () => {
+    const { f, mainBranch, endpoints, logs } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    await endpoints.start(mainBranch.id);
+
+    expect(f.computes.onLine).toHaveBeenCalledWith(mainBranch.id, expect.any(Function));
+    // Drive the exact callback wired to onLine, as the real ComputeManager would when the
+    // compute prints a line, and confirm it lands on the expected LogsService channel.
+    const onLineCb = vi.mocked(f.computes.onLine).mock.calls[0]![1];
+    onLineCb("compute log line");
+    expect(logs.recent(`branch:${mainBranch.id}:compute`)).toEqual(["compute log line"]);
+  });
+
+  // T16 self-review: computes.onLine's real implementation discards the whole listeners array
+  // on stop() (map entry deleted), so a leaked subscriber closure is moot on the manager side —
+  // but EndpointsService also tracks its own unsub and must call it, not just rely on that.
+  it("stop unsubscribes the compute-log listener returned by computes.onLine", async () => {
+    const { f, mainBranch, endpoints } = await seeded();
+    const unsub = vi.fn();
+    vi.mocked(f.computes.onLine).mockReturnValueOnce(unsub);
+    await endpoints.start(mainBranch.id);
+    expect(unsub).not.toHaveBeenCalled();
+    await endpoints.stop(mainBranch.id);
+    expect(unsub).toHaveBeenCalledOnce();
   });
 
   it("ensureRunning starts when not running", async () => {

@@ -34,6 +34,21 @@ export class EmbeddedPostgres {
     return `postgresql://devdb:${encodeURIComponent(this.opts.password)}@127.0.0.1:${this.opts.port}/postgres`;
   }
 
+  // T16 rider (ledgered at Task 8 — see task-8-report.md's follow-up #1): surfaces the real
+  // ManagedProcess state instead of EngineRuntime.status() hardcoding storcon_db as "running".
+  // No `this.proc` yet (never started) or after stop() (nulled out) reads as "stopped", matching
+  // the same idle/never-started semantic ManagedProcess itself uses before its first start().
+  get state(): "stopped" | "starting" | "running" | "failed" {
+    return this.proc?.state ?? "stopped";
+  }
+
+  // Companion to `state` above — same rider, same report follow-up (its wording covered both
+  // the hardcoded "running" state and the hardcoded-null pid). Free to expose since ManagedProcess
+  // already tracks it; closes the gap fully rather than leaving pid stuck at null.
+  get pid(): number | null {
+    return this.proc?.pid ?? null;
+  }
+
   init(): Promise<void> {
     this.initInFlight ??= this.doInit().finally(() => {
       this.initInFlight = null;

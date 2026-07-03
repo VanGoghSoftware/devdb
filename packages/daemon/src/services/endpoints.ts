@@ -3,6 +3,7 @@ import { PortExhaustedError } from "../compute/ports.js";
 import { DevdbError } from "./errors.js";
 import type { ProjectsDeps } from "./projects.js";
 import type { BranchesService, BranchDetail } from "./branches.js";
+import type { LogsService } from "./logs.js";
 
 // TimeTravelService's swap (see services/timetravel.ts) must stop/restart a branch's endpoint
 // from WITHIN its own queue.run(branchId, ...) lane. Calling the public, queued start()/stop()
@@ -17,7 +18,14 @@ export interface EndpointsLockedApi {
 }
 
 export class EndpointsService {
-  constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService }) {}
+  // One live compute-log subscription per branch, tracked so stopLocked can proactively
+  // unsubscribe. Not strictly load-bearing for correctness — ComputeManager.stop() discards
+  // the whole compute entry (including its listeners array) on stop, so an un-called unsub
+  // closure becomes unreachable garbage regardless — but explicit cleanup avoids relying on
+  // that as the only backstop and keeps this service's own bookkeeping honest.
+  private computeLogSubs = new Map<string, () => void>();
+
+  constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService; logs: LogsService }) {}
 
   // Queued body shared by start()/ensureRunning() — see the comment on ensureRunning() for why
   // the idempotency check below must run INSIDE the queue lane rather than before it.
@@ -36,6 +44,13 @@ export class EndpointsService {
     this.deps.state.branches.updateEndpoint(branch.id, { status: "starting", port: null });
     try {
       const { port } = await this.deps.computes.start({ branch, pgVersion: project.pgVersion });
+      // Wire this compute's stdout/stderr into LogsService's `branch:<id>:compute` channel —
+      // feeds both recent() replay and the live SSE tail. Registered only once per successful
+      // launch (statusOf()'s early-return above prevents re-entry into this block for an
+      // already-running compute, so this can't double-subscribe onto the same live entry).
+      const unsub = this.deps.computes.onLine(branch.id, (line) =>
+        this.deps.logs.ingest(`branch:${branch.id}:compute`, line));
+      this.computeLogSubs.set(branch.id, unsub);
       try {
         this.deps.state.branches.updateEndpoint(branch.id, { status: "running", port });
       } catch (persistErr) {
@@ -43,6 +58,10 @@ export class EndpointsService {
         // worse, a half-written "running") would strand a running process the daemon no longer
         // believes exists. Best-effort tear the compute back down and mark the branch failed
         // before surfacing the original persist error.
+        // computes.stop() discards the whole entry (incl. its listeners), so the subscription
+        // above is moot on the manager side either way — drop our own tracking entry too so
+        // this map doesn't accumulate a stale reference across this failure path.
+        this.computeLogSubs.delete(branch.id);
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           console.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure:`, stopErr));
         try {
@@ -86,6 +105,11 @@ export class EndpointsService {
   async stopLocked(branchId: string): Promise<BranchDetail> {
     const branch = this.deps.branches.byIdOr404(branchId);
     this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
+    // computes.stop() discards the whole compute entry (including its listeners array), so this
+    // is not the only thing standing between a stopped compute and a leaked subscription — but
+    // it retires our own bookkeeping proactively rather than leaning on that as the sole backstop.
+    this.computeLogSubs.get(branch.id)?.();
+    this.computeLogSubs.delete(branch.id);
     try {
       await this.deps.computes.stop(branch.id);
     } finally {

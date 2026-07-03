@@ -18,6 +18,7 @@ vi.mock("../src/engine/embedded-postgres.js", () => ({
 import { EngineRuntime } from "../src/engine/boot.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
+import { LogsService } from "../src/services/logs.js";
 
 describe("EngineRuntime partial-boot cleanup", () => {
   beforeEach(() => {
@@ -40,7 +41,7 @@ describe("EngineRuntime partial-boot cleanup", () => {
     // Failing here guarantees safekeeper registration's fetch() never fires — stays offline.
     startMock.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("storcon exploded"));
 
-    const engine = new EngineRuntime(cfg, openState(":memory:"));
+    const engine = new EngineRuntime(cfg, openState(":memory:"), new LogsService());
     await expect(engine.start()).rejects.toThrow("storcon exploded");
     expect(stopMock).toHaveBeenCalled(); // started ManagedProcess(es) stopped
     expect(pgStop).toHaveBeenCalled(); // storcon DB stopped too
