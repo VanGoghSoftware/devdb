@@ -140,11 +140,19 @@ export class ComputeManager {
       entry.phase = "running";
       return { port };
     } catch (e) {
+      // Failure cleanup follows stop()'s settlement order. Map entry first and unconditionally:
+      // a stale entry here makes every later start() for this branch throw "already ..." until
+      // the daemon restarts. Dir cleanup next — a launch that died mid-start (e.g. the readiness
+      // timeout SIGKILLing compute_ctl) orphans a live postgres exactly like stop() does, so it
+      // gets the same reap+rm treatment. removeComputeDir never throws: `e`, the reason the
+      // launch failed, is what the caller needs to see — never a secondary rm failure. Ports
+      // LAST: until the reap has killed the orphan they may still be bound, and releasing them
+      // earlier would make them eligible for re-allocation while the orphan still holds them.
+      if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
+      if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
       if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
       if (entry.internalHttpPort !== null) this.reservedPorts.delete(entry.internalHttpPort);
-      if (dirCreated) await rm(dirCreated, { recursive: true, force: true });
-      if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
       throw e;
     }
   }
@@ -244,6 +252,42 @@ export class ComputeManager {
     return false;
   }
 
+  // Failure-tolerant compute-dir removal shared by stop() and start()'s failure cleanup: reap
+  // any orphaned postgres still writing into `dir`, rm it, and on ENOTEMPTY retry reap+rm
+  // exactly once. An ENOTEMPTY on the first rm means some process was still writing to the dir
+  // despite the reap pass — most likely a race where the orphan hadn't yet released its file
+  // handles at the moment rm() ran, or (rarer) a straggler that appeared after
+  // reapOrphanedPostgres's /proc scan completed. One retry is cheap insurance against exactly
+  // that race. Any OTHER error (not ENOTEMPTY) is unexpected but handled the same way — logged,
+  // not retried, not rethrown.
+  //
+  // This method must NEVER throw: both call sites are cleanup paths where a throw does damage
+  // well beyond a leaked dir. In stop() it runs inside the outer `finally`, and a throw would
+  // skip the map/port release after it, which must settle unconditionally regardless of whether
+  // directory cleanup succeeded. In start()'s catch, a throw would REPLACE the original launch
+  // error the caller is about to rethrow — masking WHY the launch failed — and skip the port
+  // release after it. The dir is accepted as leaked instead: loud on failure, never swallowed
+  // silently, never blocks the caller (same compensation discipline as the catches elsewhere in
+  // this codebase, e.g. timetravel.ts/branches.ts).
+  private async removeComputeDir(dir: string, ctx: string): Promise<void> {
+    await this.reapOrphanedPostgres(dir);
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch (e) {
+      if ((e as { code?: string }).code !== "ENOTEMPTY") {
+        console.error(`${ctx}: rm() failed unexpectedly for ${dir} — giving up (not retried):`, e);
+      } else {
+        console.error(`${ctx}: rm() hit ENOTEMPTY for ${dir} after reaping — retrying reap+rm once:`, e);
+        await this.reapOrphanedPostgres(dir);
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } catch (e2) {
+          console.error(`${ctx}: retry of reap+rm also failed for ${dir} — giving up:`, e2);
+        }
+      }
+    }
+  }
+
   async stop(branchId: string): Promise<void> {
     const entry = this.computes.get(branchId);
     if (!entry) return;
@@ -252,35 +296,7 @@ export class ComputeManager {
       if (entry.proc) await entry.proc.stop(30_000);
     } finally {
       if (this.computes.get(branchId) === entry) this.computes.delete(branchId);
-      if (entry.dir) {
-        await this.reapOrphanedPostgres(entry.dir);
-        try {
-          await rm(entry.dir, { recursive: true, force: true });
-        } catch (e) {
-          // Review fix: a single retry of reap+rm before giving up. An ENOTEMPTY here means some
-          // process was still writing to entry.dir despite the reap pass above — most likely a
-          // race where the orphan hadn't yet released its file handles at the moment rm() ran, or
-          // (rarer) a straggler that appeared after reapOrphanedPostgres's /proc scan completed.
-          // One retry is cheap insurance against exactly that race. Any OTHER error here (not
-          // ENOTEMPTY) is unexpected but handled the same way — logged, not retried, not
-          // rethrown — because this whole block runs inside stop()'s outer `finally`: a `throw`
-          // here would propagate out of that finally and skip the map/port release below it,
-          // which must settle unconditionally regardless of whether directory cleanup succeeded
-          // (same "loud on failure, never swallowed silently, never blocks the caller" discipline
-          // as the compensation catches elsewhere in this codebase, e.g. timetravel.ts/branches.ts).
-          if ((e as { code?: string }).code !== "ENOTEMPTY") {
-            console.error(`stop(): rm() failed unexpectedly for ${entry.dir} — giving up (not retried):`, e);
-          } else {
-            console.error(`stop(): rm() hit ENOTEMPTY for ${entry.dir} after reaping — retrying reap+rm once:`, e);
-            await this.reapOrphanedPostgres(entry.dir);
-            try {
-              await rm(entry.dir, { recursive: true, force: true });
-            } catch (e2) {
-              console.error(`stop(): retry of reap+rm also failed for ${entry.dir} — giving up:`, e2);
-            }
-          }
-        }
-      }
+      if (entry.dir) await this.removeComputeDir(entry.dir, "stop()");
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
       if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
       if (entry.internalHttpPort !== null) this.reservedPorts.delete(entry.internalHttpPort);

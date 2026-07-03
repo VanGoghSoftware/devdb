@@ -177,6 +177,71 @@ describe("ComputeManager", () => {
     await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: expect.any(Number) });
   });
 
+  // start()'s failure cleanup shares stop()'s reap+rm discipline (removeComputeDir): a launch
+  // that dies mid-start (e.g. the readiness timeout SIGKILLing compute_ctl) orphans a live
+  // postgres exactly like stop() does, so the failure-path rm races the same still-live writer.
+  // The first rm fails ENOTEMPTY with a straggler written behind the walk; the retry (real rm)
+  // must clear it, and the caller must see the ORIGINAL launch error, not the rm error.
+  it("start() failure cleanup retries reap+rm on ENOTEMPTY and still throws the launch error", async () => {
+    startMock.mockRejectedValueOnce(new Error("compute_ctl not ready within 50000ms"));
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+
+    let dirSeen = "";
+    rmMock.mockImplementationOnce(async (target: string) => {
+      dirSeen = target;
+      await mkdir(join(target, "pg_data"), { recursive: true });
+      await writeFile(join(target, "pg_data", "straggler.tmp"), "written behind the rm walk");
+      throw Object.assign(
+        new Error(`ENOTEMPTY: directory not empty, rmdir '${join(target, "pg_data")}'`),
+        { code: "ENOTEMPTY" },
+      );
+    });
+
+    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl not ready within 50000ms");
+
+    expect(rmMock).toHaveBeenCalledTimes(2);
+    expect(dirSeen).not.toBe("");
+    expect(existsSync(dirSeen)).toBe(false);
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: expect.any(Number) });
+  });
+
+  // The two hazards the old inline failure-path rm (no try/catch) had beyond the ENOTEMPTY race
+  // itself: an rm throw REPLACED the original launch error, and skipped the map delete after it —
+  // a stale entry that made every later start() for the branch throw "already ..." until the
+  // daemon restarted. Persistent rm failure is the sharpest probe for both: the caller must
+  // still see the launch error, and the branch must restart cleanly on the SAME single port.
+  it("start() failure cleanup never masks the launch error when rm fails persistently, and the branch stays restartable", async () => {
+    startMock.mockRejectedValueOnce(new Error("compute_ctl exploded"));
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54332-54332" });
+    const manager = new ComputeManager(cfg);
+    const branch = fakeBranch();
+
+    rmMock.mockImplementation(async () => {
+      throw Object.assign(new Error("ENOTEMPTY: directory not empty"), { code: "ENOTEMPTY" });
+    });
+
+    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl exploded");
+    expect(rmMock).toHaveBeenCalledTimes(2); // bounded: first attempt + exactly one retry
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+    expect(manager.portOf(branch.id)).toBeNull(); // a stale map entry would still report 54332
+
+    const computesDir = join(cfg.dataDir, "computes");
+    const children = await readdir(computesDir);
+    expect(children).toHaveLength(1); // accepted trade-off: dir leaks rather than masking the error
+
+    rmMock.mockReset();
+    rmMock.mockImplementation(realFs.rm);
+    startMock.mockResolvedValueOnce(undefined);
+    // Same branch, single-port range: this resolves only if the failed start released BOTH the
+    // map entry (else "already ...") and the reserved port (else PortExhaustedError).
+    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54332 });
+  });
+
   // Fix 1 (review): `onLine` supplied to start()'s args must be registered at map-reservation
   // time — before the first await — so it captures every line printed DURING the launch itself,
   // not just once start() has already resolved. Drives the exact in-flight pattern the
