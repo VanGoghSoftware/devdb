@@ -3982,6 +3982,8 @@ git add -A && git commit -m "feat: log streaming, boot reconciliation, restart r
 
 ### Task 17: SQL console, acceptance test, README quickstart
 
+> **AMENDED (A23, post-review + live):** the SQL console additionally carries a driver-side `query_timeout` (submitted SQL can SET-override statement_timeout but not this), psql-convention multi-statement handling (last row-bearing result), a `truncated` response flag, a bounded auth-scoped `connectWithRetry` (the T14 SCRAM race hit /api/sql in-daemon; fresh pg.Client per attempt), and documented limitations (full materialization before cap — later-phase pagination; object rows collapse duplicate column names — chosen for agent/MCP ergonomics). Acceptance proves the branch-side mutation before reset. See commits 4b4fd17 + 32779b4.
+
 **Files:**
 - Create: `packages/daemon/src/services/sql.ts`, `README.md`
 - Modify: `packages/daemon/src/http/api.ts`, `packages/daemon/src/index.ts`
