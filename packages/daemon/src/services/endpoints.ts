@@ -1,4 +1,4 @@
-import type { BranchQueue } from "../state/queue.js";
+import type { BranchQueue, Lane } from "../state/queue.js";
 import { PortExhaustedError } from "../compute/ports.js";
 import { DevdbError } from "./errors.js";
 import type { ProjectsDeps } from "./projects.js";
@@ -12,9 +12,23 @@ import type { LogsService } from "./logs.js";
 // once the outer one settles, but the outer one is awaiting the inner one: a deadlock. This
 // narrow interface names exactly the two unqueued internals a caller already holding the
 // branch's lane may call directly, so a consumer never needs a concrete EndpointsService import.
+//
+// Lane capability (was JSDoc-only "caller must hold the branch lane"): both methods now REQUIRE
+// the `Lane` BranchQueue.run() mints for its work fn's branchId, not just a bare branchId string.
+// Because Lane is a branded type only constructable inside BranchQueue (state/queue.ts), the tsc
+// gate proves at compile time that no caller can invoke these without having actually gone through
+// a queue.run() for SOME branch — assertLane() below then proves at runtime that the lane held is
+// for the SAME branchId being operated on (a caller could otherwise hold branch A's lane while
+// passing branch B's id).
 export interface EndpointsLockedApi {
-  startLocked(branchId: string): Promise<BranchDetail>;
-  stopLocked(branchId: string): Promise<BranchDetail>;
+  startLocked(lane: Lane, branchId: string): Promise<BranchDetail>;
+  stopLocked(lane: Lane, branchId: string): Promise<BranchDetail>;
+}
+
+function assertLane(lane: Lane, branchId: string): void {
+  if (lane.branchId !== branchId) {
+    throw new Error(`lane invariant: held lane is for ${lane.branchId}, not ${branchId}`);
+  }
 }
 
 export class EndpointsService {
@@ -28,7 +42,8 @@ export class EndpointsService {
   // queues under the same branchId to serialize with concurrent start()/stop()/delete() calls
   // for that branch). Calling it unqueued is a deliberate least-invasive alternative to plumbing
   // a second "already locked" queue primitive — see the EndpointsLockedApi comment above.
-  async startLocked(branchId: string): Promise<BranchDetail> {
+  async startLocked(lane: Lane, branchId: string): Promise<BranchDetail> {
+    assertLane(lane, branchId);
     const branch = this.deps.branches.byIdOr404(branchId);
     const project = this.deps.state.projects.byId(branch.projectId)!;
     // Read the status once and branch on that single snapshot below — calling statusOf() a
@@ -110,11 +125,12 @@ export class EndpointsService {
   }
 
   start(branchId: string): Promise<BranchDetail> {
-    return this.deps.queue.run(branchId, () => this.startLocked(branchId));
+    return this.deps.queue.run(branchId, (lane) => this.startLocked(lane, branchId));
   }
 
   // Public for the same reason as startLocked() above — see EndpointsLockedApi's doc comment.
-  async stopLocked(branchId: string): Promise<BranchDetail> {
+  async stopLocked(lane: Lane, branchId: string): Promise<BranchDetail> {
+    assertLane(lane, branchId);
     const branch = this.deps.branches.byIdOr404(branchId);
     this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
     // Fix 1: no separate unsub bookkeeping here anymore — computes.stop() discards the whole
@@ -136,7 +152,7 @@ export class EndpointsService {
   }
 
   stop(branchId: string): Promise<BranchDetail> {
-    return this.deps.queue.run(branchId, () => this.stopLocked(branchId));
+    return this.deps.queue.run(branchId, (lane) => this.stopLocked(lane, branchId));
   }
 
   // Runs the SAME queued body as start() rather than pre-checking statusOf() before queuing:
@@ -146,6 +162,6 @@ export class EndpointsService {
   // promise-chaining implementation, but two logically-nested lane entries for one logical
   // operation is a footgun going forward. Sharing startLocked() keeps exactly one lane entry.
   ensureRunning(branchId: string): Promise<BranchDetail> {
-    return this.deps.queue.run(branchId, () => this.startLocked(branchId));
+    return this.deps.queue.run(branchId, (lane) => this.startLocked(lane, branchId));
   }
 }

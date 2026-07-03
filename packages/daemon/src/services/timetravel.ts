@@ -145,7 +145,7 @@ export class TimeTravelService {
     // pre-queue snapshot that could have gone stale while waiting in line for this branch's lane.
     preflight?: (branch: BranchRow) => { ancestorTimelineId: string };
   }): Promise<BranchDetail> {
-    return this.deps.queue.run(branchId, async () => {
+    return this.deps.queue.run(branchId, async (lane) => {
       const branch = this.deps.branches.byIdOr404(branchId);
       const ancestorTimelineId = opts.preflight
         ? opts.preflight(branch).ancestorTimelineId
@@ -159,7 +159,7 @@ export class TimeTravelService {
       // persists the same starting/stopping/stopped bookkeeping a normal stop() would — this row
       // is about to be renamed to its archived identity, but its endpoint lifecycle history
       // should stay coherent up to that point.
-      if (wasRunning) await this.deps.endpoints.stopLocked(branch.id);
+      if (wasRunning) await this.deps.endpoints.stopLocked(lane, branch.id);
 
       const newTimelineId = newHexId();
       // Review fix: the ORIGINAL failure-handling only compensated a failed detachAncestor call.
@@ -223,7 +223,7 @@ export class TimeTravelService {
         // previously-running endpoint stopped: restart it before rethrowing, best-effort (loud on
         // failure, not swallowed — same discipline as the two deletes above).
         if (wasRunning) {
-          await this.deps.endpoints.startLocked(branch.id).catch((c) =>
+          await this.deps.endpoints.startLocked(lane, branch.id).catch((c) =>
             console.error(`compensation failed — endpoint for branch ${branch.id} not restarted after a failed restore:`, c));
         }
         throw e;
@@ -233,7 +233,13 @@ export class TimeTravelService {
       // process death between a successful detach_ancestor and this DB swap leaves a detached
       // orphan timeline and (if wasRunning) a stopped endpoint; no boot reconciliation exists
       // yet — tracked for the durability phase.
-      if (wasRunning) await this.deps.endpoints.startLocked(swapped.id);
+      // swapped.id is a fresh identity restoreSwap just minted; acquire ITS lane (uncontended —
+      // nothing else can reference it yet) so this start is serialized under the branch it
+      // actually targets, not the now-archived branchId lane we still hold. Closes the
+      // "empty-lane micro-window" deferred to phase 2 in handover §9.
+      if (wasRunning) {
+        await this.deps.queue.run(swapped.id, (lane2) => this.deps.endpoints.startLocked(lane2, swapped.id));
+      }
       return this.deps.branches.detail(this.deps.branches.byIdOr404(swapped.id));
     });
   }

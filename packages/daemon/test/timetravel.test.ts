@@ -137,7 +137,7 @@ describe("TimeTravelService", () => {
       state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
     });
     await tt2.restoreInPlace(main2.id, "2026-07-02T10:00:00Z");
-    expect(stopLocked).toHaveBeenCalledWith(main2.id);
+    expect(stopLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: main2.id }), main2.id);
     expect(startLocked).toHaveBeenCalled();
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
@@ -167,8 +167,8 @@ describe("TimeTravelService", () => {
     await expect(tt2.restoreInPlace(main2.id, "2026-07-02T10:00:00Z")).rejects.toThrow(/detach boom/);
     // the swap never happened — branch.id is still the ORIGINAL, unchanged identity — so the
     // restart must target that same id, not some new/swapped id (there is no swapped id here).
-    expect(stopLocked).toHaveBeenCalledWith(main2.id);
-    expect(startLocked).toHaveBeenCalledWith(main2.id);
+    expect(stopLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: main2.id }), main2.id);
+    expect(startLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: main2.id }), main2.id);
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
 
@@ -293,8 +293,8 @@ describe("TimeTravelService", () => {
     expect(f.safekeeper.timelineDelete).toHaveBeenCalled();
     // the swap never committed — branch.id is still the ORIGINAL, unchanged identity, so the
     // restart must target that same id.
-    expect(stopLocked).toHaveBeenCalledWith(project2.mainBranch.id);
-    expect(startLocked).toHaveBeenCalledWith(project2.mainBranch.id);
+    expect(stopLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: project2.mainBranch.id }), project2.mainBranch.id);
+    expect(startLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: project2.mainBranch.id }), project2.mainBranch.id);
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
 });
