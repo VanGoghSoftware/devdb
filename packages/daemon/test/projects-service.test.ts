@@ -186,16 +186,21 @@ describe("ProjectsService", () => {
   });
 
   // Emission map: delete() publishes project.deleted after the project row is actually gone.
-  it("delete publishes project.deleted with the project id", async () => {
+  // Fix wave 1, Fix 3: a freshly-created project's only branch (main) is also drained as part of
+  // delete(), so branch.deleted for that branch now fires too (symmetric with BranchesService's
+  // own emit) — updated from this test's original single-event expectation to assert both, in the
+  // correct order (the leaf branch drains before the project row itself is deleted).
+  it("delete publishes project.deleted with the project id (and branch.deleted for the drained main branch)", async () => {
     const f = fakes();
     const state = openState(":memory:");
     const events = new EventsService();
     const seen: DevdbEvent[] = [];
     const svc = new ProjectsService({ state, events, ...f });
-    const { project } = await svc.create({ name: "acme" });
-    events.subscribe((e) => seen.push(e)); // subscribe AFTER create() so only delete()'s event is seen
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+    events.subscribe((e) => seen.push(e)); // subscribe AFTER create() so only delete()'s events are seen
     await svc.delete(project.id);
     expect(seen).toEqual([
+      expect.objectContaining({ type: "branch.deleted", projectId: project.id, branchId: mainBranch.id }),
       expect.objectContaining({ type: "project.deleted", projectId: project.id }),
     ]);
   });
@@ -357,6 +362,70 @@ describe("ProjectsService", () => {
     } finally {
       state.branches.create = original;
     }
+  });
+
+  // Fix wave 1, Fix 3: drainBranches() deletes each leaf branch row directly via
+  // `state.branches.delete(...)` (NOT BranchesService.delete(), so it never went through THAT
+  // service's own branch.deleted emit) — every branch-row deletion in the codebase must announce
+  // branch.deleted, symmetric with BranchesService.delete()'s own publish. Two branches (main +
+  // one child) means two per-leaf branch.deleted events (child torn down first, then main), plus
+  // the one project.deleted once the project row itself is gone.
+  it("delete emits branch.deleted for each branch drained, plus one project.deleted", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const svc = new ProjectsService({ state, events, ...f });
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+    seen.length = 0; // isolate delete()'s own events from create()'s project.created
+    const dev = state.branches.create({
+      id: crypto.randomUUID(), projectId: project.id, parentBranchId: mainBranch.id,
+      name: "dev", slug: "acme-dev", timelineId: "c".repeat(32), password: "x", createdBy: "api",
+    });
+
+    await svc.delete(project.id);
+
+    const branchDeleted = seen.filter((e) => e.type === "branch.deleted");
+    expect(branchDeleted).toHaveLength(2);
+    const deletedIds = branchDeleted.map((e) => e.branchId).sort();
+    expect(deletedIds).toEqual([dev.id, mainBranch.id].sort());
+    for (const e of branchDeleted) {
+      expect(e).toMatchObject({ type: "branch.deleted", projectId: project.id });
+    }
+    const projectDeleted = seen.filter((e) => e.type === "project.deleted");
+    expect(projectDeleted).toEqual([
+      expect.objectContaining({ type: "project.deleted", projectId: project.id }),
+    ]);
+  });
+
+  // Fix wave 1, Fix 3 continued: if tenantDelete throws AFTER drainBranches() already committed
+  // the per-leaf branch-row deletes, those branch.deleted events must still have fired — the rows
+  // are durably gone regardless of what the enclosing project delete does next (project delete
+  // ordering itself is out of scope here — see the brief). project.deleted must NOT have fired,
+  // since the project row delete never even runs (tenantDelete throws first).
+  it("branch.deleted still fires for drained leaves even when the project delete fails after the drain", async () => {
+    const f = fakes();
+    vi.mocked(f.pageserver.tenantDelete).mockRejectedValueOnce(new Error("tenant delete boom"));
+    const state = openState(":memory:");
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const svc = new ProjectsService({ state, events, ...f });
+    const { project, mainBranch } = await svc.create({ name: "acme" });
+    seen.length = 0; // isolate delete()'s own events from create()'s project.created
+
+    await expect(svc.delete(project.id)).rejects.toThrow(/tenant delete boom/);
+
+    const branchDeleted = seen.filter((e) => e.type === "branch.deleted");
+    expect(branchDeleted).toEqual([
+      expect.objectContaining({ type: "branch.deleted", projectId: project.id, branchId: mainBranch.id }),
+    ]);
+    const projectDeleted = seen.filter((e) => e.type === "project.deleted");
+    expect(projectDeleted).toEqual([]);
+    // the branch row really is gone, even though the enclosing project delete ultimately failed —
+    // confirms the event reflects a real, durable state change, not a rolled-back one.
+    expect(state.branches.byId(mainBranch.id)).toBeNull();
   });
 
   it("aborts delete loudly on dangling parent", async () => {

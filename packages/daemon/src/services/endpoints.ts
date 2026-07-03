@@ -95,21 +95,21 @@ export class EndpointsService {
       } catch (persistErr) {
         // The compute is live but we failed to record it — leaving state at "starting" (or
         // worse, a half-written "running") would strand a running process the daemon no longer
-        // believes exists. Best-effort tear the compute back down and mark the branch failed
-        // before surfacing the original persist error.
+        // believes exists. Best-effort tear the compute back down before surfacing the original
+        // persist error. Fix wave 1, Fix 2: does NOT also record "failed" here — persistErr is
+        // rethrown below straight into the OUTER catch, which is now the single place that
+        // records "failed" (and publishes endpoint.status) for BOTH a compute-start failure and a
+        // running-persist failure. The old code recorded "failed" here too, then rethrew into the
+        // outer catch which recorded it AGAIN for the same error — one real transition, two
+        // published events.
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           this.deps.logger.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure`, stopErr));
-        try {
-          this.setEndpointStatus(branch, {
-            status: "failed", port: null,
-            error: (persistErr as Error).message?.slice(0, 2000) ?? String(persistErr),
-          });
-        } catch (e2) {
-          this.deps.logger.error(`compensation failed — could not persist "failed" status for branch ${branch.id}`, e2);
-        }
         throw persistErr;
       }
     } catch (e) {
+      // Single "failed" recording point for startLocked: reached either directly (computes.start
+      // itself threw, or the "starting" write threw) or via the inner catch above rethrowing a
+      // running-persist failure. Either way `e` is the one error to record and surface.
       this.setEndpointStatus(branch, {
         status: "failed", port: null,
         error: (e as Error).message?.slice(0, 2000) ?? String(e),

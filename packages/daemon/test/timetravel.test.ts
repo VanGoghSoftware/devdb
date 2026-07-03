@@ -429,6 +429,51 @@ describe("TimeTravelService", () => {
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
 
+  // Fix wave 1, Fix 1: the durable swap (restoreSwap) must be announced via branch.updated even
+  // if the POST-swap restart (the `if (wasRunning) { ...startLocked(swapped.id)... }` block,
+  // which runs AFTER the swap's own try/catch) subsequently throws. Before this fix, the publish
+  // sat after that restart — so a restart failure meant the swap silently committed a new branch
+  // identity with zero invalidation for any client watching /api/events, even though the swapped
+  // branch row is durably real and queryable.
+  it("restoreInPlace publishes branch.updated for the swapped branch even when the post-swap restart fails", async () => {
+    const { f, mainBranch, state } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValue("running");
+    // stopLocked (the PRE-swap stop) must succeed so the swap itself proceeds; startLocked (the
+    // POST-swap restart) rejects — exactly the failure window this fix targets. Rebuild the
+    // service graph with a fresh events/seen collector (mirrors the other rebuilt-fixture tests in
+    // this file) rather than reusing seeded()'s default EndpointsService, since this test needs to
+    // control startLocked's outcome directly.
+    const stopLocked = vi.fn(async () => branchDetailFixture());
+    const startLocked = vi.fn(async () => { throw new Error("restart boom"); });
+    const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { mainBranch: main2 } = await projects.create({ name: "restartfail" });
+    const branches = new BranchesService({ state, queue, ...f });
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const tt2 = new TimeTravelService({
+      state, queue, branches, endpoints: { startLocked, stopLocked }, events, ...f,
+    });
+
+    await expect(tt2.restoreInPlace(main2.id, "2026-07-02T10:00:00Z")).rejects.toThrow(/restart boom/);
+
+    // (a) the swap committed durably — the original row is archived under its new suffixed name,
+    // and a new sibling row (the swapped/live identity) now exists alongside it.
+    const archived = state.branches.byId(main2.id)!;
+    expect(archived.name).toContain("main_pitr_archived_");
+    const swapped = state.branches.listByProject(archived.projectId).find((b) => b.id !== main2.id)!;
+    expect(swapped).toBeDefined();
+    expect(swapped.name).toBe("main");
+    // (b) exactly ONE branch.updated fired, for the swapped (new, now-live) branch id — NOT the
+    // archived original id.
+    const updated = seen.filter((e) => e.type === "branch.updated");
+    expect(updated).toEqual([
+      expect.objectContaining({ type: "branch.updated", projectId: archived.projectId, branchId: swapped.id }),
+    ]);
+    void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
+  });
+
   // Regression (P3, initial-stop strand): the FIRST stop — the one that quiesces a running
   // endpoint BEFORE the swap's try/catch — used to sit OUTSIDE that try/catch. If it threw, the
   // method exited before the compensation path, leaving the previously-running branch stranded

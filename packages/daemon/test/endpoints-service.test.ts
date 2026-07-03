@@ -305,6 +305,38 @@ describe("EndpointsService", () => {
     }
   });
 
+  // Fix wave 1, Fix 2: when the "running" persist (setEndpointStatus inside startLocked's inner
+  // try) itself throws, the OLD code recorded "failed" TWICE — once in the inner catch
+  // (persistErr), once again when that same error was rethrown into the OUTER catch. Only ONE
+  // "failed" endpoint.status event may fire per failed start, regardless of which step failed.
+  it("publishes exactly one endpoint.status \"failed\" event when the running-status persist fails (no double-fire)", async () => {
+    const { f, state, mainBranch, endpoints, seen } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    const originalUpdateEndpoint = state.branches.updateEndpoint.bind(state.branches);
+    let runningCalls = 0;
+    state.branches.updateEndpoint = ((id: string, a: { status: string; port: number | null; error?: string | null }) => {
+      if (a.status === "running") {
+        runningCalls++;
+        if (runningCalls === 1) {
+          throw new Error("sqlite busy — persist failed");
+        }
+      }
+      return originalUpdateEndpoint(id, a);
+    }) as typeof originalUpdateEndpoint;
+
+    try {
+      await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/persist failed/);
+    } finally {
+      state.branches.updateEndpoint = originalUpdateEndpoint;
+    }
+
+    const statusEvents = seen.filter((e) => e.type === "endpoint.status");
+    // starting, then exactly one failed — not starting/failed/failed.
+    expect(statusEvents).toHaveLength(2);
+    expect(state.branches.byId(mainBranch.id)!.endpointStatus).toBe("failed");
+  });
+
   // `events` is an OPTIONAL dep, same rationale as `logs` elsewhere in this codebase.
   it("start/stop work without throwing when events is omitted from deps", async () => {
     const f = fakes();

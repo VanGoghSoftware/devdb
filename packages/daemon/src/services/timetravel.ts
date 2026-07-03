@@ -245,6 +245,21 @@ export class TimeTravelService {
         throw e;
       }
 
+      // Emission map (spec Decision 1): this single success point covers BOTH restoreInPlace and
+      // resetToParent — one branch.updated for the swapped (new, now-live) branch identity.
+      // branchAtTimestamp does NOT go through this method (it delegates to
+      // BranchesService.create(), which publishes its own branch.created) — no double emission.
+      //
+      // Fix wave 1, Fix 1: published HERE — immediately once `swapped` is known-committed (the
+      // try/catch above just closed successfully) — rather than after the `if (wasRunning)`
+      // restart below. restoreSwap is the last engine/DB mutation in the try block; once it
+      // returns, the identity swap is durable regardless of what happens next. The restart is a
+      // SEPARATE, fallible operation in a different failure domain (see the crash-window comment
+      // below) — if it throws, the swap must still have been announced, or a client watching
+      // /api/events would never learn the swapped branch exists even though it's durably real and
+      // queryable.
+      this.deps.events?.publish({ type: "branch.updated", projectId: swapped.projectId, branchId: swapped.id });
+
       // Crash-window note (review fix, tracked for the durability phase — not fixed here):
       // process death between a successful detach_ancestor and this DB swap leaves a detached
       // orphan timeline and (if wasRunning) a stopped endpoint; no boot reconciliation exists
@@ -256,11 +271,6 @@ export class TimeTravelService {
       if (wasRunning) {
         await this.deps.queue.run(swapped.id, (lane2) => this.deps.endpoints.startLocked(lane2, swapped.id));
       }
-      // Emission map (spec Decision 1): this single success point covers BOTH restoreInPlace and
-      // resetToParent — one branch.updated for the swapped (new, now-live) branch identity.
-      // branchAtTimestamp does NOT go through this method (it delegates to
-      // BranchesService.create(), which publishes its own branch.created) — no double emission.
-      this.deps.events?.publish({ type: "branch.updated", projectId: swapped.projectId, branchId: swapped.id });
       return this.deps.branches.detail(this.deps.branches.byIdOr404(swapped.id));
     });
   }

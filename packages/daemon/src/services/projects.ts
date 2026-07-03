@@ -181,6 +181,14 @@ export class ProjectsService {
           await this.deps.pageserver.timelineDelete(projectId, b.timelineId);
           await this.deps.safekeeper.timelineDelete(projectId, b.timelineId);
           this.deps.state.branches.delete(b.id);
+          // Fix wave 1, Fix 3: symmetric with BranchesService.delete()'s own branch.deleted
+          // publish — this leaf's row is being deleted directly against the repo (not via that
+          // service), so without this it would never fire. Announced right after the delete
+          // durably commits, so a client watching /api/events learns this branch is gone even if
+          // the ENCLOSING project delete later fails (e.g. tenantDelete throws after the drain
+          // completes) — the branch row really is gone at that point regardless of what happens
+          // to the rest of the project teardown.
+          this.deps.events?.publish({ type: "branch.deleted", projectId, branchId: b.id });
           // Fix 3 (review): same rationale as BranchesService.delete()'s own evict() call — this
           // leaf's branch id is gone for good, so its `branch:<id>:compute` channel (ring + subs)
           // should go with it rather than accumulating in LogsService for the life of the daemon.
