@@ -1,0 +1,132 @@
+# DevDB — Phases 2–5 Handover
+
+**Date:** 2026-07-03 · **Audience:** the agent (or human) picking up DevDB after phase 1.
+**Phase 1 status:** COMPLETE, merged to `main` (fast-forward to `995b766`, 2026-07-03). 221 unit tests (typecheck-gated), 7 container-level integration suites, acceptance run of the spec's demo items 1–4 — all green.
+
+This document is the durable roadmap + tribal knowledge for the remaining phases. It replaces the (worktree-local, now deleted) execution ledger. Read it top to bottom before planning anything.
+
+---
+
+## 1. What DevDB is
+
+A local-development Postgres server with Neon-style instant copy-on-write branching, packaged as **one Docker container**, designed **for AI coding agents first**: where git worktrees give parallel agents isolated copies of *code*, DevDB branches give them isolated writable copies of *data*. An agent asks for a branch, gets a connection string in one call, works destructively in isolation, throws the branch away — while a human oversees everything in a web dashboard (phase 3).
+
+- **Spec (authoritative for product decisions):** `docs/superpowers/specs/2026-07-02-devdb-design.md`
+- **Phase-1 plan (authoritative for how phase 1 was actually built — its 23 “AMENDED (A4–A23)” blocks are the changelog of every post-review change and live-engine discovery):** `docs/superpowers/plans/2026-07-02-devdb-phase-1-engine-and-branching.md`
+- **Oracle:** `~/git/neond` (Apache-2.0 Rust control plane over Neon's engine). We port its behavior with cited `// oracle: <file:line>` comments; we do not copy its UI. Findings about neond/upstream bugs are documented internally (see memory `no-upstream-reports`); Jordan handles any external reporting himself in his own sessions.
+
+## 2. What exists on `main` today
+
+| Surface | State |
+|---|---|
+| Docker image `devdb:dev` | node:22-bookworm-slim + engine binaries `COPY`'d from digest-pinned `neond/neond` (see `docker/BINARIES.md`); build-time binary verify gate (`docker/verify-binaries.sh`); compose file publishes `4400` + `54300-54339` |
+| Engine boot | TS daemon = PID 1; boots storcon-DB (embedded vanilla PG :5431) → storage_broker :50051 → storage_controller :1234 → safekeeper :5454/:7676 (+ registration POST) → pageserver :9898/:64000 — **trust mode** (no NeonJWT; all engine ports loopback-only in-container). Partial-boot failures reverse-stop and release the lock; SIGTERM shutdown escalates (45s hard-exit, second-signal force) |
+| State | SQLite `state.db` (WAL, FKs incl. composite same-project parent FK), additive column migrations at open, boot reconciliation (`reconcileEndpointsOnBoot`) + crash-orphaned compute-dir sweep |
+| REST :4400 | projects CRUD; branches create/list/get/delete (create serialized under the PARENT's queue lane, compensated); endpoints start/stop/get (queued; crashed computes auto-recover on next start); time travel (`GET /lsn?timestamp=`, `POST /restore {in_place|new_branch}`, `POST /reset`); SSE logs (daemon components allowlisted + per-branch compute channels); `POST /api/sql` (driver-side query_timeout, multi-statement psql-convention, `truncated` flag); `GET /api/status` (real per-component state incl. storcon-DB) |
+| Per-branch computes | `compute_ctl`-launched Postgres, ports/slots reserved synchronously, sticky ports, durable `endpoint_error`, orphaned-postgres reaper (compute_ctl loses its child on SIGTERM — see §8) |
+| Tests | `pnpm --filter @devdb/daemon test` (tsc gate then vitest, 221 tests); `pnpm --filter @devdb/integration test` (7 files: boot, projects, branching-isolation “money test”, endpoints incl. live stop/port-reuse, timetravel, restart, acceptance; ~5 min total; testcontainers with an in-repo port-cache-race workaround) |
+| Review memory | `docs/codebase-review.md` — the review-broker's append-only prior-findings doc (checked in; dedup memory across phases). Keep pointing the broker at it: `REVIEW_BROKER_DOC=<repo>/docs/codebase-review.md` |
+
+**Repo layout:** `packages/daemon` (src: `config.ts`, `state/*`, `engine/*`, `compute/*`, `services/*`, `http/api.ts`, `index.ts`), `packages/shared` (zod schemas + DTO types), `docker/`, `tests/integration/` (+ `helpers/pg.ts`, `helpers/container.ts`), `docs/`.
+
+**Check `git log` before planning:** Jordan runs hands-on sessions in parallel (IDE + chip-spawned sessions — currently: compute_ctl ready-vs-auth investigation, the task-14 “500 on stop” revisit, and two upstream-report drafts). `main` may have moved past `995b766`. His direct fixes ride into commits with disclosure + plan amendment notes; that pattern is welcome — absorb, verify, credit.
+
+## 3. Process contract (how phases get built)
+
+Phase 1 was built with the superpowers flow and it worked well. Keep it:
+
+1. **Each phase gets its own spec-refinement (light) + full implementation plan** via `superpowers:brainstorming` (only where genuine product questions remain — most were settled in the spec) and `superpowers:writing-plans` (bite-sized TDD tasks, complete code in steps, `Interfaces:` blocks, oracle citations). Do NOT try to execute a phase from this handover alone.
+2. **Execution:** `superpowers:subagent-driven-development`. Per task: implementer subagent (haiku for transcription tasks, sonnet for live/judgment tasks) → **two parallel gates**: a task-reviewer subagent AND a review-broker scan → controller adjudicates merged findings → one fixer → focused re-review. Ledger every verdict in `.superpowers/sdd/progress.md` (worktree-local; gitignored — **copy anything durable into a committed doc before removing the worktree**; phase 1 lost its ledger this way and this handover is the reconstruction).
+3. **Review broker:** user-scoped MCP (`mcp__review-broker__*` — available natively in new sessions). Per-task: `run_intelligent_review_scan` with `repoRoot` = the worktree, absolute `focusFiles`, `appendToDoc: true`, `targetFindings` 5–6, `priorityFloor` "P4", task-scoped `directions` that name the sanctioned deviations (so it doesn't burn findings on them). Severity map: P1–P2 → Critical, P3 → Important (fix now), P4–P5 → Minor (ledger, final-review triage). The broker runs on Jordan's Codex account — it costs real tokens; one scan per task + one per fix round only when warranted.
+4. **Standing user rulings (still in force):**
+   - **A1:** integration tests import shared helpers from `tests/integration/helpers/` — no per-file duplication.
+   - **A2:** unit tests use typed fakes against the narrow interfaces in `services/engine-api.ts` — no `as never`/`as any`. The daemon test script's tsc gate enforces test-file types; keep it.
+   - **Standing rule:** when a gate flags something the plan's literal text mandates and the controller judges the finding correct → fix it AND amend the plan (numbered `> **AMENDED (An, …)**` note), autonomously; only architecture-changing conflicts go back to Jordan.
+   - **Supply chain:** `minimumReleaseAge: 1440` (npm deps ≥ 24h old), pnpm 11.9.0 via packageManager pin, `allowBuilds` allowlist (every new native dep needs an explicit true/false decision), image installs with `--frozen-lockfile` (remember: a new workspace importer requires COPYing its `package.json` into the image before `pnpm install`).
+   - Conventional commits; `Co-Authored-By: Claude` on controller commits; worktree per phase (`git worktree add` under `.claude/worktrees/` — the native EnterWorktree tool may fail if the harness cached pre-git state; the manual + `EnterWorktree {path}` fallback also failed once, plain `git worktree add` + absolute paths worked fine).
+5. **Machine quirks:** corepack's shim is broken under some node versions here — use plain `pnpm`. `core.autocrlf` is on — scripts checked out with CRLF need `tr -d '\r'` before executing by shebang. Docker Desktop runs many unrelated containers — first-run integration flakes happen under load; rerun before diagnosing.
+
+## 4. Phase 2 — MCP server + agent skills (NEXT)
+
+**Goal:** agents create/use/reset/restore branches without human help; skills establish the branch-per-task workflow. This is the phase that delivers the product's original pitch.
+
+### Scope (from the spec, §MCP + §Skills)
+- **MCP server inside the daemon** at `http://localhost:4400/mcp`, Streamable HTTP, official `@modelcontextprotocol/sdk`. Registration UX: `claude mcp add --transport http devdb http://localhost:4400/mcp`.
+- **Tools:** `list_projects`, `create_project {name, pgVersion?}`, `list_branches {project}` (tree + status + created_by), `create_branch {project, name, parent?, at_timestamp?}` (**auto-starts endpoint, returns connection string** — the “new worktree” move), `get_branch {project, branch, ensure_running?=true}` (the “switch” move), `stop_endpoint`, `delete_branch`, `reset_branch`, `restore_branch {project, branch, to_timestamp, as_new_branch?}`, `import_database` (STUB in phase 2 — real implementation is phase 4; return a clear “arrives in a later phase” error or defer the tool entirely — decide in the plan), `export_branch` (same), `get_job {id}` (same), `get_status`.
+- **Design principles (spec):** every success response is actionable text including the connection string when relevant + a “next step” hint; every error names its remediation (`endpoint_error` is now durable — surface it); timestamps ISO-8601 with explicit timezone (the REST layer already rejects tz-less).
+- **Skills** shipped in-repo under `skills/`, superpowers-conventioned, referencing MCP tool names exactly: `using-devdb` (branch-per-task discipline mirroring worktrees; naming `agent/<task-slug>`; wire connstring into the worktree's env; never share a branch between concurrent agents; delete on completion), `safe-db-migrations` (rehearse on a branch → verify → apply to main; `restore_branch` as the undo), `importing-databases` (phase-4-dependent — consider deferring this skill to phase 4 with the tools).
+
+### Parked design decisions this phase's plan MUST resolve (accumulated from phase-1 gates)
+1. **Lane capability tokens** — `startLocked`/`stopLocked` are public with a JSDoc “caller must hold the branch lane” contract; the final review recommended an enforceable shape (queue-issued token or `runLocked` helper). MCP adds more callers; do the refactor first.
+2. **DTO mappers with redaction** — wire responses are currently `BranchRow` supersets: `password` is present on every branch response. Fine under localhost trust, wrong for MCP ergonomics and hygiene: map to explicit DTOs, drop `password` (agents get `connectionString`), genericize 409 constraint messages (they leak `branches.slug` style internals).
+3. **Compute readiness probe** — compute_ctl signals ready ~10ms before SCRAM auth works. Two bounded retries exist (test helper + `/api/sql`'s `connectWithRetry`). Memory `compute-ctl-readiness-signals` (from Jordan's session) documents the structural fix: **compute_ctl's `/metrics` endpoint is auth-free and exposes `compute_ctl_up{status=…}`** (its `/status` endpoint needs JWT even under `--dev`). Replace needle+retry with a metrics poll in `ComputeManager.start`, then delete the retries. Check Jordan's in-flight investigation session for conclusions before implementing.
+4. **PDEATHSIG/setpgid port** — the oracle's `pre_exec` (Linux `PR_SET_PDEATHSIG`, macOS `setpgid`) was never ported to `ManagedProcess`; compute_ctl orphans its postgres child on SIGTERM, currently mitigated by `reapOrphanedPostgres` (path-scan + kill). Spawning computes into their own process group and killing the group is the structural fix (Node: `spawn(..., {detached: true})` + `process.kill(-pid)`); removes the reap's cross-file invariant dependence. Jordan has a session revisiting this — sync first.
+5. **Structured logging** — compensation paths use bare `console.error`; route through a logger that also feeds the existing `LogsService` channels.
+6. **MCP-specific concurrency review** — agents will hammer the API concurrently; the queue-lane model held up under review, but the plan should include a concurrency-focused integration test (parallel create/use/delete across branches — the product's core promise).
+
+### Acceptance sketch (spec v1 items 3–4, MCP edition)
+`claude mcp add … /mcp` → agent `create_branch` → gets connstring → destructive writes on its branch; `main` unaffected; `list_branches` shows the tree; `reset_branch` → branch matches parent again; `restore_branch --as-new-branch` recovers a pre-mistake timestamp. Ship at least one skill exercised end-to-end by a scripted agent flow in integration tests (MCP SDK client against `/mcp` inside the testcontainers harness).
+
+## 5. Phase 3 — Web UI
+
+**Goal (spec §Web UI):** React 19 + Vite + **Mantine** (Jordan's explicit choice — not Tailwind/shadcn), static build embedded in the daemon at `:4400`, no login. Fresh design; do not copy neond's Vue dashboard.
+
+- **Screens:** Dashboard (projects, engine health, durability badge — badge is phase-4-gated, show local-only state until then); **Project view with a git-graph-style branch tree** (the differentiator; agent-created branches visually tagged via `created_by`); Branch panel (connstring copy, live SSE logs — endpoints exist, `endpoint_error` display, job history phase-4-gated, restore-to-timestamp picker, danger zone); SQL console (branch picker, results table — consume the `truncated` flag; pagination/cursors is the planned fix for the full-materialization limitation; revisit duplicate-column handling: object rows were chosen for MCP ergonomics, the UI may want `fields`-driven rendering); Settings (port range read-only view; remote storage + export targets are phase 4 — stub the sections).
+- **Deferred REST from phase 1 to land here:** `PATCH /api/branches/:id` (rename) — spec lists it; deliberately deferred “alongside the UI that exposes it”.
+- **Embedding:** build `packages/web` → static assets served by Fastify (plan the Dockerfile stage + dev-mode proxy). Update the image's `pnpm install` COPY set for the new workspace importer (same trap as tests/integration in phase 1 — see §3.4).
+- SSE consumption: the daemon's SSE hardening (backpressure = drop + reconnect-replay) shapes the client: auto-reconnect with replay is expected behavior.
+
+## 6. Phase 4 — Import/Export + Durability
+
+**Goal (spec §Import & Export, §Durability):** the bucket features.
+
+- **Import:** external PG → new branch. Oracle: `neond/src/mgmt/service/import.rs` — create empty branch (Bootstrap timeline) → start endpoint → stream `pg_dump -Fc <source> | pg_restore` → progress into a job log channel (LogsService channels + `jobs` table exist, dormant since T4) → `importing → ready|failed` with stderr tail preserved. Docker reachability guidance: `host.docker.internal` for host DBs.
+- **Export:** `pg_dump -Fc` from the branch endpoint streamed WITHOUT disk buffering to: local file (data dir), S3 multipart, Azure block blob. `export_targets` table exists (dormant). Job records size + LSN at dump time. Phase-2 MCP stubs (`import_database`, `export_branch`, `get_job`) become real here.
+- **Durability:** daemon-level mode `none|s3|azure` — generate pageserver `remote_storage` (upstream supports S3, Azure, GCS natively — verified in `libs/remote_storage/src/config.rs`; neond only wired S3, we wire both) + safekeeper WAL backup args; `state.db` uploaded on interval + graceful shutdown; boot-time restore when local state missing; `none → bucket` switch allowed, reverse blocked with explanation. Surface the “all in sync” checkpoint badge in `/api/status` (+ UI).
+- **Boot reconciliation, part 2:** diff engine timelines against SQLite at boot — this is the designated home for: the detach→swap crash-window orphan cleanup (documented at `timetravel.ts` swap call site), compensation residue (orphaned tenants/timelines when best-effort cleanup failed), and ghost-branch detection after a bucket restore (spec's backups doc warns about this).
+- **S3 lease/lockfile:** oracle `neond/src/daemon/lease/mod.rs` (S3 conditional-put lock) if/when two-host safety is wanted — spec keeps it single-host; the local `.lock` + documented recovery command may suffice; decide in the plan.
+- **Tests:** MinIO + Azurite containers in the integration harness; disaster-recovery boot-from-bucket test (spec acceptance item 7); export artifact restored into vanilla Postgres (item 6).
+
+## 7. Phase 5 — Extensions, PG 18, platform
+
+- **Extensions (spec §Postgres versions & extensions):** contrib + pgvector already ship in the binaries. Add **pg_cron** and **PostGIS**, compiled per supported PG major against the shipped `pg_install/<ver>` headers (`pg_config` available in-image) in a Dockerfile stage. `shared_preload_libraries` currently = `neon` only (`compute/pgconf.ts`) — pg_cron needs appending + `cron.database_name` decided (computes are single-db `postgres` today). UI lists available extensions (phase 3 settings hook). Watch image size (PostGIS is heavy — consider an opt-in variant per the spec's risk note).
+- **PG 18:** absent from the pinned neond image (inventory: v14–v17 + vanilla_v17 — note vanilla reports `19devel`, internal-only, excluded from tenant versions). Options: re-pin a newer neond digest and re-run the inventory decision in `docker/BINARIES.md` + bump `SUPPORTED_PG_VERSIONS`/`PgVersionSchema`, or build v18 compute from the `neon` submodule (heavy). Spec default stays 17 until then.
+- **Platform:** multi-arch images (inventory verified linux/arm64 only — documented caveat in BINARIES.md), CI for unit + integration (the testcontainers workaround makes integration CI-viable; unique image tags per worktree/CI job was a consciously deferred finding), `.claude`/skills packaging decisions, quickstart polish.
+
+## 8. Tribal knowledge — live-engine facts (do not re-learn these the hard way)
+
+All of these are also recorded as plan amendment notes (A4–A23) with commit references:
+
+1. **storcon `tenant_create` wants config fields FLAT on the body** — nesting under `config` → 400 “unknown field”. (A17)
+2. **~5s post-boot window** where storcon 409s tenant creation (“No pageserver found matching constraint”) while the pageserver heartbeats warming-up→active; `/api/status` can't see it. Bounded retry exists in `storcon-client.ts`. A metrics/scheduler-readiness gate is the structural alternative if it ever bites elsewhere. (A17)
+3. **compute_ctl requires `compute_ctl_config: { jwks: { keys: [] } }`** even in trust mode (serde demands the struct). (A19)
+4. **Postgres GUC values with dots need quoting** — unquoted `listen_addresses=0.0.0.0` is a conf parse error; `pgQuote()` exists in `compute/pgconf.ts`. (A19)
+5. **`get_lsn_by_timestamp` returns `kind:"future"` until LATER COMMITS advance the timeline clock** — wall-clock waiting never resolves it; integration tests poll AFTER the next write. (A21)
+6. **compute_ctl orphans its postgres child on SIGTERM** (we never ported the oracle's PDEATHSIG/setpgid `pre_exec`); `reapOrphanedPostgres` mitigates; process-group kill is the structural fix (phase 2 §4.4). This was the true cause of a “500 on stop” initially misread as environmental. (A21/T15)
+7. **compute_ctl readiness:** stderr needle “listening on IPv4 address” fires ~10ms before SCRAM auth works; `/metrics` (auth-free, `compute_ctl_up{status}`) is the reliable probe; `/status` needs JWT even with `--dev`. (memory: compute-ctl-readiness-signals)
+8. **`--internal-http-port` must be allocated per compute** — default 3081 collides across concurrent computes (Jordan found this via `/proc/net/tcp`; fixed in `ComputeManager`). (A20)
+9. **testcontainers@10.28.0 has a port-binding cache race** on start()/restart() with many exposed ports — worked around in `tests/integration/helpers/container.ts` (Devdb owns its port cache; retryStart stops failed live attempts). (A22)
+10. **Upstream neond bugs found (kept internal):** compute pg_hba uses `::1/32` (vastly broader than IPv6 loopback; we ship `/128`) (A15); the orphaning in #6 traces to neond's reliance on `pre_exec` which their launcher has and ours needed porting.
+11. **`format_version` serializes as JSON `1`** (JS int) — live-confirmed fine for compute_ctl's deserializer. (A15/A19)
+12. **Stale lock recovery:** `docker compose -f docker/compose.yaml run --rm devdb rm /data/.lock` (README Troubleshooting; only if no other container uses the volume).
+13. **Engine reserved ports:** 50051, 1234, 5431, 9898, 64000, 5454, 7676 (+ 4318 referenced by storcon's `--control-plane-url`, + computes' 40000-40999 metrics/internal range — the config validator covers the first seven; extending it to the other two is an open Minor).
+
+## 9. Open Minors & consciously-declined items (final-review triage, reconstructed)
+
+**Accepted as-is (phase 1):** verify-binaries ldd-absence edge; joined missing-env-var message; dead `id != newBranchId` guard in restoreSwap; SCRAM retry ≤1.5s masking window (server-issued passwords); `log_line_prefix` hand-quoted literal; format_version JSON int.
+
+**Deferred with a home:**
+- → Phase 2: lane capability tokens; DTO redaction + genericized 409s; structured logging; PDEATHSIG port; metrics-based readiness; stop-during-start interleaving test; swap-hands-new-branch-id-an-empty-lane micro-window.
+- → Phase 3: SQL pagination/cursor (full-materialization cap) & duplicate-column presentation; README psql-race note only if reports come in.
+- → Phase 4 (durability/boot reconciliation): detach→swap crash-window orphans; compensation residue; computesDir sweep already landed but engine-side orphan diffing pending.
+- → Phase 5/CI: arm64-only inventory; unique image tags per worktree/CI; reserved-port validator completeness (4318 + 40000-40999).
+
+**Declined (do not re-litigate without a NEW argument — rationale in the phase-1 plan/reviews):** zod :id param validation; output-DTO zod schemas; Rust-source port-parity tests; mocked-execa EmbeddedPostgres contract tests; engine-client live-parity suite; needle fixture tests; lock-ownership nonce; boot-test live-engine probes; `rowMode:"array"`; cursor/streaming in phase 1.
+
+## 10. How to start Phase 2 (concretely)
+
+1. `git log --oneline -10` on main — absorb anything Jordan's parallel sessions landed since `995b766` (esp. the compute_ctl readiness + orphan investigations, which may pre-resolve §4.3/§4.4).
+2. Read: the spec's §MCP + §Skills, this doc's §4, the phase-1 plan's A16/A19/A21/A22 amendment notes (ComputeManager/endpoints/timetravel current shapes), `services/engine-api.ts`, `services/endpoints.ts`, `http/api.ts`.
+3. Brainstorm ONLY the genuinely open product questions (e.g., MCP tool auth posture on localhost, import/export tool stubbing vs omission, skill packaging/distribution) — everything else is settled.
+4. Write the phase-2 plan with `superpowers:writing-plans` (same format: header, global constraints — carry §3.4's rulings verbatim — oracle map where applicable, bite-sized TDD tasks with Interfaces blocks). Include the parked-decision resolutions (§4) as early tasks — they're prerequisites for the MCP surface, not cleanup.
+5. Execute with `superpowers:subagent-driven-development` + the review broker per §3. Create the worktree, initialize the ledger, and **at phase end copy durable ledger content into a committed doc before removing the worktree** (this doc exists because phase 1 didn't).
