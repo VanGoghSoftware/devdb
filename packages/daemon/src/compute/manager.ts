@@ -93,8 +93,11 @@ export class ComputeManager {
 
     let dirCreated: string | null = null;
     try {
+      // allocatePort claims each returned port into reservedPorts itself, synchronously before
+      // its bind probe (reserve-then-probe — see ports.ts), so parallel starts on other branches
+      // can never be handed the same candidate. Recording the port on `entry` in the same tick is
+      // what start()'s catch and stop() use to release the claim.
       const port = await allocatePort(this.cfg.portRange, a.branch.stickyPort, this.reservedPorts);
-      this.reservedPorts.add(port);
       entry.port = port;
 
       const computesDir = engineDirs(this.cfg).computesDir;
@@ -112,7 +115,6 @@ export class ComputeManager {
         password: a.branch.password,
       }));
       const metricsPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts);
-      this.reservedPorts.add(metricsPort);
       entry.metricsPort = metricsPort;
       // Without an explicit --internal-http-port, compute_ctl binds its internal HTTP server
       // (remote-extension downloads for the neon extension, local_proxy config) to the default
@@ -120,7 +122,6 @@ export class ComputeManager {
       // collide — nonfatal, but that server is silently missing/misrouted for every compute
       // after the first (verified via /proc/net/tcp in a live devdb:dev container).
       const internalHttpPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts);
-      this.reservedPorts.add(internalHttpPort);
       entry.internalHttpPort = internalHttpPort;
 
       // oracle args: src/mgmt/compute/mod.rs:189-208; readiness: :245-252 ("listening on IPv4 address", 50s)
