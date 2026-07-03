@@ -396,9 +396,13 @@ describe("registerMcp — session lifecycle (real listener)", () => {
       // A second request that reuses the same client/transport (and therefore the same
       // mcp-session-id header the SDK attaches internally) must resolve to the SAME session —
       // proven here by the session id staying stable across a second real RPC round-trip
-      // (listTools(), which Task 8 expects to reject with -32601 since no tools are registered
-      // yet — the point of this assertion is session continuity, not the tools contract).
-      await expect(client.listTools()).rejects.toThrow(/-32601/);
+      // (listTools()). Task 8 left this asserting a -32601 rejection (zero tools registered at
+      // the time); Task 9 registers 5 read tools, so listTools() now genuinely resolves — updated
+      // to assert that resolution instead, since a stale rejection assertion would itself become
+      // a false negative the moment tools existed. The point of this assertion remains session
+      // continuity, not the tools contract (mcp-tools.test.ts and mcp-handshake.test.ts own that).
+      const { tools } = await client.listTools();
+      expect(tools.length).toBeGreaterThan(0);
       expect(transport.sessionId).toBe(sessionId);
       await client.close();
     } finally {

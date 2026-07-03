@@ -36,6 +36,15 @@ export class BranchesService {
     return b;
   }
 
+  // MCP tools take branch by NAME, scoped to an already-resolved project — same rationale as
+  // ProjectsService.byNameOr404: one place phrases the actionable "call list_branches" remediation
+  // for every read tool that resolves a branch by name.
+  byProjectAndNameOr404(projectId: string, name: string): BranchRow {
+    const b = this.deps.state.branches.byProjectAndName(projectId, name.trim());
+    if (!b) throw new DevdbError(404, `branch "${name}" not found in this project — call list_branches`);
+    return b;
+  }
+
   // Amendment A11 (controller): percent-encode the password via encodeURIComponent — passwords
   // are alphanumeric today (compute/scram.ts CHARSET) so this is a no-op in practice, but it
   // keeps the connection-string contract safe if that charset ever grows URL-special characters.

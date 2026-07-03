@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { PACKAGE_VERSION, type Deps } from "../http/api.js";
 import { MCP_INSTRUCTIONS } from "./instructions.js";
-// import { registerTools } from "./tools.js";   // ← uncommented in Task 9
+import { registerTools } from "./tools.js";
 
 export interface ToolCtx {
   deps: Deps;
@@ -9,26 +9,29 @@ export interface ToolCtx {
 }
 
 // Builds one McpServer per session (registerMcp calls this from the initialize-request branch of
-// its POST /mcp handler). Zero tools registered here — Task 9 wires registerTools once the tool
-// surface exists; until then `listTools()` correctly returns [] and only the handshake
-// (initialize + instructions) is exercised.
-// deps/getClientInfo are unused until Task 9 wires registerTools(server, {deps, clientInfo}) —
-// kept in the signature now so http.ts's call site doesn't change shape between the two tasks.
+// its POST /mcp handler).
 //
-// Fix 3: no explicit `tools` capability. Passing `capabilities: { tools: {...} }` here (as this
-// used to) tells clients at `initialize` that tools ARE supported, but with zero registerTool()
-// calls the SDK never wires up its tools/list request handler (setToolRequestHandlers() only
-// runs as a side effect of registerTool() itself — see mcp-handshake.test.ts's tripwire comment)
-// — so a client would see the capability advertised, call tools/list or tools/call, and get back
-// a bare -32601 Method not found with no clue why. Advertising a capability the server can't
-// actually serve is worse than advertising none. Task 9's registerTool() calls will make the SDK
-// auto-advertise the tools capability (including listChanged) the moment the first tool is
-// registered — no manual capabilities object needed at all once that lands.
+// Task 8 landed this with zero tools and NO explicit `tools` capability: passing
+// `capabilities: { tools: {...} }` at construction time would have told clients at `initialize`
+// that tools ARE supported, but with zero registerTool() calls the SDK never wires up its
+// tools/list request handler (setToolRequestHandlers() only runs as a side effect of
+// registerTool() itself — see mcp.js's setToolRequestHandlers()/registerCapabilities call, and
+// mcp-handshake.test.ts's now-flipped tripwire tests). Advertising a capability the server can't
+// actually serve would have been worse than advertising none.
+//
+// Task 9: registerTools(server, ...) below calls server.registerTool() for the first time (5 read
+// tools) — the SDK's own registerTool() implementation calls
+// `this.server.registerCapabilities({ tools: { listChanged: true } })` as a side effect the FIRST
+// time any tool is registered (mcp.js's setToolRequestHandlers(), gated on
+// `_toolHandlersInitialized`), which both wires up the tools/list and tools/call JSON-RPC handlers
+// AND makes that capability show up in the negotiated `initialize` result. No manual
+// `capabilities` object is needed here at all — verified against mcp-handshake.test.ts's flipped
+// assertions (tools capability present with listChanged:true, listTools() resolves the 5 tools).
 export function buildMcpServer(deps: Deps, getClientInfo: ToolCtx["clientInfo"]): McpServer {
   const server = new McpServer(
     { name: "devdb", version: PACKAGE_VERSION },
     { instructions: MCP_INSTRUCTIONS },
   );
-  // registerTools(server, { deps, clientInfo: getClientInfo });   // ← Task 9
+  registerTools(server, { deps, clientInfo: getClientInfo });
   return server;
 }

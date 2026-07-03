@@ -15,39 +15,41 @@ describe("mcp handshake", () => {
     await client.close();
   });
 
-  // Fix 3: buildMcpServer no longer passes an explicit `tools` capability (it used to advertise
-  // `{ tools: { listChanged: true } }` with zero registered tools — a lie the SDK would then
-  // contradict on the very first tools/list call, see the -32601 tripwire test below). This
-  // asserts the CONTRACT side of that fix: the negotiated `initialize` result must not claim
-  // tools support at all while there are genuinely zero tools. Task 9's registerTool() calls
-  // will make the SDK auto-advertise `tools` (incl. listChanged) the moment the first tool is
-  // registered — that's the natural flip point for this assertion (see the sibling -32601 test's
-  // own comment for the other half of what Task 9 changes).
-  it("does NOT advertise a tools capability yet (zero tools registered)", async () => {
+  // Task 9 flip (was Task 8's tripwire: "does NOT advertise a tools capability yet"). Task 8's
+  // buildMcpServer passed no explicit `capabilities` object — correct at the time (zero tools
+  // registered, so advertising `{ tools: {...} }` would have been a lie the SDK's own dispatcher
+  // then contradicted on the first real tools/list call). Task 9's registerTools() call makes the
+  // SDK auto-advertise `tools` the moment the first tool is registered: verified against the
+  // installed SDK (@modelcontextprotocol/sdk@1.29.0, dist/esm/server/mcp.js's
+  // setToolRequestHandlers()) — `registerTool()` calls
+  // `this.server.registerCapabilities({ tools: { listChanged: true } })` as a side effect the
+  // FIRST time any tool is registered, gated on a private `_toolHandlersInitialized` flag so it
+  // only fires once regardless of how many tools get registered after the first. No manual
+  // `capabilities` object in buildMcpServer's McpServer construction was needed to make this
+  // happen — server.ts still passes none, and the capability shows up anyway, confirming the
+  // auto-advertise behavior asserted here.
+  it("advertises a tools capability (incl. listChanged) now that read tools are registered", async () => {
     const client = new Client({ name: "test", version: "1.0.0" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${dev.base}/mcp`)));
-    expect(client.getServerCapabilities()?.tools).toBeUndefined();
+    expect(client.getServerCapabilities()?.tools).toEqual({ listChanged: true });
     await client.close();
   });
 
-  // Task 8 lands zero tools (Task 9 registers the real 10). Verified against the installed SDK
-  // (@modelcontextprotocol/sdk@1.29.0, dist/esm/server/mcp.js): McpServer only wires up the
-  // tools/list JSON-RPC handler as a side effect of registerTool() being called at least once
-  // (setToolRequestHandlers() is invoked from inside registerTool()'s body, never from the
-  // constructor, and is `private` in the .d.ts — there's no public zero-tools-friendly way to
-  // force it). Passing `capabilities: { tools: {...} }` to the constructor only affects what's
-  // negotiated at initialize; it does NOT register the tools/list method handler on the
-  // underlying Server. So a zero-tool McpServer genuinely has no tools/list handler at all, and
-  // the brief's original assertion (`listTools()` resolves to `{ tools: [] }`) does not hold
-  // against the real SDK — corrected here to assert the actual, verified behavior: the call
-  // rejects with JSON-RPC -32601 Method not found, which is the honest signal for "no tools
-  // capability yet" rather than a silently-wrong empty-array response. Task 9, once it registers
-  // the first real tool, is expected to flip this same call to resolve with a populated list —
-  // that's the natural regression check for this test's assumption no longer holding.
-  it("has no tools/list handler yet — listTools() rejects with Method not found", async () => {
+  // Task 9 flip (was Task 8's tripwire: "has no tools/list handler yet — listTools() rejects with
+  // Method not found"). Task 9 registers the 5 read tools (get_status, list_projects,
+  // create_project, list_branches, get_branch) — registerTool()'s side effect (see the sibling
+  // test's comment above) wires up the real tools/list JSON-RPC handler, so listTools() now
+  // genuinely resolves instead of rejecting with -32601. This is the natural regression check for
+  // Task 8's own assumption ("no tools yet") no longer holding, and proves the handshake-level
+  // (not just unit-level, see mcp-tools.test.ts) tool surface is live end-to-end over the real
+  // Streamable-HTTP transport.
+  it("lists exactly the 5 registered read tools via a real tools/list round-trip", async () => {
     const client = new Client({ name: "test", version: "1.0.0" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${dev.base}/mcp`)));
-    await expect(client.listTools()).rejects.toThrow(/-32601/);
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual(
+      ["create_project", "get_branch", "get_status", "list_branches", "list_projects"].sort(),
+    );
     await client.close();
   });
 });

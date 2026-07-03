@@ -123,6 +123,15 @@ export class ProjectsService {
     return p;
   }
 
+  // MCP tools take project by NAME (agents don't know ids) — this resolver is the one place that
+  // 404 remediation is phrased, so every read tool that resolves a project by name gets the same
+  // actionable "call list_projects" next step rather than a bare not-found.
+  byNameOr404(name: string): ProjectRow {
+    const p = this.deps.state.projects.byName(name.trim());
+    if (!p) throw new DevdbError(404, `project "${name}" not found — call list_projects to see available projects`);
+    return p;
+  }
+
   // One children-before-parents "sweep": compute a fresh leaves snapshot, tear each down (inside
   // its own queue lane), repeat until nothing remains for this project. Shared by delete()'s main
   // loop and its bounded final-sweep retry below so there is exactly one place that knows how to
