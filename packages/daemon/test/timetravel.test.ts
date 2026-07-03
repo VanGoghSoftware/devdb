@@ -24,7 +24,7 @@ function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetai
     id: "fixture-branch-id", projectId: "fixture-project-id", parentBranchId: null,
     name: "fixture", slug: "fixture", timelineId: "t".repeat(32), password: "pw",
     stickyPort: null, endpointStatus: "running", endpointError: null,
-    importStatus: "none", importError: null, createdBy: "test", context: null,
+    importStatus: "none", importError: null, createdBy: "api", context: null,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
     port: 54300, connectionString: null, lastRecordLsn: null,
     logicalSizeBytes: null, ancestorLsn: null,

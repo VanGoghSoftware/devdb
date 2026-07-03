@@ -86,7 +86,11 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.get("/api/status", async () => {
     const engine = deps.engine.status();
     const healthy = Object.values(engine).every((p) => p.state === "running");
-    return { version: PACKAGE_VERSION, healthy, engine };
+    return {
+      version: PACKAGE_VERSION, healthy, engine,
+      portRange: deps.cfg.portRange,
+      storage: "none" as const, // phase 4 wires real modes (spec §Daemon additions)
+    };
   });
 
   // Open SSE responses, tracked so preClose (below) can end them explicitly. Fastify's own docs

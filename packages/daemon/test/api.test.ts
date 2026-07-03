@@ -672,6 +672,22 @@ describe("buildServer /api/status", () => {
 
     expect(res.json().healthy).toBe(false);
   });
+
+  it("GET /api/status — includes portRange and storage (phase-4 modes hardcoded 'none')", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/status" });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.portRange).toEqual({ min: 54300, max: 54339 }); // from the test config env (DEVDB_PORT_RANGE default)
+    expect(body.storage).toBe("none");
+  });
 });
 
 // The SSE routes hijack the reply and never call reply.raw.end() on their own (only on client

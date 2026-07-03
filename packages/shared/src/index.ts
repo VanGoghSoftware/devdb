@@ -52,6 +52,8 @@ export interface StatusDto {
   version: string;
   healthy: boolean;
   engine: Record<string, { state: "running" | "stopped" | "failed"; pid: number | null }>;
+  portRange: { min: number; max: number };
+  storage: "none" | "s3" | "azure"; // typed for phase 4; the daemon returns "none" until then
 }
 
 // Phase 3: /api/events wire schema. Events are coarse INVALIDATION HINTS, never data — the UI

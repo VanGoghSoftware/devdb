@@ -8,7 +8,7 @@ export interface BranchRow {
   id: string; projectId: string; parentBranchId: string | null; name: string; slug: string;
   timelineId: string; password: string; stickyPort: number | null; endpointStatus: string;
   endpointError: string | null;
-  importStatus: string; importError: string | null; createdBy: string;
+  importStatus: string; importError: string | null; createdBy: "ui" | "api" | "mcp";
   context: BranchContext | null;
   createdAt: string; updatedAt: string;
 }
@@ -28,7 +28,11 @@ function branchRow(r: Record<string, unknown>): BranchRow {
     endpointStatus: r.endpoint_status as string,
     endpointError: (r.endpoint_error as string | null) ?? null,
     importStatus: r.import_status as string,
-    importError: (r.import_error as string | null) ?? null, createdBy: r.created_by as string,
+    importError: (r.import_error as string | null) ?? null,
+    // Row boundary: created_by is constrained by every write path (services pass the literal union;
+    // there is no other writer), so this is the one place the string column narrows to the union —
+    // letting dto.ts and everything downstream drop their per-use casts (handover §9 close-out).
+    createdBy: r.created_by as BranchRow["createdBy"],
     context: r.context ? (JSON.parse(r.context as string) as BranchContext) : null,
     createdAt: r.created_at as string, updatedAt: r.updated_at as string,
   };
