@@ -45,9 +45,25 @@ export class SessionStore {
     return this.sessions.size;
   }
 
-  // Removes the session immediately (used for the DELETE teardown path and the transport's own
-  // onclose callback). Swallows close() failures — an already-dead transport erroring on close
-  // must not block eviction of the session-store entry itself.
+  // Pure map removal — never calls transport.close(). This is the primitive http.ts's
+  // transport.onclose callback wires to (Fix 2): onclose fires when the transport closes for ANY
+  // reason, including a close WE initiated via delete()/sweep()/closeAll() below — all three of
+  // which already call transport.close() themselves. If onclose ALSO called close() (e.g. via the
+  // old `store.delete(id)` wiring), the client-disconnect path (SDK closes the transport on its
+  // own, entry still present, onclose fires) would close the transport a SECOND time. Keeping
+  // "remove from the map" and "close the transport" as two separate, single-owner operations is
+  // what makes both call paths (WE-initiate vs SDK-initiate) idempotent with respect to each
+  // other — whichever runs first, the second sees nothing left to act on.
+  removeEntry(id: string): void {
+    this.sessions.delete(id);
+  }
+
+  // Removes the session immediately AND closes its transport (used for the DELETE teardown path
+  // — the one path WE initiate outside of sweep()/closeAll()). Swallows close() failures — an
+  // already-dead transport erroring on close must not block eviction of the session-store entry
+  // itself. Idempotent with removeEntry()/onclose: if the entry is already gone (e.g. the SDK's
+  // own onclose already fired and called removeEntry() first), this is a no-op — it does NOT
+  // call transport.close() a second time on an entry it no longer holds.
   async delete(id: string): Promise<void> {
     const s = this.sessions.get(id);
     if (!s) return;

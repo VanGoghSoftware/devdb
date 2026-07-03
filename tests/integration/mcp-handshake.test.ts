@@ -15,6 +15,21 @@ describe("mcp handshake", () => {
     await client.close();
   });
 
+  // Fix 3: buildMcpServer no longer passes an explicit `tools` capability (it used to advertise
+  // `{ tools: { listChanged: true } }` with zero registered tools — a lie the SDK would then
+  // contradict on the very first tools/list call, see the -32601 tripwire test below). This
+  // asserts the CONTRACT side of that fix: the negotiated `initialize` result must not claim
+  // tools support at all while there are genuinely zero tools. Task 9's registerTool() calls
+  // will make the SDK auto-advertise `tools` (incl. listChanged) the moment the first tool is
+  // registered — that's the natural flip point for this assertion (see the sibling -32601 test's
+  // own comment for the other half of what Task 9 changes).
+  it("does NOT advertise a tools capability yet (zero tools registered)", async () => {
+    const client = new Client({ name: "test", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${dev.base}/mcp`)));
+    expect(client.getServerCapabilities()?.tools).toBeUndefined();
+    await client.close();
+  });
+
   // Task 8 lands zero tools (Task 9 registers the real 10). Verified against the installed SDK
   // (@modelcontextprotocol/sdk@1.29.0, dist/esm/server/mcp.js): McpServer only wires up the
   // tools/list JSON-RPC handler as a side effect of registerTool() being called at least once

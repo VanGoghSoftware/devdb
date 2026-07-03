@@ -12,8 +12,39 @@ const SWEEP_INTERVAL_MS = 60_000;
 
 // Well-known loopback/container-gateway hostnames this daemon is legitimately reachable under.
 // Matched on HOSTNAME ALONE (port-agnostic) — see the port-mapping note on isHostAllowed below —
-// unlike cfg.mcpAllowedHosts/mcpAllowedOrigins, which are operator-supplied exact strings.
-const TRUSTED_LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "host.docker.internal"]);
+// unlike cfg.mcpAllowedHosts/mcpAllowedOrigins, which are operator-supplied exact strings compared
+// as canonical hostnames (see canonicalHostname below).
+//
+// "::1" is listed in its BRACKETED form ("[::1]"). This differs from the Task-8 fix brief's
+// working assumption ("IPv6 comes back bracket-stripped from URL") — empirically verified against
+// the installed WHATWG URL implementation (Node v25.2.1): `new URL("http://[::1]:4400").hostname`
+// returns "[::1]", brackets retained, not "::1". This is standardized WHATWG URL behavior (the
+// spec defines `hostname` to stay round-trippable back into a URL, which for an IPv6 literal
+// requires the brackets), not an implementation quirk — so the allowlist stores the bracketed
+// form to match what the canonicalizer actually produces, rather than trusting the brief's
+// unverified assumption.
+const TRUSTED_LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "host.docker.internal"]);
+
+// Robustly extracts and canonicalizes a hostname from a raw HTTP authority string (a Host header's
+// value, e.g. "localhost:4400" or "[::1]:4400" — NOT a full URL). Replaces the previous
+// `host.split(":")[0]` parse, which mishandled IPv6 literals (splits on every colon inside the
+// address) and let malformed authorities (join artifacts like "localhost, evil.com", or invalid
+// ports like "localhost:bad") through uncaught. `new URL("http://" + authority)` is the standard
+// robust way to parse a bare "host[:port]" authority: prefixing a scheme lets the WHATWG URL
+// parser apply its own authority-parsing/validation (including IPv6 bracket handling) and reject
+// anything that isn't a single valid host[:port] pair. Canonicalization: lowercase (case-
+// insensitive hostname comparison) + strip a single trailing dot (a DNS FQDN's root-zone dot,
+// "localhost." vs "localhost", refer to the same name). Returns null on ANY parse failure —
+// callers must treat null as "reject", not "skip validation" (fail CLOSED, not fail open).
+function canonicalHostname(authority: string): string | null {
+  try {
+    let hostname = new URL(`http://${authority}`).hostname.toLowerCase();
+    if (hostname.length > 1 && hostname.endsWith(".")) hostname = hostname.slice(0, -1);
+    return hostname || null;
+  } catch {
+    return null;
+  }
+}
 
 // DNS-rebinding guard (refinement spec Decision 1 + the Task-8 plan amendment): the SDK's own
 // enableDnsRebindingProtection/allowedHosts/allowedOrigins transport options are @deprecated in
@@ -35,22 +66,53 @@ const TRUSTED_LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "host.dock
 // DNS-rebinding protection actually needs is "does this hostname resolve to somewhere we trust",
 // not "is this the exact port we happen to be configured for" — a port number carries no bearing
 // on whether a request originated from a same-machine/same-docker-network caller vs. a remote
-// attacker's rebound DNS name. cfg.mcpAllowedHosts/mcpAllowedOrigins remain exact-string matches
-// (operator-supplied values, taken literally, may legitimately include a specific port to pin).
-function isHostAllowed(host: string, cfg: Deps["cfg"]): boolean {
-  const hostname = host.split(":")[0];
-  if (hostname && TRUSTED_LOOPBACK_HOSTNAMES.has(hostname)) return true;
-  return cfg.mcpAllowedHosts.includes(host);
+// attacker's rebound DNS name. cfg.mcpAllowedHosts/mcpAllowedOrigins are operator-supplied values
+// but are STILL compared as canonical hostnames (same canonicalHostname() call on both the
+// request's authority and each configured entry) — not raw string equality — so an operator can
+// write either "devdb.internal" or "devdb.internal:4400" in DEVDB_MCP_ALLOWED_HOSTS and either
+// form still matches a request presenting the other.
+function isHostAllowed(hostname: string, cfg: Deps["cfg"]): boolean {
+  if (TRUSTED_LOOPBACK_HOSTNAMES.has(hostname)) return true;
+  return cfg.mcpAllowedHosts.some((entry) => canonicalHostname(entry) === hostname);
+}
+
+// Origin entries (both the request header and cfg.mcpAllowedOrigins) are FULL origin strings
+// ("http://host:port"), unlike Host entries which are bare authorities ("host:port") — so this
+// parses via `new URL(origin).hostname` directly (the string already carries a scheme), not
+// canonicalHostname()'s scheme-prepending bare-authority parse. Still applies the same lowercase +
+// trailing-dot canonicalization as canonicalHostname() so e.g. "http://LOCALHOST" and
+// "http://localhost." both resolve to the same canonical "localhost".
+function canonicalOriginHostname(origin: string): string | null {
+  try {
+    let hostname = new URL(origin).hostname.toLowerCase();
+    if (hostname.length > 1 && hostname.endsWith(".")) hostname = hostname.slice(0, -1);
+    return hostname || null;
+  } catch {
+    return null; // an Origin that isn't a parseable URL is never legitimate — reject, don't skip
+  }
 }
 
 function isOriginAllowed(origin: string, cfg: Deps["cfg"]): boolean {
-  if (cfg.mcpAllowedOrigins.length && cfg.mcpAllowedOrigins.includes(origin)) return true;
-  try {
-    const hostname = new URL(origin).hostname;
-    return TRUSTED_LOOPBACK_HOSTNAMES.has(hostname);
-  } catch {
-    return false; // an Origin header that isn't a parseable URL is never legitimate
+  const hostname = canonicalOriginHostname(origin);
+  if (hostname === null) return false; // malformed Origin — fail closed
+  if (TRUSTED_LOOPBACK_HOSTNAMES.has(hostname)) return true;
+  return cfg.mcpAllowedOrigins.some((entry) => canonicalOriginHostname(entry) === hostname);
+}
+
+// Scans req.raw.rawHeaders (the UN-collapsed wire-level header list — Node's parser preserves
+// every repeated header line here, whereas req.headers.host would already be Node's own
+// comma-joined/last-wins view for a header that legitimately appeared more than once) for how
+// many times a given header name appears, case-insensitively (HTTP header names are case-
+// insensitive). rawHeaders is a flat [name, value, name, value, ...] array — odd indices hold
+// values, so only even indices (names) are compared. A count > 1 means the client (or a
+// rebinding-adjacent proxy) sent the same security-relevant header twice; per Fix 1 that is
+// ALWAYS ambiguous enough to reject outright rather than pick one value to validate.
+function countRawHeader(rawHeaders: string[], name: string): number {
+  let count = 0;
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (rawHeaders[i]?.toLowerCase() === name) count++;
   }
+  return count;
 }
 
 // Registers the session-stateful Streamable-HTTP MCP endpoint at /mcp. Returns closeAll() so
@@ -67,17 +129,46 @@ export function registerMcp(app: FastifyInstance, deps: Deps): { closeAll: () =>
   // req.url, rather than inside a child-context .register() plugin) — this endpoint is the only
   // one on this Fastify instance carrying MCP's DNS-rebinding exposure (Streamable-HTTP is
   // reachable from a browser tab; every other REST route here is a plain fetch()/curl target
-  // consumed by tooling, not a page-navigable endpoint the rebinding attack needs). A malformed
-  // or absent Host header is impossible in practice (Node's HTTP parser requires it for HTTP/1.1),
-  // but Origin is legitimately absent for same-origin non-browser clients (curl, the MCP SDK's
-  // own client, server-to-server calls) — so Origin is checked only when present, matching the
-  // brief's "reject with 403 when Host/Origin is present and not in the allowlist" wording.
+  // consumed by tooling, not a page-navigable endpoint the rebinding attack needs).
+  //
+  // Route match is the EXACT pathname "/mcp" (query string, if any, stripped before comparing),
+  // not a startsWith("/mcp") prefix — a prefix match would also catch a hypothetical future
+  // "/mcpfoo" route that has nothing to do with this guard's threat model.
+  //
+  // Fix 1 — this hook now fails CLOSED on every ambiguous or malformed case, not just a
+  // present-and-untrusted one:
+  //   1. Missing/empty Host → 403. A same-origin browser request ALWAYS carries a Host header
+  //      (Node's HTTP/1.1 parser requires one) — a request that arrives here with none is
+  //      already suspicious, and the old `if (host && !allowed)` shape silently let it through
+  //      (skipped the check entirely rather than rejecting), which is the fail-OPEN bug Fix 1
+  //      closes. Falsy/absent Host is now treated identically to an unparseable one.
+  //   2. Duplicate Host or duplicate Origin (checked against the UN-collapsed req.raw.rawHeaders,
+  //      not the already-collapsed req.headers view) → 403. Two Host lines on the wire is never
+  //      legitimate HTTP and is a classic header-smuggling/proxy-confusion shape — reject instead
+  //      of validating whichever value Node's parser happened to keep.
+  //   3. Malformed authority (canonicalHostname()/canonicalOriginHostname() return null — e.g.
+  //      "localhost:bad", or a comma-joined join-artifact string) → 403.
+  //   4. Origin is still optional (curl, the MCP SDK's own client, and other non-browser callers
+  //      legitimately send none) — but a PRESENT Origin must resolve to an allowed hostname; it is
+  //      no longer possible for a present-but-malformed Origin to slip through unchecked.
   app.addHook("onRequest", async (req, reply) => {
-    if (!req.url.startsWith("/mcp")) return;
-    const host = req.headers.host;
-    if (host && !isHostAllowed(host, deps.cfg)) {
-      return reply.status(403).send({ error: `Host ${JSON.stringify(host)} is not allowed — set DEVDB_MCP_ALLOWED_HOSTS to permit it` });
+    const pathname = req.url.split("?")[0];
+    if (pathname !== "/mcp") return;
+
+    const rawHeaders = req.raw.rawHeaders;
+    if (countRawHeader(rawHeaders, "host") > 1) {
+      return reply.status(403).send({ error: "duplicate Host header is not allowed" });
     }
+    if (countRawHeader(rawHeaders, "origin") > 1) {
+      return reply.status(403).send({ error: "duplicate Origin header is not allowed" });
+    }
+
+    const host = req.headers.host;
+    const hostname = host ? canonicalHostname(host) : null;
+    if (hostname === null || !isHostAllowed(hostname, deps.cfg)) {
+      return reply.status(403).send({ error: `Host ${JSON.stringify(host ?? null)} is not allowed — set DEVDB_MCP_ALLOWED_HOSTS to permit it` });
+    }
+
     const origin = req.headers.origin;
     if (origin && !isOriginAllowed(origin, deps.cfg)) {
       return reply.status(403).send({ error: `Origin ${JSON.stringify(origin)} is not allowed — set DEVDB_MCP_ALLOWED_ORIGINS to permit it` });
@@ -111,12 +202,18 @@ export function registerMcp(app: FastifyInstance, deps: Deps): { closeAll: () =>
         },
       });
       // onclose is a post-construction property (not a ctor option — sdk-notes.md), fired when
-      // the transport itself closes for any reason (client disconnect, error, or our own
-      // store.delete()/closeAll() calling transport.close()). Idempotent: store.delete() no-ops
-      // if the id is already gone (e.g. this firing as a side effect of a sweep-triggered close).
+      // the transport itself closes for ANY reason — including a close WE initiated (store.
+      // delete()/sweep()/closeAll() all call transport.close()). That "any reason" is exactly
+      // why onclose must be PURE MAP REMOVAL and must never itself call transport.close() (Fix
+      // 2): on the CLIENT-DISCONNECT path, the SDK closes the transport on its own → onclose
+      // fires while the session-store entry is still present → if onclose called store.delete()
+      // (which itself calls transport.close()), the transport would be closed a SECOND time.
+      // removeEntry() is the pure-removal primitive (no close() call) that lets this callback
+      // just drop the map entry; delete()/sweep()/closeAll() remain the sole owners of actually
+      // calling transport.close(), on the paths WE initiate.
       transport.onclose = () => {
         const id = transport.sessionId;
-        if (id) void store.delete(id);
+        if (id) store.removeEntry(id);
       };
 
       await server.connect(transport);
