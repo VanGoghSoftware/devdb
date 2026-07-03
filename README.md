@@ -39,6 +39,32 @@ Time travel:
     # discard a branch's changes (back to parent state)
     curl -X POST http://localhost:4400/api/branches/<id>/reset
 
+## MCP server (for AI agents)
+
+DevDB exposes an MCP server at `http://localhost:4400/mcp` (Streamable HTTP). Register it:
+
+    claude mcp add --transport http devdb http://localhost:4400/mcp
+
+Tools: `list_projects`, `create_project`, `list_branches`, `create_branch` (auto-starts an endpoint
+and returns a connection string), `get_branch`, `stop_endpoint`, `delete_branch`, `reset_branch`,
+`restore_branch`, `get_status`. (Import/export tools arrive in a later release.)
+
+The server is unauthenticated (localhost trust) but validates `Host`/`Origin` to block DNS-rebinding.
+Reaching it from another host or a custom hostname:
+
+- Publish wider by overriding the compose port binding (drop the `127.0.0.1:` prefix) — you accept the exposure.
+- Add the hostname to the allowlist: `DEVDB_MCP_ALLOWED_HOSTS=myhost:4400` / `DEVDB_MCP_ALLOWED_ORIGINS=http://myhost:4400`.
+
+## Agent skills
+
+Copy the shipped skills into your agent's skills directory:
+
+    cp -r skills/using-devdb skills/safe-db-migrations ~/.claude/skills/     # global
+    # or into a project: cp -r skills/* /path/to/repo/.claude/skills/
+
+Even with no skills installed, connected agents receive the core branch-per-task workflow via the
+MCP server's `initialize` instructions.
+
 ## Troubleshooting
 
 **"lockfile /data/.lock exists" on startup.** DevDB uses an exclusive-create
@@ -59,7 +85,7 @@ so no separate log file to find.
 
 Status: Phase 1 is complete — engine, branching, endpoints, time travel, logs
 (SSE), and restart resilience are all live and integration-proven end to end.
-Web UI, an MCP server for agents, import/export, and S3/Azure durability land
-in subsequent phases.
+Phase 2 (MCP server + agent skills) is live per above. Web UI, import/export,
+and S3/Azure durability land in subsequent phases.
 Built on [Neon](https://github.com/neondatabase/neon)'s storage engine;
 architecture informed by [neond](https://github.com/matisiekpl/neond) (Apache 2.0).
