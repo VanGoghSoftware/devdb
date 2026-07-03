@@ -78,6 +78,8 @@ Facts the tasks depend on (all already verified — do not re-derive the hard wa
 
 Make `startLocked`/`stopLocked` impossible to call without holding the branch's queue lane, replacing the JSDoc-only contract. `BranchQueue.run` mints a branded `Lane` and passes it to the work function; the locked methods require it and assert it matches the branch they operate on. Bonus: close the "empty-lane micro-window" (handover §9) where the swap starts an endpoint on the freshly-created `swapped.id` while holding the *archived* id's lane.
 
+> **AMENDED (2026-07-03, execution):** two corrections landed during implementation/review. (1) Step 3's `declare const laneBrand: unique symbol;` is a type-only ambient declaration that erases at runtime — used as a computed key in a live object it throws `ReferenceError`. Use a real runtime symbol: `const laneBrand: unique symbol = Symbol("lane");`. (2) The branded lane proves *provenance* but not *liveness*; a review gate showed a retained lane would still satisfy the assertion. The lane is now **turn-scoped**: `BranchQueue` holds a `private activeLanes = new WeakSet<Lane>()` (add before `fn(lane)`, remove once it settles via `.finally`) and exposes `assertLane(lane, branchId)` that throws unless the lane is *currently active* AND its `branchId` matches; `startLocked`/`stopLocked` call `this.deps.queue.assertLane(...)` (the local helper is gone). Commits 49ec09a (initial) + 63f1dff (turn-scoping). Keep `laneBrand` un-exported.
+
 **Files:**
 - Modify: `packages/daemon/src/state/queue.ts`
 - Modify: `packages/daemon/src/services/endpoints.ts:15-18,31-150`
