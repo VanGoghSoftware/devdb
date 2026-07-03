@@ -9,6 +9,7 @@ import { ManagedProcess } from "../engine/process.js";
 import { computeConfigJson } from "./spec.js";
 import { PG_HBA } from "./pgconf.js";
 import { allocatePort } from "./ports.js";
+import { waitComputeReady } from "./readiness.js";
 
 interface RunningCompute {
   proc: ManagedProcess | null;
@@ -24,7 +25,16 @@ export class ComputeManager {
   private computes = new Map<string, RunningCompute>();
   private reservedPorts = new Set<number>();
 
-  constructor(private cfg: DevdbConfig, private logger: Logger) {}
+  // `waitComputeReady` is an injected 3rd (optional) positional dependency — defaulting to the
+  // real poller — rather than a hardcoded call, so unit tests that exercise the real start()
+  // (manager.test.ts mocks ManagedProcess but not this) never hit the global `fetch`: they pass a
+  // fast-resolving fake here instead. Kept positional (not folded into a deps bag) to match this
+  // class's existing (cfg, logger) constructor shape rather than introduce a second pattern.
+  constructor(
+    private cfg: DevdbConfig,
+    private logger: Logger,
+    private waitReady: typeof waitComputeReady = waitComputeReady,
+  ) {}
 
   statusOf(branchId: string): EndpointStatus {
     const c = this.computes.get(branchId);
@@ -138,17 +148,27 @@ export class ComputeManager {
         },
       });
       await entry.proc.start();
+      // Structural readiness gate (handover §4.3): the needle fires ~80-140ms before apply_spec
+      // commits the branch's SCRAM verifier; block until compute_ctl_up{status="running"}.
+      await this.waitReady(metricsPort);
       entry.phase = "running";
       return { port };
     } catch (e) {
       // Failure cleanup follows stop()'s settlement order. Map entry first and unconditionally:
       // a stale entry here makes every later start() for this branch throw "already ..." until
-      // the daemon restarts. Dir cleanup next — a launch that died mid-start (e.g. the readiness
-      // timeout SIGKILLing compute_ctl) orphans a live postgres exactly like stop() does, so it
-      // gets the same reap+rm treatment. removeComputeDir never throws: `e`, the reason the
-      // launch failed, is what the caller needs to see — never a secondary rm failure. Ports
-      // LAST: until the reap has killed the orphan they may still be bound, and releasing them
-      // earlier would make them eligible for re-allocation while the orphan still holds them.
+      // the daemon restarts. Task 5: waitReady() throwing (readiness timeout, or status="failed")
+      // fires strictly AFTER entry.proc.start() has already resolved successfully — unlike the
+      // OLD single readiness gate inside ManagedProcess.start() (which SIGKILLs its own child on
+      // ITS OWN timeout, see process.ts), a live compute_ctl here would otherwise never be told to
+      // stop, orphaning it exactly like a caller-forgotten stop() would. Explicitly stop the proc
+      // BEFORE the dir/reap cleanup below, so removeComputeDir's reapOrphanedPostgres (which only
+      // scans for the POSTGRES child, not compute_ctl itself) races a compute_ctl already on its
+      // way down rather than one still fully alive and holding the pgdata directory open.
+      // entry.proc is only unset here if the throw happened BEFORE it was constructed (port/dir
+      // setup above); once constructed, proc.stop() is a safe no-op if compute_ctl already exited
+      // on its own (e.g. ManagedProcess.start()'s OWN readiness-needle timeout already SIGKILLed
+      // it — see process.ts's catch — so this call just observes an already-null child and returns).
+      if (entry.proc) await entry.proc.stop();
       if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
       if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
       if (entry.port !== null) this.reservedPorts.delete(entry.port);

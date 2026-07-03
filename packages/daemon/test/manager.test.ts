@@ -33,6 +33,7 @@ import { loadConfig } from "../src/config.js";
 import { newHexId } from "../src/engine/ids.js";
 import { ComputeManager } from "../src/compute/manager.js";
 import { ManagedProcess } from "../src/engine/process.js";
+import type { waitComputeReady } from "../src/compute/readiness.js";
 import type { BranchRow } from "../src/state/repos.js";
 import type { Logger } from "../src/logging/logger.js";
 
@@ -54,6 +55,15 @@ function freshCfg(extraEnv: Record<string, string> = {}) {
 // Logger shape so `new ComputeManager(cfg, fakeLogger())` typechecks.
 function fakeLogger(): Logger {
   return { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+}
+
+// Task 5: ComputeManager's 3rd (optional) constructor arg injects waitComputeReady — the real
+// implementation polls `fetch` against 127.0.0.1:<metricsPort>/metrics, which must never run
+// inside a unit test (no live compute_ctl exists here). This fake resolves immediately,
+// preserving every existing test's assumption that manager.start() settles as soon as the
+// (mocked) ManagedProcess.start() does, without needing to touch any of their assertions.
+function fakeWaitReady(): typeof waitComputeReady {
+  return vi.fn(async () => {});
 }
 
 function fakeBranch(overrides: Partial<BranchRow> = {}): BranchRow {
@@ -91,7 +101,7 @@ describe("ComputeManager", () => {
   it("start() constructs ManagedProcess with the oracle launch contract and writes config files", async () => {
     startMock.mockResolvedValueOnce(undefined);
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
 
     const { port } = await manager.start({ branch, pgVersion: 17 });
@@ -149,7 +159,7 @@ describe("ComputeManager", () => {
       () => new Promise<void>((resolve) => { releaseFirstStart = resolve; }),
     );
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
 
     const firstStart = manager.start({ branch, pgVersion: 17 });
@@ -169,7 +179,7 @@ describe("ComputeManager", () => {
   it("cleans up the map entry, temp dir, and reserved ports when the launch fails", async () => {
     startMock.mockRejectedValueOnce(new Error("compute_ctl exploded"));
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
 
     await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl exploded");
@@ -195,7 +205,7 @@ describe("ComputeManager", () => {
   it("start() failure cleanup retries reap+rm on ENOTEMPTY and still throws the launch error", async () => {
     startMock.mockRejectedValueOnce(new Error("compute_ctl not ready within 50000ms"));
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
 
     let dirSeen = "";
@@ -228,7 +238,7 @@ describe("ComputeManager", () => {
   it("start() failure cleanup never masks the launch error when rm fails persistently, and the branch stays restartable", async () => {
     startMock.mockRejectedValueOnce(new Error("compute_ctl exploded"));
     const cfg = freshCfg({ DEVDB_PORT_RANGE: "54332-54332" });
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
 
     rmMock.mockImplementation(async () => {
@@ -263,7 +273,7 @@ describe("ComputeManager", () => {
       () => new Promise<void>((resolve) => { releaseStart = resolve; }),
     );
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     const received: string[] = [];
 
@@ -294,7 +304,7 @@ describe("ComputeManager", () => {
       () => new Promise<void>((_resolve, reject) => { rejectStart = reject; }),
     );
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     const received: string[] = [];
 
@@ -316,7 +326,7 @@ describe("ComputeManager", () => {
       () => new Promise<void>((resolve) => { releaseStop = resolve; }),
     );
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     await manager.start({ branch, pgVersion: 17 });
 
@@ -342,7 +352,7 @@ describe("ComputeManager", () => {
   it("stop() retries reap+rm once when pg_data is repopulated behind the first rm (ENOTEMPTY)", async () => {
     startMock.mockResolvedValueOnce(undefined);
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     await manager.start({ branch, pgVersion: 17 });
 
@@ -375,7 +385,7 @@ describe("ComputeManager", () => {
     // restart at the end would have nowhere to allocate and throw PortExhaustedError instead
     // of reusing it.
     const cfg = freshCfg({ DEVDB_PORT_RANGE: "54331-54331" });
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54331 });
     const computesDir = join(cfg.dataDir, "computes");
@@ -403,7 +413,7 @@ describe("ComputeManager", () => {
   it("isolates onLine listeners: a throwing listener does not prevent later listeners from receiving the line", async () => {
     startMock.mockResolvedValueOnce(undefined);
     const cfg = freshCfg();
-    const manager = new ComputeManager(cfg, fakeLogger());
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
     const branch = fakeBranch();
     await manager.start({ branch, pgVersion: 17 });
 

@@ -232,13 +232,14 @@ describe("SqlService", () => {
 
   // Live-found correction: the first version of this test asserted end() is NOT called on a
   // connect() failure (reasoning: the brief's snippet wraps only client.query() in try/finally).
-  // That held for the brief's original single-Client design, but connectWithRetry's corrected,
-  // real-pg.Client-compatible implementation (see its own doc comment) DOES call client.end() in
-  // its catch block on every failed attempt, retriable or not — a non-auth connect() failure can
-  // still leave a partially-open TCP socket (auth happens after transport connects), and pg's own
-  // end() is a documented no-op when the connection truly never got underway, so calling it
-  // unconditionally here is safe cleanup, not a possibly-erroring extra call against nothing.
-  it("ends the client's connection attempt even on a non-retriable connect() failure", async () => {
+  // That held for the brief's original single-Client design, but sql.ts's connect() is now wrapped
+  // in its OWN try/catch (Task 5, replacing connectWithRetry — see the doc comment above the
+  // client construction) that calls client.end() on any connect() failure — a non-auth connect()
+  // failure can still leave a partially-open TCP socket (auth happens after transport connects),
+  // and pg's own end() is a documented no-op when the connection truly never got underway, so
+  // calling it unconditionally here is safe cleanup, not a possibly-erroring extra call against
+  // nothing.
+  it("ends the client's connection attempt even on a connect() failure", async () => {
     mockConnect.mockRejectedValueOnce(new Error("connection refused"));
     const branches = fakeBranches();
     const { endpoints } = fakeEndpoints();
@@ -248,64 +249,28 @@ describe("SqlService", () => {
     expect(mockEnd).toHaveBeenCalledTimes(1);
   });
 
-  // Live-found (this task, running the acceptance test against a real container): CONFIRMED the
-  // SAME race tests/integration/helpers/pg.ts's connectWithRetry() already documents from Task 14
-  // — compute_ctl matches ComputeManager's readyNeedle ("listening on IPv4 address", the
-  // postmaster socket bind) and EndpointsService reports "running" *before* compute_ctl has
-  // finished reconciling the SCRAM password/role, so a connect() issued immediately after
-  // ensureRunning() resolves can land in that gap and fail with
-  // "password authentication failed for user \"postgres\"" even though the password is correct
-  // and a retry ~100ms later against a FRESH socket succeeds. pg.ts's helper papers over this for
-  // TEST connections; SqlService is PRODUCTION code hit by every POST /api/sql against a
-  // just-started endpoint (ensureRunning() is called unconditionally on every request — see its
-  // own doc comment) and had no retry at all, so it inherited the exact same race live. Bounded
-  // retry (5 attempts x 200ms = up to 1s) ONLY on that specific auth-failure message — any other
-  // connect() failure (wrong port, refused, host down) must still surface on the very first
-  // attempt with no added latency, since every other failure mode looks identical from here and
-  // waiting out the full retry budget on a genuine failure would be a needless multi-second stall
-  // on every truly-broken request.
-  //
-  // Live-found correction (second pass): the FIRST version of this test asserted ClientMock was
-  // called exactly once — i.e. that retries reuse one Client instance's .connect(). That passed
-  // against the ORIGINAL (too-permissive) mock but failed immediately against a real container,
-  // because real pg.Client instances are single-use (see the ClientMock comment above). This
-  // version (and the mock it now runs against) both encode the corrected, real-library-verified
-  // contract: a FRESH Client per retry attempt, with each failed attempt's client .end()'d before
-  // the next attempt's Client is constructed.
-  it("retries connect() on the compute_ctl SCRAM-readiness race (password auth failure immediately after start), succeeding once the role settles", async () => {
-    mockConnect
-      .mockRejectedValueOnce(new Error('password authentication failed for user "postgres"'))
-      .mockRejectedValueOnce(new Error('password authentication failed for user "postgres"'))
-      .mockResolvedValueOnce(undefined);
-    const branches = fakeBranches();
-    const { endpoints } = fakeEndpoints();
-    const sql = new SqlService({ branches, endpoints });
-
-    await sql.run("branch-1", "SELECT 1");
-
-    expect(mockConnect).toHaveBeenCalledTimes(3);
-    // A fresh pg.Client per attempt (3 total: 2 failed + 1 successful) — matches real pg.Client's
-    // single-use-per-instance contract (see ClientMock's own comment above).
-    expect(ClientMock).toHaveBeenCalledTimes(3);
-    // Each of the 2 FAILED attempts' clients is .end()'d (cleanup for the auth-failure case, where
-    // the TCP socket did open) PLUS the eventually-successful connection's own post-query .end() —
-    // 3 total, one per Client instance ever constructed here.
-    expect(mockEnd).toHaveBeenCalledTimes(3);
-  });
-
-  it("gives up after exhausting retries on a PERSISTENT auth failure and surfaces the auth error", async () => {
-    mockConnect.mockRejectedValue(new Error('password authentication failed for user "postgres"'));
+  // Task 5: this file used to carry two tests here asserting connectWithRetry()'s bounded-retry
+  // behavior on "password authentication failed" — that behavior is GONE. The race it papered
+  // over (compute_ctl's readyNeedle firing before apply_spec committed the branch's first-ever
+  // SCRAM verifier) is now closed structurally: ComputeManager.start() blocks on
+  // waitComputeReady() polling compute_ctl_up{status="running"} (set strictly after apply_spec
+  // commits — handover §4.3; compute/readiness.ts) before EndpointsService/ensureRunning() ever
+  // reports the endpoint "running". So SqlService has no retry logic left to test — the two tests
+  // below prove the replacement invariant instead: exactly ONE connect() attempt, whatever the
+  // failure, with the partially-open socket still cleaned up via end().
+  it("surfaces a connect() auth failure on the FIRST attempt — no retry left to mask it (readiness gate replaces it)", async () => {
+    mockConnect.mockRejectedValueOnce(new Error('password authentication failed for user "postgres"'));
     const branches = fakeBranches();
     const { endpoints } = fakeEndpoints();
     const sql = new SqlService({ branches, endpoints });
 
     await expect(sql.run("branch-1", "SELECT 1")).rejects.toThrow(/password authentication failed/);
-    expect(mockConnect).toHaveBeenCalledTimes(5);
-    expect(ClientMock).toHaveBeenCalledTimes(5); // a fresh Client per attempt, all 5 exhausted
-    expect(mockEnd).toHaveBeenCalledTimes(5); // every failed attempt's client is cleaned up
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+    expect(ClientMock).toHaveBeenCalledTimes(1);
+    expect(mockEnd).toHaveBeenCalledTimes(1); // cleanup for the auth-failure case (TCP socket did open)
   });
 
-  it("does NOT retry a connect() failure that isn't the auth-race message — surfaces immediately", async () => {
+  it("does not retry a connect() failure that isn't auth-shaped either — surfaces immediately", async () => {
     mockConnect.mockRejectedValueOnce(new Error("connection refused"));
     const branches = fakeBranches();
     const { endpoints } = fakeEndpoints();

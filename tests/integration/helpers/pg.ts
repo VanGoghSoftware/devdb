@@ -5,54 +5,26 @@ import type { Devdb } from "./container.js";
 // connect()/api() so later integration tests (endpoints, PITR, etc.) import the same
 // implementation instead of re-declaring it per test file.
 
-// CONFIRMED live (Task 14): a real race in compute_ctl's own startup sequence — POST
-// .../endpoint/start returns 200 (compute_ctl matched the "listening on IPv4 address" ready
-// needle, EndpointsService.start() correctly reports "running") slightly *before* SCRAM auth
-// against the configured role is actually usable. Reproduced in isolation outside any test
-// framework: connecting within ~10ms of a 200 response reliably fails with "password
-// authentication failed for user postgres"; a bare retry ~100ms later against the exact same
-// socket succeeds. This is not a config-generation bug (manually verified: psql from inside the
-// container and a bare `pg` client from the host both authenticate correctly against a
-// freshly-started endpoint once given a moment) — it's a brief window between "postmaster is
-// listening" and "role/password reconciliation has landed". A bounded retry-on-auth-failure is
-// the same discipline any real client (including Phase 2's MCP layer) will need against the
-// actual engine, so it belongs here rather than masked by a manager.ts/spec.ts launch-arg change.
-// Capped at 10 attempts x 150ms = 1.5s: long enough to ride out the compute_ctl readiness window
-// described above, short enough that a genuinely-wrong password fails the test in ~1.5s instead
-// of hanging. Tradeoff: a PERSISTENT auth failure (wrong password, not a timing race) burns the
-// full 1.5s window before surfacing, since every attempt looks identical from here — that's an
-// accepted test-helper cost, not a fix; the actual daemon-side readiness signal is tracked
-// separately rather than papered over by a longer client-side retry loop.
-async function connectWithRetry(config: pg.ClientConfig, attempts = 10, delayMs = 150): Promise<pg.Client> {
-  let lastErr: unknown;
-  const start = Date.now();
-  for (let i = 0; i < attempts; i++) {
-    const client = new pg.Client(config);
-    try {
-      await client.connect();
-      if (i > 0) console.log(`connectWithRetry: succeeded after ${i + 1} attempt(s), ${Date.now() - start}ms elapsed`);
-      return client;
-    } catch (e) {
-      lastErr = e;
-      await client.end().catch(() => {});
-      const message = e instanceof Error ? e.message : String(e);
-      if (!message.includes("password authentication failed")) throw e; // a different failure must surface immediately
-      await new Promise((res) => setTimeout(res, delayMs));
-    }
-  }
-  console.log(`connectWithRetry: exhausted ${attempts} attempts, ${Date.now() - start}ms elapsed`);
-  throw lastErr;
-}
-
+// Task 5: connectWithRetry() (bounded retry on "password authentication failed", Task 14) used
+// to paper over a real race in compute_ctl's startup — POST .../endpoint/start could return 200
+// (readyNeedle matched, EndpointsService reports "running") slightly BEFORE apply_spec had
+// actually committed the branch's first-ever SCRAM verifier, so a connect() issued immediately
+// after could land in that gap. That gap is now closed structurally: ComputeManager.start()
+// blocks on waitComputeReady() polling compute_ctl_up{status="running"} — set strictly AFTER
+// apply_spec commits (handover §4.3; packages/daemon/src/compute/readiness.ts) — before the
+// endpoint is ever reported "running", so a connect() issued right after this helper's caller
+// sees a 200 no longer needs (or should mask) that specific failure mode.
 export async function connect(dev: Devdb, connectionString: string): Promise<pg.Client> {
   const url = new URL(connectionString);
-  return connectWithRetry({
+  const client = new pg.Client({
     host: "localhost",
     port: dev.mappedPort(Number(url.port)),
     user: url.username,
     password: decodeURIComponent(url.password),
     database: url.pathname.slice(1),
   });
+  await client.connect();
+  return client;
 }
 
 export async function api<T>(dev: Devdb, method: string, path: string, body?: unknown): Promise<T> {
