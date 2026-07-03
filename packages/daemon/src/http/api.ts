@@ -15,6 +15,7 @@ import type { SqlService } from "../services/sql.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
 import { daemonLogChannel } from "../logging/logger.js";
+import { registerMcp } from "../mcp/http.js";
 
 // T16 rider (ledgered at Task 12, optional): /api/status's top-level "version" comes from this
 // package's own package.json instead of a hand-maintained literal. Read once at module load —
@@ -23,7 +24,7 @@ import { daemonLogChannel } from "../logging/logger.js";
 // under the package root (src/http/ and dist/http/ mirror each other — rootDir:"src",
 // outDir:"dist"). A read failure here would be a packaging bug worth surfacing loudly rather
 // than papering over with a silent fallback string.
-const PACKAGE_VERSION = (
+export const PACKAGE_VERSION = (
   JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as { version: string }
 ).version;
 
@@ -73,8 +74,17 @@ export function buildServer(deps: Deps): FastifyInstance {
   // hang for as long as any client stays connected, silently eating this daemon's 45s hard-exit
   // budget in index.ts's shutdown() before engine/computes ever get torn down.
   const openSseResponses = new Set<FastifyReply["raw"]>();
+
+  // Mounted here (before the preClose hook below references it) so the session-stateful /mcp
+  // transport's own in-flight streams get the same shutdown treatment as SSE: registerMcp's
+  // closeAll() drains every open MCP session (clears the idle-sweep interval, closes every
+  // transport) within the daemon's 45s shutdown budget, instead of letting index.ts's hard-exit
+  // escalation be the only thing that ever ends them.
+  const mcp = registerMcp(app, deps);
+
   app.addHook("preClose", async () => {
     for (const raw of openSseResponses) raw.end();
+    await mcp.closeAll();
   });
 
   // Replays recent() (bounded ring, oldest-first) as one SSE event per line, then subscribes for

@@ -17,6 +17,8 @@ const EnvSchema = z.object({
   DEVDB_PORT_RANGE: z.string().regex(/^\d+-\d+$/).default("54300-54339"),
   NEON_BINARIES_DIR: z.string().trim().min(1),
   PG_INSTALL_DIR: z.string().trim().min(1),
+  DEVDB_MCP_ALLOWED_HOSTS: z.string().optional(),
+  DEVDB_MCP_ALLOWED_ORIGINS: z.string().optional(),
 });
 
 export interface DevdbConfig {
@@ -34,6 +36,8 @@ export interface DevdbConfig {
     safekeeperPgPort: 5454;
     safekeeperHttpPort: 7676;
   };
+  mcpAllowedHosts: string[];
+  mcpAllowedOrigins: string[];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
@@ -88,5 +92,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     neonBinDir: e.NEON_BINARIES_DIR,
     pgInstallDir: e.PG_INSTALL_DIR,
     engine: { ...ENGINE_PORTS },
+    mcpAllowedHosts: e.DEVDB_MCP_ALLOWED_HOSTS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
+    mcpAllowedOrigins: e.DEVDB_MCP_ALLOWED_ORIGINS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
   };
 }
