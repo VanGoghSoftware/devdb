@@ -201,6 +201,11 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
   // MCP session's own captured clientInfo (ctx.clientInfo(), below), never accepted as caller
   // input. Accepting it here would let a caller spoof which agent/version actually made the fork,
   // defeating the whole point of recording it.
+  //
+  // Fix 2 (task-10 fix wave, fold): this shape has NO `client` key at all — the SDK's own zod
+  // validation strips an adversarial `context.client` before the handler below ever sees it, so
+  // the spoof-safety guarantee holds independent of the merge's spread order (belt AND suspenders
+  // with `{ ...(context ?? {}), client: ctx.clientInfo() }` below, which overwrites it either way).
   const BranchContextInputShape = {
     git_branch: z.string().optional(),
     workdir: z.string().optional(),
@@ -236,7 +241,35 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     const branch = await deps.services.branches.create({
       projectId: p.id, name, parentBranchId: parentRow?.id, atLsn, createdBy: "mcp", context: merged,
     });
-    const detail = await deps.services.endpoints.ensureRunning(branch.id);
+
+    // Fix 1 (task-10 fix wave, Important): the branch (the valuable data fork) already exists at
+    // this point — ONLY the auto-start is wrapped here, so a pre-create failure (bad project/
+    // parent, above) still flows through the shared guard() normally. If ensureRunning() throws
+    // (port exhaustion, compute launch failure), letting that escape to guard() would turn a
+    // partial success into an opaque, generic error — the agent would see a failure, retry
+    // create_branch with the SAME name, hit a 409 duplicate, and be stuck with an orphaned branch
+    // it doesn't know exists. Do NOT delete the branch (the endpoint is restartable —
+    // EndpointsService.startLocked's own catch block already persisted a durable `endpointError` on
+    // the branch row before re-throwing, services/endpoints.ts) — instead read the branch back to
+    // surface that persisted error, and name the recovery so a retry uses get_branch, never another
+    // create_branch.
+    let detail;
+    try {
+      detail = await deps.services.endpoints.ensureRunning(branch.id);
+    } catch {
+      // Re-fetch the row by id (not `branches.detail(branch)` with the pre-start `branch` object
+      // in hand) — `detail()` only re-derives LIVE compute status/port on top of whatever row it's
+      // handed, it does NOT re-read the row from SQLite itself, so the stale in-memory `branch`
+      // from before ensureRunning() ran would still show `endpointError: null` even though
+      // startLocked's catch block just persisted it.
+      const failed = await deps.services.branches.detail(deps.services.branches.byIdOr404(branch.id));
+      return errorResult(
+        `${contextLine({ project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" })}\n` +
+        `  branch CREATED, but its endpoint failed to start: ${failed.endpointError ?? "unknown error"}\n` +
+        `Next: fix the cause and call get_branch "${branch.name}" to retry the endpoint, or delete_branch "${branch.name}" to discard.`,
+      );
+    }
+
     const dto = toBranchDto(detail);
     return text(
       `${contextLine({ project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" })}\n` +

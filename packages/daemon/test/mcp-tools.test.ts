@@ -400,5 +400,131 @@ describe("MCP read tools", () => {
       const res = await h.call("create_branch", { project: "shop", name: "agent/try-index" });
       expect(firstText(res)).not.toMatch(/password/i);
     });
+
+    // Fix 1 (task-10 fix wave, Important): create_branch persists the branch THEN calls
+    // ensureRunning() to auto-start its endpoint. If ensureRunning() throws (port exhaustion,
+    // compute launch failure), the branch (the valuable data fork) already exists — the pre-fix
+    // behavior let the shared guard() turn this into an opaque "internal error" / raw message, so
+    // an agent seeing an error would retry create_branch with the SAME name, hit a 409 duplicate,
+    // and be stuck with an orphaned branch it doesn't know about. The branch must NOT be deleted
+    // (the endpoint is restartable — EndpointsService.startLocked's catch block, services/
+    // endpoints.ts, ALREADY persists a durable endpointError on the branch row via
+    // state.branches.updateEndpoint(..., {status:"failed", error}), exactly like
+    // endpoints-service.test.ts's own "durably records the error message" fixture), so the fix
+    // reads the branch back after the failure and surfaces that persisted error + a recovery path
+    // naming get_branch/delete_branch — never another create_branch (which would just 409).
+    it("when auto-start fails after the branch is created, reports a partial success naming the branch + endpoint_error + recovery, and does NOT delete the branch", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      vi.mocked(h.engineFakes.computes.start).mockRejectedValueOnce(new Error("compute_ctl exited before ready"));
+
+      const res = await h.call("create_branch", { project: "shop", name: "agent/try-index" });
+
+      // (a) names the created branch — same context-line contract as every other tool response.
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstLine(firstText(res))).toMatch(/branch "agent\/try-index"/);
+      // The connection string the caller needs is genuinely absent (the endpoint never came up),
+      // so this is still an error result — but a DIFFERENT one from an opaque failure: the body
+      // must (b) state the branch was created, name the endpoint failure/persisted endpoint_error,
+      // and point at get_branch/delete_branch — not another create_branch (which would 409).
+      expect(res.isError).toBe(true);
+      const body = firstText(res);
+      expect(body.toLowerCase()).toMatch(/created/);
+      expect(body).toMatch(/compute_ctl exited before ready/);
+      expect(body).toMatch(/get_branch/);
+      expect(body).toMatch(/delete_branch/);
+
+      // (c) the branch STILL EXISTS — a follow-up list_branches shows it, proving create_branch
+      // did not compensate/delete it away.
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/agent\/try-index/);
+    });
+
+    // Fix 2 (task-10 fix wave, fold): pins the spoof-safety property with an adversarial test —
+    // the merge (`{ ...(context ?? {}), client: ctx.clientInfo() }`) is spoof-safe because `client`
+    // is spread LAST (overwriting anything the caller could otherwise smuggle in under that key)
+    // AND the input schema (BranchContextInputShape, above) has no `client` key at all, so the SDK
+    // itself would strip it before tools.ts ever sees it — belt and suspenders. No prior test
+    // actually supplied an ADVERSARIAL client value; this one does, with the harness's OWN
+    // captured clientInfo deliberately set to a DIFFERENT value than the spoofed one, so a
+    // regression that accidentally let caller input win (e.g. spread-order flip) would be caught.
+    it("drops a caller-supplied context.client (schema has no such key) — the SERVER-captured session client always wins", async () => {
+      h = await makeReadToolsHarness({ clientInfo: { name: "claude-code", version: "9.9" } });
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("create_branch", {
+        project: "shop", name: "agent/try-index",
+        // `client` isn't part of CreateBranchShape's context schema, so the SDK's own validation
+        // should strip it — but even if it somehow reached tools.ts, the merge order must still
+        // win. Passing it via an untyped bag mirrors an adversarial caller who ignores the
+        // declared schema (a real MCP client is not obligated to only ever send valid shapes).
+        context: { purpose: "legit reason", client: { name: "FAKE", version: "0" } } as Record<string, unknown>,
+      });
+      expect(res.isError).toBeFalsy();
+
+      const list = await h.call("list_branches", { project: "shop" });
+      const body = firstText(list);
+      expect(body).toMatch(/claude-code/); // the server-captured session client
+      expect(body).not.toMatch(/FAKE/); // never the caller-spoofed one
+    });
+
+    // Fix 3 (task-10 fix wave, fold): pins persisted ancestry, at_timestamp-on-named-parent, and
+    // createdBy by spying on the actual service calls create_branch makes — not just the response
+    // TEXT (which could say "forked from X" while the underlying create() call received something
+    // else entirely, e.g. main's id by mistake).
+    describe("persisted ancestry, at_timestamp resolution, and createdBy (spy on the service calls)", () => {
+      it("a named-parent fork persists parentBranchId as the PARENT's id, not main's", async () => {
+        h = await makeReadToolsHarness();
+        await h.call("create_project", { name: "shop" });
+        primeRunningAfterStart(h);
+        const project = h.deps.services.projects.byNameOr404("shop");
+        await h.call("create_branch", { project: "shop", name: "feature" });
+        const parent = h.deps.services.branches.byProjectAndNameOr404(project.id, "feature");
+        const main = h.deps.services.branches.byProjectAndNameOr404(project.id, "main");
+        const spy = vi.spyOn(h.deps.services.branches, "create");
+
+        const res = await h.call("create_branch", { project: "shop", name: "feature-child", parent: "feature" });
+
+        expect(res.isError).toBeFalsy();
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ parentBranchId: parent.id }));
+        expect(spy).not.toHaveBeenCalledWith(expect.objectContaining({ parentBranchId: main.id }));
+      });
+
+      it("at_timestamp + a named parent resolves the LSN against the PARENT (not main), and passes the resolved atLsn into branches.create", async () => {
+        h = await makeReadToolsHarness();
+        await h.call("create_project", { name: "shop" });
+        primeRunningAfterStart(h);
+        const project = h.deps.services.projects.byNameOr404("shop");
+        await h.call("create_branch", { project: "shop", name: "feature" });
+        const parent = h.deps.services.branches.byProjectAndNameOr404(project.id, "feature");
+        const main = h.deps.services.branches.byProjectAndNameOr404(project.id, "main");
+        const lsnSpy = vi.spyOn(h.deps.services.timetravel, "lsnAtTimestamp").mockResolvedValueOnce("0/ABCDEF");
+        const createSpy = vi.spyOn(h.deps.services.branches, "create");
+
+        const res = await h.call("create_branch", {
+          project: "shop", name: "pitr-fork", parent: "feature", at_timestamp: "2026-07-01T00:00:00Z",
+        });
+
+        expect(res.isError).toBeFalsy();
+        // resolved against the PARENT's id, never main's.
+        expect(lsnSpy).toHaveBeenCalledWith(parent.id, "2026-07-01T00:00:00Z");
+        expect(lsnSpy).not.toHaveBeenCalledWith(main.id, expect.anything());
+        // the resolved LSN actually reaches branches.create as atLsn.
+        expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ atLsn: "0/ABCDEF" }));
+      });
+
+      it("the happy-path create passes createdBy: \"mcp\" to branches.create", async () => {
+        h = await makeReadToolsHarness();
+        await h.call("create_project", { name: "shop" });
+        primeRunningAfterStart(h);
+        const spy = vi.spyOn(h.deps.services.branches, "create");
+
+        const res = await h.call("create_branch", { project: "shop", name: "agent/try-index" });
+
+        expect(res.isError).toBeFalsy();
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ createdBy: "mcp" }));
+      });
+    });
   });
 });
