@@ -184,18 +184,24 @@ export class ManagedProcess {
     // clearing the SIGKILL timer right then would let that surviving member dodge the escalated
     // group SIGKILL forever (the bug this fix exists to close). So: observe the leader's own exit
     // (still needed — avoids leaving a dangling child ref, and the leader is usually first to
-    // go), then poll the WHOLE GROUP for emptiness up to timeoutMs (from the SIGTERM send, same
-    // budget the non-detached path gives its single child), escalating to a group SIGKILL if
-    // anything in the group is still alive at the deadline.
+    // go), then poll the WHOLE GROUP for emptiness up to timeoutMs (from the SIGTERM send — a
+    // SINGLE deadline covers both the leader-await below and the group-poll after it), escalating
+    // to a group SIGKILL if anything in the group is still alive at the deadline.
     //
-    // `await exited` here is intentionally unbounded by timeoutMs: the only detached caller is
-    // ComputeManager's compute_ctl, whose near-instant exit-on-SIGTERM is a confirmed, cited, live
-    // behavior (handover §8.6) — not a hypothetical this method needs to defend against. A leader
-    // that itself ignored SIGTERM indefinitely would need its own escalation, which is exactly
-    // what the group-SIGKILL below already provides once this resolves; it just wouldn't be
-    // bounded by timeoutMs on the leader-exit leg specifically. Documented, not fixed here.
-    await exited;
+    // `await exited` here is ALSO bounded by that same deadline: the leader itself (not just a
+    // grandchild) can ignore or never process SIGTERM (e.g. a wedged compute_ctl) — without a
+    // bound, that would hang stop() forever, wedging the branch lane stop() runs under, and the
+    // group-poll below (and its SIGKILL escalation) would never run at all. The killer timer is
+    // armed BEFORE the leader-await so a hung leader is force-killed at the deadline; since the
+    // leader is itself a member of the group, that SIGKILL reaches it too (SIGKILL is uncatchable),
+    // so `exited` then resolves and control proceeds into the group-poll exactly as on the normal
+    // path. On the common path (leader exits instantly on SIGTERM) the killer never fires and is
+    // cleared immediately after `exited` resolves — behavior is byte-identical to before this bound
+    // was added.
     const deadline = Date.now() + timeoutMs;
+    const killer = setTimeout(() => signal("SIGKILL"), timeoutMs);
+    await exited;
+    clearTimeout(killer);
     const groupGone = () => {
       try {
         process.kill(-pid, 0);

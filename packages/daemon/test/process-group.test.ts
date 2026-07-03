@@ -97,6 +97,72 @@ describe("ManagedProcess detached group kill", () => {
     expect(() => process.kill(grandPid, 0)).toThrow();
   });
 
+  // Fix wave 2 (review): the crux test above proves a stubborn GRANDCHILD gets group-SIGKILLed.
+  // This test proves the LEADER itself can be stubborn too — a compute_ctl that ignores or never
+  // processes SIGTERM (wedged) — and that stop() still resolves rather than hanging forever on the
+  // unbounded `await exited` that sat in front of the group-poll. Pre-fix (`await exited` with no
+  // timer armed ahead of it on the detached path), this test HANGS: the leader never exits, so
+  // `exited` never resolves, so `stop()` never returns and the group-poll/escalation code never
+  // even runs. Post-fix, the killer timer (armed before `await exited`) reaches the deadline, sends
+  // a group SIGKILL that (since the leader is itself in the group) kills the leader too — letting
+  // `exited` resolve — and stop() proceeds into (and completes) the group-poll exactly as normal.
+  //
+  // Both the leader and a grandchild it forks install SIGTERM-ignoring handlers, so ONLY SIGKILL
+  // can end either of them — this exercises the worst case (leader AND grandchild both stubborn)
+  // in one test rather than two.
+  it("stop() does not hang when the LEADER itself ignores SIGTERM, and group-SIGKILLs leader+grandchild at the deadline", async () => {
+    // Leader: installs a SIGTERM handler that swallows the signal, forks a grandchild that does
+    // the same, and only reports the "gpid:" readiness needle once the grandchild has confirmed
+    // (over its own stdout pipe) that ITS handler is armed — same handler-armed synchronization
+    // discipline as the crux test above, to avoid a false pass via the default SIGTERM disposition
+    // racing the handler installation. The leader's OWN handler is installed before the grandchild
+    // is even spawned, so there's no equivalent race to guard for the leader side.
+    const script = `
+      process.on('SIGTERM', () => {});
+      const { spawn } = require("node:child_process");
+      const g = spawn(process.execPath, [
+        "-e",
+        "process.on('SIGTERM', () => {}); console.log('armed'); setInterval(()=>{},1e9);",
+      ], { stdio: ["ignore", "pipe", "ignore"] });
+      g.stdout.on("data", (d) => {
+        if (d.toString().includes("armed")) process.stdout.write("gpid:" + g.pid + "\\n");
+      });
+      setInterval(()=>{},1e9);
+    `;
+    let grandPid = 0;
+    const mp = new ManagedProcess({
+      name: "detached-stubborn-leader",
+      bin: process.execPath, args: ["-e", script], detached: true,
+      readyNeedle: "gpid:", readyTimeoutMs: 5000,
+      onLine: (l) => { const m = l.match(/gpid:(\d+)/); if (m) grandPid = Number(m[1]); },
+    });
+    await mp.start();
+    expect(grandPid).toBeGreaterThan(0);
+    const leaderPidRaw = mp.pid;
+    expect(leaderPidRaw).not.toBeNull();
+    if (leaderPidRaw === null) throw new Error("unreachable: asserted not-null above");
+    const leaderPid: number = leaderPidRaw;
+    const timeoutMs = 500;
+    const t0 = Date.now();
+    // The upper-bound assertion below is the actual regression guard: against the pre-fix
+    // unbounded `await exited`, this call never resolves and the test fails via vitest's own
+    // per-test timeout (well past our assertion's threshold) rather than via a clean assertion
+    // failure — either way, "did NOT resolve within timeoutMs + slack" is what distinguishes
+    // pre-fix from post-fix here.
+    await mp.stop(timeoutMs);
+    const elapsedMs = Date.now() - t0;
+    // Generous slack: the killer fires at ~timeoutMs, the leader's own "exit" event needs a tick
+    // to propagate, then the (already-satisfied, near-instant) group-poll and its post-SIGKILL
+    // confirmation window run. ~timeoutMs + ~1s comfortably covers all of that without being loose
+    // enough to mask a real hang.
+    expect(elapsedMs).toBeLessThan(timeoutMs + 1000);
+    await delay(300);
+    // Both the leader and the grandchild must be dead — proving the deadline group SIGKILL fired
+    // and reached the whole group, not just the grandchild.
+    expect(() => process.kill(leaderPid, 0)).toThrow();
+    expect(() => process.kill(grandPid, 0)).toThrow();
+  });
+
   // Fix 2: start()'s OWN failure/timeout cleanup (the catch block that fires when the readiness
   // needle never appears) must also be group-aware for a detached ManagedProcess. Pre-fix, that
   // catch called child.kill("SIGKILL") on the direct child only — a grandchild spawned before the
