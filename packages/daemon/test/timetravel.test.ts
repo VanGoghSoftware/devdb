@@ -7,10 +7,11 @@ import { EndpointsService, type EndpointsLockedApi } from "../src/services/endpo
 import type { BranchDetail } from "../src/services/branches.js";
 import { TimeTravelService } from "../src/services/timetravel.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
-import type { EndpointStatus } from "@devdb/shared";
+import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
 // Fix 3 (review): a small typed BranchDetail fixture builder — replaces the `({}) as never`
 // casts the EndpointsLockedApi fakes below used to return, which bypassed the A2 typed-fake
@@ -91,11 +92,18 @@ async function seeded() {
   const queue = new BranchQueue();
   const projects = new ProjectsService({ state, queue, ...f });
   const { project, mainBranch } = await projects.create({ name: "acme" });
-  const branches = new BranchesService({ state, queue, ...f });
+  const events = new EventsService();
+  const seen: DevdbEvent[] = [];
+  events.subscribe((e) => seen.push(e));
+  // `events` threaded through `branches` too (not just `tt`) — TimeTravelService.branchAtTimestamp
+  // delegates to THIS SAME BranchesService instance's create(), so it must share the one
+  // EventsService for that delegated branch.created to actually fire (mirrors production wiring,
+  // where every service is constructed against one shared EventsService instance).
+  const branches = new BranchesService({ state, queue, events, ...f });
   const logs = new LogsService();
   const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
-  const tt = new TimeTravelService({ state, queue, branches, endpoints, ...f });
-  return { f, state, project, mainBranch, branches, endpoints, tt, queue };
+  const tt = new TimeTravelService({ state, queue, branches, endpoints, events, ...f });
+  return { f, state, project, mainBranch, branches, endpoints, tt, queue, events, seen };
 }
 
 describe("TimeTravelService", () => {
@@ -265,6 +273,58 @@ describe("TimeTravelService", () => {
     expect(f.pageserver.timelineDetachAncestor).not.toHaveBeenCalled();
     expect(out.name).toBe("dev");
     expect(state.branches.byId(dev.id)!.name).toContain("dev_reset_archived_");
+  });
+
+  // Emission map (spec Decision 1): swapOntoNewTimeline's single success point covers BOTH
+  // restoreInPlace and resetToParent — exactly one branch.updated per call, for the SWAPPED
+  // (new) branch id, with the ORIGINAL project id.
+  it("restoreInPlace publishes exactly one branch.updated for the swapped branch id", async () => {
+    const { project, mainBranch, tt, seen } = await seeded();
+    const out = await tt.restoreInPlace(mainBranch.id, "2026-07-02T10:00:00Z");
+    const updated = seen.filter((e) => e.type === "branch.updated");
+    expect(updated).toEqual([
+      expect.objectContaining({ type: "branch.updated", projectId: project.id, branchId: out.id }),
+    ]);
+  });
+
+  it("resetToParent publishes exactly one branch.updated for the swapped branch id", async () => {
+    const { project, tt, branches, seen } = await seeded();
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+    seen.length = 0; // isolate resetToParent's own event from the branch.created above
+    const out = await tt.resetToParent(dev.id);
+    const updated = seen.filter((e) => e.type === "branch.updated");
+    expect(updated).toEqual([
+      expect.objectContaining({ type: "branch.updated", projectId: project.id, branchId: out.id }),
+    ]);
+  });
+
+  // branchAtTimestamp delegates to BranchesService.create() — no separate emission in
+  // branchAtTimestamp itself, so exactly one branch.created (not two, and not branch.updated).
+  it("branchAtTimestamp publishes exactly one branch.created via delegation (no duplicate)", async () => {
+    const { project, mainBranch, tt, seen } = await seeded();
+    const b = await tt.branchAtTimestamp({
+      projectId: project.id, sourceBranchId: mainBranch.id,
+      name: "recovered", isoTimestamp: "2026-07-02T10:00:00Z",
+    });
+    expect(seen).toEqual([
+      expect.objectContaining({ type: "branch.created", projectId: project.id, branchId: b.id }),
+    ]);
+  });
+
+  // `events` is an OPTIONAL dep, same rationale as `logs` elsewhere in this codebase.
+  it("restoreInPlace and resetToParent work without throwing when events is omitted from deps", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { project, mainBranch } = await projects.create({ name: "acme" });
+    const branches = new BranchesService({ state, queue, ...f });
+    const logs = new LogsService();
+    const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
+    const tt = new TimeTravelService({ state, queue, branches, endpoints, ...f });
+    await expect(tt.restoreInPlace(mainBranch.id, "2026-07-02T10:00:00Z")).resolves.toBeDefined();
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+    await expect(tt.resetToParent(dev.id)).resolves.toBeDefined();
   });
 
   it("swap serializes under the branch's own queue lane (no concurrent swap for the same branch)", async () => {

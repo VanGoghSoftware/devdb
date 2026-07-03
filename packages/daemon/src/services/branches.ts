@@ -98,7 +98,7 @@ export class BranchesService {
       await this.deps.pageserver.timelineCreate(project.id, req);
 
       try {
-        return this.deps.state.branches.create({
+        const row = this.deps.state.branches.create({
           id: crypto.randomUUID(),
           projectId: project.id,
           parentBranchId: parent.id,
@@ -109,6 +109,10 @@ export class BranchesService {
           createdBy: a.createdBy ?? "api",
           context: a.context ?? null,
         });
+        // Emission map: branch.created fires only once the row actually exists — a create that
+        // fails engine-side (compensation path below) must publish nothing.
+        this.deps.events?.publish({ type: "branch.created", projectId: project.id, branchId: row.id });
+        return row;
       } catch (e) {
         // compensation: never leave a live timeline on the engine for a create that failed after
         // timelineCreate succeeded (best-effort — loud on failure rather than silently swallowed).
@@ -175,6 +179,8 @@ export class BranchesService {
       // both the ring buffer and any subscriber Set for it now rather than letting LogsService
       // hold onto them forever.
       this.deps.logs?.evict(`branch:${branch.id}:compute`);
+      // Emission map: branch.deleted fires after the row is actually gone.
+      this.deps.events?.publish({ type: "branch.deleted", projectId: branch.projectId, branchId: branch.id });
     });
   }
 }

@@ -53,9 +53,10 @@ async function main(): Promise<void> {
   try {
     const state = openState(join(cfg.dataDir, "state.db"));
     const logs = new LogsService();
-    // Phase 3 Task 1: constructed here (not yet published to by anything — Tasks 2-3 wire
-    // publish() calls into the mutation services below) so GET /api/events has a live
-    // EventsService to subscribe against from daemon boot.
+    // Phase 3 Task 1: constructed here so GET /api/events has a live EventsService to subscribe
+    // against from daemon boot. Task 2 wires this same instance into every mutation service below
+    // (projects/branches/endpoints/timetravel) so their create/delete/swap/status seams publish
+    // to it; Task 3 (MCP tool wrappers) is a separate emission surface, still pending.
     const events = new EventsService();
     const logger = createLogger(logs);
     engine = new EngineRuntime(cfg, state, logs);
@@ -87,10 +88,15 @@ async function main(): Promise<void> {
     // EndpointsService already serialize start()/stop()/create()/delete() through for a branch id.
     // Task 4: `logger` wired via the shared ProjectsDeps interface (routes compensation-path
     // console.error calls through LogsService's daemon:app channel, in addition to stderr).
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, logger });
-    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, logger });
-    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, logger });
-    const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, logger });
+    // Task 2 (phase 3): `events` wired into all four mutation services (shared with the same
+    // EventsService instance GET /api/events subscribes against) so every create/delete/swap/
+    // endpoint-status seam actually announces its invalidation hint in production, not just
+    // under test (`events?` is optional on ProjectsDeps precisely so this wiring can be threaded
+    // here without touching every existing unit test's construction).
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger });
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, events, logger });
+    const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, events, logger });
     const sql = new SqlService({ branches, endpoints });
 
     // Task 9 fix wave: `logger` threaded into Deps so mcp/tools.ts's guard() can log an

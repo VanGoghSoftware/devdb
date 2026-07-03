@@ -29,6 +29,19 @@ export interface EndpointsLockedApi {
 export class EndpointsService {
   constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService; logs: LogsService }) {}
 
+  // Every endpoint status persisted to SQLite is also announced on /api/events — one seam so a
+  // transition can never be written without being announced (spec Decision 1 emission table).
+  // All six updateEndpoint call sites in this file route through here (including the two
+  // compensation-path calls, which stay inside their own try/catch — this helper just goes
+  // inside that existing wrapping).
+  private setEndpointStatus(
+    branch: { id: string; projectId: string },
+    a: { status: string; port: number | null; error?: string | null },
+  ): void {
+    this.deps.state.branches.updateEndpoint(branch.id, a);
+    this.deps.events?.publish({ type: "endpoint.status", projectId: branch.projectId, branchId: branch.id });
+  }
+
   // Queued body shared by start()/ensureRunning() — see the comment on ensureRunning() for why
   // the idempotency check below must run INSIDE the queue lane rather than before it.
   //
@@ -63,7 +76,7 @@ export class EndpointsService {
     if (status === "failed") {
       await this.deps.computes.stop(branch.id);
     }
-    this.deps.state.branches.updateEndpoint(branch.id, { status: "starting", port: null });
+    this.setEndpointStatus(branch, { status: "starting", port: null });
     try {
       // Fix 1: `onLine` is passed straight into computes.start() rather than subscribed after
       // the fact via a separate computes.onLine() call once start() resolves. ComputeManager
@@ -78,7 +91,7 @@ export class EndpointsService {
         onLine: (line) => this.deps.logs.ingest(`branch:${branch.id}:compute`, line),
       });
       try {
-        this.deps.state.branches.updateEndpoint(branch.id, { status: "running", port });
+        this.setEndpointStatus(branch, { status: "running", port });
       } catch (persistErr) {
         // The compute is live but we failed to record it — leaving state at "starting" (or
         // worse, a half-written "running") would strand a running process the daemon no longer
@@ -87,7 +100,7 @@ export class EndpointsService {
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           this.deps.logger.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure`, stopErr));
         try {
-          this.deps.state.branches.updateEndpoint(branch.id, {
+          this.setEndpointStatus(branch, {
             status: "failed", port: null,
             error: (persistErr as Error).message?.slice(0, 2000) ?? String(persistErr),
           });
@@ -97,7 +110,7 @@ export class EndpointsService {
         throw persistErr;
       }
     } catch (e) {
-      this.deps.state.branches.updateEndpoint(branch.id, {
+      this.setEndpointStatus(branch, {
         status: "failed", port: null,
         error: (e as Error).message?.slice(0, 2000) ?? String(e),
       });
@@ -127,7 +140,7 @@ export class EndpointsService {
   async stopLocked(lane: Lane, branchId: string): Promise<BranchDetail> {
     this.deps.queue.assertLane(lane, branchId);
     const branch = this.deps.branches.byIdOr404(branchId);
-    this.deps.state.branches.updateEndpoint(branch.id, { status: "stopping", port: null });
+    this.setEndpointStatus(branch, { status: "stopping", port: null });
     // Fix 1: no separate unsub bookkeeping here anymore — computes.stop() discards the whole
     // compute entry (including its listeners array, which now includes the onLine callback
     // passed into computes.start() above) unconditionally in its own finally block, so listener
@@ -141,7 +154,7 @@ export class EndpointsService {
       // "stopped" must land regardless, or a throwing proc-stop would strand the branch at
       // "stopping" forever with no way to retry (stop() short-circuits on nothing, but every
       // other transition reads this row as truth).
-      this.deps.state.branches.updateEndpoint(branch.id, { status: "stopped", port: null });
+      this.setEndpointStatus(branch, { status: "stopped", port: null });
     }
     return this.deps.branches.detail(this.deps.branches.byIdOr404(branchId));
   }

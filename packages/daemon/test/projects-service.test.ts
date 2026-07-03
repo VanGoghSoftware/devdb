@@ -4,11 +4,12 @@ import { ProjectsService } from "../src/services/projects.js";
 import { DevdbError } from "../src/services/errors.js";
 import { slugify } from "../src/services/slug.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { BranchQueue } from "../src/state/queue.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
 import type { BranchRow } from "../src/state/repos.js";
-import type { EndpointStatus } from "@devdb/shared";
+import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 import { StorconClient } from "../src/engine/storcon-client.js";
 import { PageserverClient } from "../src/engine/pageserver-client.js";
 import { SafekeeperClient } from "../src/engine/safekeeper-client.js";
@@ -102,6 +103,36 @@ describe("ProjectsService", () => {
     await expect(svc.create({ name: "acme" })).rejects.toMatchObject({ statusCode: 409 });
   });
 
+  // Emission map (spec Decision 1): create() publishes exactly ONE project.created event — no
+  // separate branch.created for the seeded main branch, since clients invalidate both projects
+  // AND branches off this single event.
+  it("create publishes project.created with the project id, and nothing else", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const svc = new ProjectsService({ state, events, ...f });
+    const { project } = await svc.create({ name: "acme" });
+    expect(seen).toEqual([
+      expect.objectContaining({ type: "project.created", projectId: project.id }),
+    ]);
+  });
+
+  // A create() that fails engine-side (compensated) must publish NOTHING — the event marks a
+  // successful local write, never an attempted one.
+  it("a create() that fails engine-side publishes no events", async () => {
+    const f = fakes();
+    vi.mocked(f.pageserver.timelineCreate).mockRejectedValueOnce(new Error("bootstrap timeline failed"));
+    const state = openState(":memory:");
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const svc = new ProjectsService({ state, events, ...f });
+    await expect(svc.create({ name: "acme" })).rejects.toThrow();
+    expect(seen).toEqual([]);
+  });
+
   it("delete removes branches (children first), timelines, tenant", async () => {
     const f = fakes();
     const state = openState(":memory:");
@@ -147,6 +178,31 @@ describe("ProjectsService", () => {
   // `logs` is an OPTIONAL dep (see the constructor's doc comment) — delete() must not throw when
   // it's simply omitted, which is exactly what every OTHER test in this file (fakes()-only) does.
   it("delete works without throwing when logs is omitted from deps", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const svc = new ProjectsService({ state, ...f });
+    const { project } = await svc.create({ name: "acme" });
+    await expect(svc.delete(project.id)).resolves.toBeUndefined();
+  });
+
+  // Emission map: delete() publishes project.deleted after the project row is actually gone.
+  it("delete publishes project.deleted with the project id", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    const svc = new ProjectsService({ state, events, ...f });
+    const { project } = await svc.create({ name: "acme" });
+    events.subscribe((e) => seen.push(e)); // subscribe AFTER create() so only delete()'s event is seen
+    await svc.delete(project.id);
+    expect(seen).toEqual([
+      expect.objectContaining({ type: "project.deleted", projectId: project.id }),
+    ]);
+  });
+
+  // `events` is an OPTIONAL dep, same rationale as `logs` above — every existing test in this
+  // file (fakes()-only) constructs ProjectsService without one.
+  it("create and delete work without throwing when events is omitted from deps", async () => {
     const f = fakes();
     const state = openState(":memory:");
     const svc = new ProjectsService({ state, ...f });

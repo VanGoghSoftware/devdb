@@ -4,10 +4,11 @@ import { BranchQueue } from "../src/state/queue.js";
 import { BranchesService } from "../src/services/branches.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
-import type { EndpointStatus } from "@devdb/shared";
+import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
 // Amendment A2: typed fakes satisfying the narrow service-facing interfaces from
 // services/engine-api.ts — no `as never` casts. Every method the interfaces declare must
@@ -126,6 +127,66 @@ describe("BranchesService", () => {
   // `logs` is an OPTIONAL dep (see the constructor's doc comment) — delete() must not throw when
   // it's simply omitted, which is exactly what every OTHER test in this file (via seeded()) does.
   it("delete works without throwing when logs is omitted from deps", async () => {
+    const { project, branches } = await seeded();
+    const dev = await branches.create({ projectId: project.id, name: "dev" });
+    await expect(branches.delete(dev.id)).resolves.toBeUndefined();
+  });
+
+  // Emission map (spec Decision 1): create() publishes branch.created with project+branch ids
+  // AFTER the row exists — capture the created row, then publish it.
+  it("create publishes branch.created with project + branch ids after the row exists", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { project } = await projects.create({ name: "acme" });
+    const branches = new BranchesService({ state, queue, events, ...f });
+    const row = await branches.create({ projectId: project.id, name: "dev" });
+    expect(seen).toEqual([
+      expect.objectContaining({ type: "branch.created", projectId: project.id, branchId: row.id }),
+    ]);
+  });
+
+  // A create() that fails engine-side (compensated) must publish NOTHING.
+  it("a create() that fails engine-side publishes no events", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { project } = await projects.create({ name: "acme" });
+    const branches = new BranchesService({ state, queue, events, ...f });
+    events.subscribe((e) => seen.push(e)); // subscribe AFTER seeding the project's own create()
+    const err = { code: "SQLITE_CONSTRAINT_UNIQUE" } as unknown as Error;
+    vi.spyOn(state.branches, "create").mockImplementationOnce(() => { throw err; });
+    await expect(branches.create({ projectId: project.id, name: "dev" })).rejects.toThrow();
+    expect(seen).toEqual([]);
+  });
+
+  // Emission map: delete() publishes branch.deleted after the row is gone (next to logs?.evict).
+  it("delete publishes branch.deleted after the row is gone", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const events = new EventsService();
+    const seen: DevdbEvent[] = [];
+    events.subscribe((e) => seen.push(e));
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { project } = await projects.create({ name: "acme" });
+    const branches = new BranchesService({ state, queue, events, ...f });
+    const row = await branches.create({ projectId: project.id, name: "doomed" });
+    await branches.delete(row.id);
+    expect(seen.filter((e) => e.type === "branch.deleted")).toEqual([
+      expect.objectContaining({ projectId: project.id, branchId: row.id }),
+    ]);
+  });
+
+  // `events` is an OPTIONAL dep, same rationale as `logs` above.
+  it("create and delete work without throwing when events is omitted from deps", async () => {
     const { project, branches } = await seeded();
     const dev = await branches.create({ projectId: project.id, name: "dev" });
     await expect(branches.delete(dev.id)).resolves.toBeUndefined();

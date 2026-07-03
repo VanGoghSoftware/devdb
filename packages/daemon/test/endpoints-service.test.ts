@@ -5,10 +5,11 @@ import { BranchesService } from "../src/services/branches.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { EndpointsService } from "../src/services/endpoints.js";
 import { LogsService } from "../src/services/logs.js";
+import { EventsService } from "../src/services/events.js";
 import { PortExhaustedError } from "../src/compute/ports.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
-import type { EndpointStatus } from "@devdb/shared";
+import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
 // Amendment A2 (controller): typed fakes satisfying the narrow service-facing interfaces from
 // services/engine-api.ts — no `as never` casts. Mirrors branches-service.test.ts's fakes().
@@ -59,8 +60,11 @@ async function seeded() {
   const { project, mainBranch } = await projects.create({ name: "acme" });
   const branches = new BranchesService({ state, queue, ...f });
   const logs = new LogsService();
-  const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
-  return { f, state, project, mainBranch, branches, endpoints, queue, logs };
+  const events = new EventsService();
+  const seen: DevdbEvent[] = [];
+  events.subscribe((e) => seen.push(e));
+  const endpoints = new EndpointsService({ state, queue, branches, logs, events, ...f });
+  return { f, state, project, mainBranch, branches, endpoints, queue, logs, events, seen };
 }
 
 describe("EndpointsService", () => {
@@ -256,5 +260,64 @@ describe("EndpointsService", () => {
     // both settled without throwing a "start already running/entry exists" race — the queue
     // serialized them per branch id, exactly like BranchesService.create/delete.
     expect(queue.pendingCount()).toBe(0);
+  });
+
+  // Emission map (spec Decision 1): every persisted endpoint status transition is announced via
+  // the setEndpointStatus helper — a successful start writes "starting" then "running", so
+  // exactly 2 endpoint.status events fire, both for this branch.
+  it("a successful start publishes exactly 2 endpoint.status events (starting, running)", async () => {
+    const { f, mainBranch, endpoints, seen } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    await endpoints.start(mainBranch.id);
+    const statusEvents = seen.filter((e) => e.type === "endpoint.status");
+    expect(statusEvents).toHaveLength(2);
+    for (const e of statusEvents) {
+      expect(e).toMatchObject({ projectId: mainBranch.projectId, branchId: mainBranch.id });
+    }
+  });
+
+  // A failed start still writes "starting" then "failed" — both persisted transitions must still
+  // be announced (the event marks a write happened, not that the operation ultimately succeeded).
+  it("a failed start publishes exactly 2 endpoint.status events (starting, failed)", async () => {
+    const { f, mainBranch, endpoints, seen } = await seeded();
+    vi.mocked(f.computes.start).mockRejectedValueOnce(new Error("compute_ctl exited before ready"));
+    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/compute_ctl exited/);
+    const statusEvents = seen.filter((e) => e.type === "endpoint.status");
+    expect(statusEvents).toHaveLength(2);
+    for (const e of statusEvents) {
+      expect(e).toMatchObject({ projectId: mainBranch.projectId, branchId: mainBranch.id });
+    }
+  });
+
+  // stop() writes "stopping" then "stopped" — 2 endpoint.status events.
+  it("stop publishes exactly 2 endpoint.status events (stopping, stopped)", async () => {
+    const { f, mainBranch, endpoints, seen } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    await endpoints.start(mainBranch.id);
+    seen.length = 0; // isolate stop()'s own events from start()'s
+    await endpoints.stop(mainBranch.id);
+    const statusEvents = seen.filter((e) => e.type === "endpoint.status");
+    expect(statusEvents).toHaveLength(2);
+    for (const e of statusEvents) {
+      expect(e).toMatchObject({ projectId: mainBranch.projectId, branchId: mainBranch.id });
+    }
+  });
+
+  // `events` is an OPTIONAL dep, same rationale as `logs` elsewhere in this codebase.
+  it("start/stop work without throwing when events is omitted from deps", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { mainBranch } = await projects.create({ name: "acme" });
+    const branches = new BranchesService({ state, queue, ...f });
+    const logs = new LogsService();
+    const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    await expect(endpoints.start(mainBranch.id)).resolves.toBeDefined();
+    await expect(endpoints.stop(mainBranch.id)).resolves.toBeDefined();
   });
 });

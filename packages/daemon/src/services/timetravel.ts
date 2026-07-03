@@ -256,6 +256,11 @@ export class TimeTravelService {
       if (wasRunning) {
         await this.deps.queue.run(swapped.id, (lane2) => this.deps.endpoints.startLocked(lane2, swapped.id));
       }
+      // Emission map (spec Decision 1): this single success point covers BOTH restoreInPlace and
+      // resetToParent — one branch.updated for the swapped (new, now-live) branch identity.
+      // branchAtTimestamp does NOT go through this method (it delegates to
+      // BranchesService.create(), which publishes its own branch.created) — no double emission.
+      this.deps.events?.publish({ type: "branch.updated", projectId: swapped.projectId, branchId: swapped.id });
       return this.deps.branches.detail(this.deps.branches.byIdOr404(swapped.id));
     });
   }

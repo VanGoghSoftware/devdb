@@ -3,6 +3,7 @@ import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
 import type { LogsService } from "./logs.js";
+import type { EventsService } from "./events.js";
 import type { Logger } from "../logging/logger.js";
 import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
@@ -31,6 +32,12 @@ export interface ProjectsDeps {
   computes: ComputesApi;
   queue: BranchQueue;
   logger: Logger;
+  // Task 2 (phase 3): OPTIONAL, on the SHARED base type (not bolted on per-service like `logs?`
+  // is) — every other service types its own deps as `ProjectsDeps & {...}`, so BranchesService /
+  // EndpointsService / TimeTravelService all inherit `events?` here with no further deps-type
+  // edits. Optional so the many existing unit tests that construct services directly without an
+  // EventsService keep typechecking unchanged.
+  events?: EventsService;
 }
 
 // oracle: tenant config values src/mgmt/service/project.rs:95-108
@@ -105,6 +112,10 @@ export class ProjectsService {
         }
         throw e;
       }
+      // Emission map (spec Decision 1): ONE project.created event — clients invalidate BOTH
+      // projects and branches off it, so the seeded main branch does NOT also get its own
+      // branch.created (that would be redundant with what this single event already covers).
+      this.deps.events?.publish({ type: "project.created", projectId });
       return {
         project: this.deps.state.projects.byId(projectId)!,
         mainBranch: this.deps.state.branches.byId(branchId)!,
@@ -217,6 +228,7 @@ export class ProjectsService {
     for (let attempt = 1; ; attempt++) {
       try {
         this.deps.state.projects.delete(project.id);
+        this.deps.events?.publish({ type: "project.deleted", projectId: project.id });
         return;
       } catch (e) {
         const isFkViolation = (e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT");
