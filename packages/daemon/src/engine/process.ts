@@ -44,6 +44,22 @@ export class ManagedProcess {
     }
   }
 
+  // Shared by stop() and start()'s own failure/timeout cleanup: when detached, signal the whole
+  // process group (negative pid) instead of just the direct child, so a grandchild spawned before
+  // a start failure (or before the group outlives SIGTERM in stop()) is group-killed rather than
+  // left to whatever backstop the caller has (e.g. ComputeManager's reapOrphanedPostgres). Wrapped
+  // in try/catch: a group/child that's already gone (ESRCH) or a signal we're not permitted to
+  // send (EPERM) must never make the caller (stop()'s contract is total; start()'s catch must not
+  // mask the original readiness/launch error) throw for this reason.
+  private killSignal(child: ChildProcess, pid: number | null, sig: NodeJS.Signals): void {
+    try {
+      if (this.opts.detached && pid) process.kill(-pid, sig);
+      else child.kill(sig);
+    } catch {
+      // already gone
+    }
+  }
+
   async start(): Promise<void> {
     if (this.state === "running" || this.state === "starting") {
       throw new Error(`${this.opts.name} already ${this.state}`);
@@ -129,7 +145,7 @@ export class ManagedProcess {
         this.pid = null;
       }
       if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
+        this.killSignal(child, child.pid ?? null, "SIGKILL");
       }
       throw e;
     } finally {
@@ -149,22 +165,57 @@ export class ManagedProcess {
       child.once("exit", () => res());
       child.once("error", () => res());
     });
-    // When detached, signal the whole process group (negative pid) so compute_ctl's orphaned
-    // postgres child (R3: it never waits for/reparents-away its own child on SIGTERM) dies too,
-    // instead of surviving as a PID-1 orphan. Wrapped in try/catch: a group that's already gone
-    // (ESRCH) or a signal we're not permitted to send (EPERM, e.g. group leader already reaped)
-    // must never make stop() itself throw — this method's contract is total.
-    const signal = (sig: NodeJS.Signals) => {
+    const signal = (sig: NodeJS.Signals) => this.killSignal(child, pid, sig);
+    signal("SIGTERM");
+    if (!this.opts.detached || !pid) {
+      // Non-detached (engine binaries): unchanged from before this fix. The direct child IS the
+      // only thing we're responsible for, so its own "exit" is the correct (and only) completion
+      // signal, and the killer timer is scoped to exactly that child.
+      const killer = setTimeout(() => signal("SIGKILL"), timeoutMs);
+      await exited;
+      clearTimeout(killer);
+      return;
+    }
+    // Detached (compute_ctl): the LEADER exiting is not sufficient — compute_ctl orphans its
+    // postgres child on SIGTERM instead of waiting for it (handover §4.4/§8.6), so the leader can
+    // (and normally does) exit almost instantly while a group member it spawned is still alive,
+    // possibly in Postgres "smart shutdown" (waits for clients) or otherwise ignoring SIGTERM
+    // entirely. Awaiting only the leader's own exit — as the non-detached branch above does — and
+    // clearing the SIGKILL timer right then would let that surviving member dodge the escalated
+    // group SIGKILL forever (the bug this fix exists to close). So: observe the leader's own exit
+    // (still needed — avoids leaving a dangling child ref, and the leader is usually first to
+    // go), then poll the WHOLE GROUP for emptiness up to timeoutMs (from the SIGTERM send, same
+    // budget the non-detached path gives its single child), escalating to a group SIGKILL if
+    // anything in the group is still alive at the deadline.
+    //
+    // `await exited` here is intentionally unbounded by timeoutMs: the only detached caller is
+    // ComputeManager's compute_ctl, whose near-instant exit-on-SIGTERM is a confirmed, cited, live
+    // behavior (handover §8.6) — not a hypothetical this method needs to defend against. A leader
+    // that itself ignored SIGTERM indefinitely would need its own escalation, which is exactly
+    // what the group-SIGKILL below already provides once this resolves; it just wouldn't be
+    // bounded by timeoutMs on the leader-exit leg specifically. Documented, not fixed here.
+    await exited;
+    const deadline = Date.now() + timeoutMs;
+    const groupGone = () => {
       try {
-        if (this.opts.detached && pid) process.kill(-pid, sig);
-        else child.kill(sig);
+        process.kill(-pid, 0);
+        return false; // signal 0 succeeded — at least one process in the group still exists
       } catch {
-        // already gone
+        return true; // ESRCH (or EPERM on an unrelated already-reaped pid) — treat as gone
       }
     };
-    signal("SIGTERM");
-    const killer = setTimeout(() => signal("SIGKILL"), timeoutMs);
-    await exited;
-    clearTimeout(killer);
+    while (!groupGone() && Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    if (!groupGone()) {
+      signal("SIGKILL");
+      // Brief bounded confirmation window — mirrors ComputeManager.reapOnePid's own post-SIGKILL
+      // poll (manager.ts). Not indefinite: stop()'s contract is to resolve, not to guarantee the
+      // kernel has fully reaped the group by the time it returns.
+      const killDeadline = Date.now() + 1000;
+      while (!groupGone() && Date.now() < killDeadline) {
+        await new Promise((res) => setTimeout(res, 50));
+      }
+    }
   }
 }

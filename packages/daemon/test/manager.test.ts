@@ -109,13 +109,18 @@ describe("ComputeManager", () => {
     expect(ManagedProcessMock).toHaveBeenCalledTimes(1);
     const opts = ManagedProcessMock.mock.calls[0]![0] as {
       bin: string; args: string[]; env: Record<string, string>;
-      readyNeedle: string; readyTimeoutMs: number;
+      readyNeedle: string; readyTimeoutMs: number; detached?: boolean;
       onLine: (line: string, stream: "stdout" | "stderr") => void;
     };
     expect(opts.bin).toBe(join(cfg.neonBinDir, "compute_ctl"));
     expect(opts.env).toEqual({});
     expect(opts.readyNeedle).toBe("listening on IPv4 address");
     expect(opts.readyTimeoutMs).toBe(50_000);
+    // Fix 3 (review, Task 6 fix wave): pin the detached-scope contract so it can't silently
+    // regress — compute_ctl's ManagedProcess MUST be detached (own process group), since that's
+    // the whole mechanism stop() relies on to group-kill its orphaned postgres child (see
+    // process.ts's detached-path SIGKILL escalation and manager.ts's oracle-launch comment above).
+    expect(opts.detached).toBe(true);
 
     // Recover the temp dir compute_ctl was launched with, to assert byte-exact arg order.
     const computesDir = join(cfg.dataDir, "computes");
