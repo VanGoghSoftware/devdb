@@ -7,6 +7,15 @@ export interface Logger {
   info(event: string, detail?: unknown): void;
 }
 
+// Fix 2 (review, fix wave 2): single source of truth for the `daemon:<component>` channel
+// format. Previously the SSE route (http/api.ts) inlined `` `daemon:${component}` ``,
+// createLogger defaulted to the literal "daemon:app", and the wiring test reconstructed the
+// format independently — three copies that could silently drift apart. All three now call this
+// helper instead.
+export function daemonLogChannel(component: string): string {
+  return `daemon:${component}`;
+}
+
 // Fix 2 (review, fix wave): fmt() must be TOTAL — it is called from inside compensation
 // handlers' best-effort .catch() callbacks (see services/branches.ts, projects.ts, endpoints.ts,
 // timetravel.ts), where a throw here would propagate out of the .catch(), mask the original
@@ -35,7 +44,7 @@ function fmt(detail: unknown): string {
 // must match that convention — "daemon:app" — or compensation logs are ingested to a channel the
 // SSE endpoint never reads, and the whole feature is a silent no-op (see
 // test/logger.test.ts's "logger -> SSE channel wiring" tests for the end-to-end proof).
-export function createLogger(logs: LogsService, channel = "daemon:app"): Logger {
+export function createLogger(logs: LogsService, channel = daemonLogChannel("app")): Logger {
   const emit = (level: "error" | "warn" | "info", event: string, detail?: unknown) => {
     const line = `[${level}] ${event}${fmt(detail)}`;
     // Fix 3 (review, fix wave): route ALL levels to stderr. info previously wrote console.log

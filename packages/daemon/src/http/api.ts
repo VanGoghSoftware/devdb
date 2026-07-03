@@ -14,6 +14,7 @@ import type { LogsService } from "../services/logs.js";
 import type { SqlService } from "../services/sql.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
+import { daemonLogChannel } from "../logging/logger.js";
 
 // T16 rider (ledgered at Task 12, optional): /api/status's top-level "version" comes from this
 // package's own package.json instead of a hand-maintained literal. Read once at module load —
@@ -208,7 +209,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     if (!DAEMON_LOG_COMPONENTS.has(component)) {
       throw new DevdbError(404, `unknown daemon component: ${JSON.stringify(component)}`);
     }
-    sse(reply, `daemon:${component}`);
+    sse(reply, daemonLogChannel(component));
   });
 
   const CreateProject = z.object({ name: z.string(), pgVersion: PgVersionSchema.optional() });

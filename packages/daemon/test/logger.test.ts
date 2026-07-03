@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { LogsService } from "../src/services/logs.js";
-import { createLogger } from "../src/logging/logger.js";
+import { createLogger, daemonLogChannel } from "../src/logging/logger.js";
 import { buildServer } from "../src/http/api.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
@@ -77,8 +77,19 @@ describe("createLogger", () => {
   });
 });
 
-// Fix 1 (review, fix wave) — end-to-end channel wiring. This is the crux of the fix: it must
-// fail if the logger's ingest channel and the SSE route's subscribe channel ever diverge again.
+// Fix 1 (review, fix wave) — end-to-end channel wiring.
+//
+// Fix 2 (review, fix wave 2) — honest scope of this test: the route (http/api.ts) and the
+// logger's default (logging/logger.ts) both now derive their channel from the single
+// `daemonLogChannel()` helper, so they cannot drift from EACH OTHER without one side bypassing
+// the helper entirely (a deliberate, visible change, not a silent one). What this test actually
+// still guards against is logger-side drift: it proves `createLogger`'s default channel equals
+// `daemonLogChannel("app")` by observing a subscriber registered on that exact value receive the
+// logger's line. It does NOT independently re-derive or re-check the route's construction (the
+// route is exercised separately below, via the live allowlist/404 checks) — this is not
+// symmetric proof that route and logger agree, because they no longer have two independent
+// formulas to agree between; there is only one formula now, and this test confirms the logger
+// side actually calls it.
 //
 // The SSE route (http/api.ts `sse()` helper, called from `GET /api/daemon/logs/:component`)
 // hijacks the reply and never calls `reply.raw.end()` on the success path — the live tail is
@@ -86,26 +97,13 @@ describe("createLogger", () => {
 // against that route hangs (verified during this fix: a bare `await app.inject(...)` timed out
 // after 2s with no response), so driving the route through a full HTTP round-trip in a unit test
 // is genuinely heavy, matching the fix brief's own "if a full SSE test is heavy" carve-out.
-//
-// Instead: (1) derive the channel with the SAME template the route uses
-// (`` `daemon:${component}` ``, component "app") rather than hardcoding "daemon:app" — so this
-// test is coupled to the route's construction, not just a duplicated literal; (2) prove a real
-// `createLogger` + `LogsService` line lands on a fresh subscriber to that derived channel; (3)
-// prove the allowlist actually accepts "app" as a component (via a live, non-hanging 404 control
-// against a bogus component, establishing the allowlist gate is real) and that the daemon logger
-// module and the route agree "app" is the component name in play.
 describe("logger -> SSE channel wiring (end-to-end)", () => {
   const SSE_COMPONENT = "app"; // same literal the fix wave adds to DAEMON_LOG_COMPONENTS
-  function routeChannelFor(component: string): string {
-    // Mirrors http/api.ts's `sse(reply, \`daemon:${component}\`)` call inside the
-    // `/api/daemon/logs/:component` handler — if that template ever changes, update both.
-    return `daemon:${component}`;
-  }
 
   it("a logger.error line is observed by a fresh subscriber to the exact channel the SSE route subscribes for /api/daemon/logs/app", () => {
     const logs = new LogsService();
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const channel = routeChannelFor(SSE_COMPONENT);
+    const channel = daemonLogChannel(SSE_COMPONENT);
     const received: string[] = [];
     const unsub = logs.subscribe(channel, (line) => received.push(line));
 
@@ -117,9 +115,10 @@ describe("logger -> SSE channel wiring (end-to-end)", () => {
     expect(received[0]).toContain("boom");
 
     // If the logger's default channel ever regresses to a bare "app" (or anything other than
-    // exactly what the route builds), this subscriber — registered against the route's own
-    // channel formula — receives nothing, and the assertion above fails. This is the guard
-    // against silent re-divergence.
+    // `daemonLogChannel("app")`), this subscriber — registered against that same helper — receives
+    // nothing, and the assertion above fails. This is the guard against logger-side re-divergence
+    // from the shared helper (see fix-wave-2 note above for what this test does and does not
+    // prove about the route side).
     unsub();
     vi.restoreAllMocks();
   });
