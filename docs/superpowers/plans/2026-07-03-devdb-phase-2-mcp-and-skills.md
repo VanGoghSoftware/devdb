@@ -464,6 +464,8 @@ git commit -m "feat: explicit wire DTOs drop password, surface context; generici
 
 Compensation/rollback paths currently use bare `console.error`, invisible to the SSE log surface. Introduce a small `Logger` that fans out to stderr (so Docker logs are unchanged) **and** `LogsService` on a subscribable `daemon:app` channel, then convert the service- and compute-layer compensation sites.
 
+> **AMENDED (2026-07-03, execution):** Step 3's `createLogger(logs, channel = "app")` used the WRONG channel. The SSE route subscribes to `` `daemon:${component}` `` (so `/api/daemon/logs/app` reads channel `daemon:app`), and engine components ingest to their full `daemon:<name>` channel — so `createLogger`'s default must be **`"daemon:app"`** (ingest the full channel), not `"app"`, or the compensation logs land in a channel nobody reads (the feature is a silent no-op). Also: `fmt()` must be **total** — wrap `JSON.stringify(detail)` in try/catch (fallback `String`/`util.inspect`) since it runs inside best-effort compensation `.catch()` handlers where a throw would mask the original error and skip later cleanup; and all levels route to **stderr** (the `info→console.log` split contradicted the stated stderr fanout). A wiring test asserts a `logger.error` line reaches the exact `daemon:app` channel the route subscribes to. Commits 9dff797 (initial) + a7b1a02 (fix). `branches.ts:132` (read-enrichment resilience log) is intentionally left as bare `console.error` — not a compensation site.
+
 **Files:**
 - Create: `packages/daemon/src/logging/logger.ts`.
 - Modify: `packages/daemon/src/http/api.ts:202-204` (add `"app"` to `DAEMON_LOG_COMPONENTS`).
