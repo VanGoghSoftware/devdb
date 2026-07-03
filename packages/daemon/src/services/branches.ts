@@ -1,4 +1,4 @@
-import type { EndpointStatus } from "@devdb/shared";
+import type { BranchContext, EndpointStatus } from "@devdb/shared";
 import type { BranchRow } from "../state/repos.js";
 import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
@@ -47,7 +47,7 @@ export class BranchesService {
   // oracle: src/mgmt/service/branch.rs:66-208 create()
   async create(a: {
     projectId: string; name: string; parentBranchId?: string | null;
-    atLsn?: string | null; createdBy?: "ui" | "api" | "mcp";
+    atLsn?: string | null; createdBy?: "ui" | "api" | "mcp"; context?: BranchContext | null;
   }): Promise<BranchRow> {
     const name = a.name.trim();
     const project = this.deps.state.projects.byId(a.projectId);
@@ -98,6 +98,7 @@ export class BranchesService {
           timelineId,
           password: generatePassword(),
           createdBy: a.createdBy ?? "api",
+          context: a.context ?? null,
         });
       } catch (e) {
         // compensation: never leave a live timeline on the engine for a create that failed after

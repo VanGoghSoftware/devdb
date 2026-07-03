@@ -294,14 +294,14 @@ describe("ProjectsService", () => {
       id: "branch-a", projectId: project.id, parentBranchId: "branch-b", name: "a", slug: "a",
       timelineId: "a".repeat(32), password: "x", stickyPort: null, endpointStatus: "stopped",
       endpointError: null,
-      importStatus: "none", importError: null, createdBy: "api",
+      importStatus: "none", importError: null, createdBy: "api", context: null,
       createdAt: "2026-07-02T00:00:00.000Z", updatedAt: "2026-07-02T00:00:00.000Z",
     };
     const b: BranchRow = {
       id: "branch-b", projectId: project.id, parentBranchId: "branch-a", name: "b", slug: "b",
       timelineId: "b".repeat(32), password: "x", stickyPort: null, endpointStatus: "stopped",
       endpointError: null,
-      importStatus: "none", importError: null, createdBy: "api",
+      importStatus: "none", importError: null, createdBy: "api", context: null,
       createdAt: "2026-07-02T00:00:00.000Z", updatedAt: "2026-07-02T00:00:00.000Z",
     };
     state.branches.listByProject = ((projectId: string) => {

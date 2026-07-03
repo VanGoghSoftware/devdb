@@ -14,7 +14,7 @@ export interface StateDb {
 // current schema declares but an older database lacks. Additive-only by design.
 function applyAdditiveMigrations(raw: Database.Database): void {
   const REQUIRED_COLUMNS: Record<string, Record<string, string>> = {
-    branches: { endpoint_error: "TEXT" },
+    branches: { endpoint_error: "TEXT", context: "TEXT" },
   };
   for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
     const existing = new Set(

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { PgVersion } from "@devdb/shared";
+import type { BranchContext, PgVersion } from "@devdb/shared";
 
 export interface ProjectRow {
   id: string; name: string; pgVersion: PgVersion; createdAt: string; updatedAt: string;
@@ -9,6 +9,7 @@ export interface BranchRow {
   timelineId: string; password: string; stickyPort: number | null; endpointStatus: string;
   endpointError: string | null;
   importStatus: string; importError: string | null; createdBy: string;
+  context: BranchContext | null;
   createdAt: string; updatedAt: string;
 }
 
@@ -28,6 +29,7 @@ function branchRow(r: Record<string, unknown>): BranchRow {
     endpointError: (r.endpoint_error as string | null) ?? null,
     importStatus: r.import_status as string,
     importError: (r.import_error as string | null) ?? null, createdBy: r.created_by as string,
+    context: r.context ? (JSON.parse(r.context as string) as BranchContext) : null,
     createdAt: r.created_at as string, updatedAt: r.updated_at as string,
   };
 }
@@ -61,12 +63,13 @@ export class BranchesRepo {
   constructor(private db: Database.Database) {}
   create(a: {
     id: string; projectId: string; parentBranchId: string | null; name: string; slug: string;
-    timelineId: string; password: string; createdBy: string;
+    timelineId: string; password: string; createdBy: string; context?: BranchContext | null;
   }): BranchRow {
     this.db.prepare(
-      `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(a.id, a.projectId, a.parentBranchId, a.name, a.slug, a.timelineId, a.password, a.createdBy);
+      `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, created_by, context)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(a.id, a.projectId, a.parentBranchId, a.name, a.slug, a.timelineId, a.password, a.createdBy,
+      a.context ? JSON.stringify(a.context) : null);
     return this.byId(a.id)!;
   }
   byId(id: string): BranchRow | null {

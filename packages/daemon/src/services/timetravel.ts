@@ -1,3 +1,4 @@
+import type { BranchContext } from "@devdb/shared";
 import type { BranchRow } from "../state/repos.js";
 import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
@@ -67,13 +68,13 @@ export class TimeTravelService {
   // branch changes — this is BranchesService.create() with atLsn wired from lsnAtTimestamp().
   async branchAtTimestamp(a: {
     projectId: string; sourceBranchId: string; name: string; isoTimestamp: string;
-    createdBy?: "ui" | "api" | "mcp";
+    createdBy?: "ui" | "api" | "mcp"; context?: BranchContext | null;
   }): Promise<BranchRow> {
     const lsn = await this.lsnAtTimestamp(a.sourceBranchId, a.isoTimestamp);
     try {
       return await this.deps.branches.create({
         projectId: a.projectId, name: a.name, parentBranchId: a.sourceBranchId,
-        atLsn: lsn, createdBy: a.createdBy ?? "api",
+        atLsn: lsn, createdBy: a.createdBy ?? "api", context: a.context ?? null,
       });
     } catch (e) {
       throw this.classifyLsnRangeError(e);

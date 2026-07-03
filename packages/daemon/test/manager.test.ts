@@ -62,6 +62,7 @@ function fakeBranch(overrides: Partial<BranchRow> = {}): BranchRow {
     importStatus: "none",
     importError: null,
     createdBy: "api",
+    context: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...overrides,

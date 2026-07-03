@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS branches (
   endpoint_error TEXT,
   import_status TEXT NOT NULL DEFAULT 'none',
   import_error TEXT,
+  context TEXT,
   created_by TEXT NOT NULL DEFAULT 'api',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),

@@ -11,6 +11,15 @@ export const DEFAULT_PG_VERSION: PgVersion = 17;
 export const EndpointStatusSchema = z.enum(["stopped", "starting", "running", "stopping", "failed"]);
 export type EndpointStatus = z.infer<typeof EndpointStatusSchema>;
 
+export const BranchContextSchema = z.object({
+  git_branch: z.string().optional(),
+  workdir: z.string().optional(),
+  agent: z.string().optional(),
+  purpose: z.string().optional(),
+  client: z.object({ name: z.string(), version: z.string() }).optional(),
+});
+export type BranchContext = z.infer<typeof BranchContextSchema>;
+
 export interface ProjectDto {
   id: string;
   name: string;
