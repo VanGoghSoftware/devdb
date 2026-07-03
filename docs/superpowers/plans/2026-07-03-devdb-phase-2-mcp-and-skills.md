@@ -885,6 +885,14 @@ git commit -m "chore: add @modelcontextprotocol/sdk (daemon + integration); pin 
 
 Mount a session-stateful Streamable-HTTP endpoint at `/mcp` on the existing Fastify app. Each `initialize` mints a session (per-session `McpServer` holding the client's `Implementation`), DNS-rebinding validation runs on every request, and an idle sweep evicts abandoned sessions (agents drop connections without a clean `DELETE`). No tools yet — this task lands the handshake.
 
+> **AMENDED (2026-07-03, execution — SDK API pinned in Task 7, verified against installed `@modelcontextprotocol/sdk@1.29.0` `.d.ts`; supersedes the Step-7/8 code where they differ):** the plan's Step-8 `registerMcp` code used the transport's built-in DNS-rebinding options, which are **`@deprecated`** in 1.29.0. Corrections (see `packages/daemon/src/mcp/sdk-notes.md`):
+> - **Rebinding guard is a Fastify hook, NOT a transport option.** Do the Host/Origin allowlist check in a Fastify `onRequest` (or `preHandler`) hook scoped to the `/mcp` routes — reject with 403 when `Host`/`Origin` is present and not in the allowlist (allowlist = `localhost`, `127.0.0.1`, `host.docker.internal` ± `:${httpPort}`, plus `cfg.mcpAllowedHosts`/`mcpAllowedOrigins`). Do NOT pass `enableDnsRebindingProtection`/`allowedHosts`/`allowedOrigins` to the transport.
+> - **Transport ctor:** `new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), onsessioninitialized: (id) => {…} })` — `onsessioninitialized`/`onsessionclosed` ARE ctor options. Import the class from `@modelcontextprotocol/sdk/server/streamableHttp.js` (options type lives in `webStandardStreamableHttp.d.ts`).
+> - **`onclose` is a post-construction property:** set `transport.onclose = () => { const id = transport.sessionId; if (id) void store.delete(id); }` AFTER `new`, not in the ctor.
+> - **`McpServer`:** `new McpServer({ name: "devdb", version: <PACKAGE_VERSION> }, { capabilities: { tools: { listChanged: true } }, instructions: MCP_INSTRUCTIONS })` — capabilities/instructions in the 2nd (`ServerOptions`) arg.
+> - **Client info:** read via `server.server.getClientVersion()` (the inner `Server`), returns `Implementation | undefined`.
+> - Everything else (`transport.handleRequest(req.raw, reply.raw, req.body)`, `transport.sessionId`, `isInitializeRequest` from `@modelcontextprotocol/sdk/types.js`, `SessionStore`, idle sweep, `mcp.closeAll()` in `preClose`) stands as written.
+
 **Files:**
 - Modify: `packages/daemon/src/config.ts:14-20,22-37,39-84` (`DEVDB_MCP_ALLOWED_HOSTS/ORIGINS`).
 - Create: `packages/daemon/src/mcp/instructions.ts`.
