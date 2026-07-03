@@ -162,4 +162,30 @@ describe("ManagedProcess", () => {
     await expect(pending).rejects.toThrow(/exited|before ready/i);
     expect(p.state).toBe("stopped");
   });
+
+  it("onStateChange fires on every distinct transition, and observer throws are swallowed", async () => {
+    const states: string[] = [];
+    const p = new ManagedProcess({
+      name: "fake", bin: node,
+      args: ["-e", "console.log('booting'); console.log('READY now'); setInterval(()=>{},1000)"],
+      readyNeedle: "READY",
+      onStateChange: (s) => { states.push(s); if (s === "running") throw new Error("observer boom"); },
+    });
+    await p.start();          // starting -> running
+    await p.stop();           // -> stopped
+    expect(states).toEqual(["starting", "running", "stopped"]);
+  });
+
+  it("crash after readiness reports failed via onStateChange", async () => {
+    const states: string[] = [];
+    const p = new ManagedProcess({
+      name: "crasher", bin: node,
+      args: ["-e", "console.log('READY'); setTimeout(()=>process.exit(1), 100)"],
+      readyNeedle: "READY",
+      onStateChange: (s) => states.push(s),
+    });
+    await p.start();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(states).toEqual(["starting", "running", "failed"]);
+  });
 });

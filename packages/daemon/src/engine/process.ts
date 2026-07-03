@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 
+export type ManagedProcessState = "stopped" | "starting" | "running" | "failed";
+
 export interface ManagedProcessOpts {
   name: string;
   bin: string;
@@ -10,6 +12,12 @@ export interface ManagedProcessOpts {
   readyNeedle: string;
   readyTimeoutMs?: number;
   onLine?: (line: string, stream: "stdout" | "stderr") => void;
+  // Fires on every DISTINCT state transition (no-ops if set to the same state twice — e.g. two
+  // internal call sites both trying to settle "failed"). Lets a caller (index.ts, composition
+  // root only) announce async transitions no service write initiated — a crash-after-running or
+  // an engine component dying/restarting — without process.ts importing anything from services/.
+  // Same swallow contract as onLine: an observer throwing must never break the child lifecycle.
+  onStateChange?: (state: ManagedProcessState) => void;
   // When true, spawn as its own process-group leader (setsid-equivalent via Node's `detached`)
   // and signal the whole group (`process.kill(-pid, sig)`) on stop — not just the direct child.
   // compute_ctl orphans its postgres child on SIGTERM (never waits for it, never sets
@@ -23,12 +31,36 @@ export interface ManagedProcessOpts {
 const RING_SIZE = 500;
 
 export class ManagedProcess {
-  state: "stopped" | "starting" | "running" | "failed" = "stopped";
+  private _state: ManagedProcessState = "stopped";
   pid: number | null = null;
   private child: ChildProcess | null = null;
   private ring: string[] = [];
 
   constructor(private opts: ManagedProcessOpts) {}
+
+  get state(): ManagedProcessState {
+    return this._state;
+  }
+
+  // Sole internal writer of _state — every one of the six former direct `this.state = ...`
+  // assignments now routes through here so onStateChange fires exactly once per distinct
+  // transition (the `===` no-op guard also means a redundant re-assertion of the current state,
+  // e.g. two paths both settling "failed", does not double-publish).
+  private setState(s: ManagedProcessState): void {
+    if (this._state === s) return;
+    this._state = s;
+    try {
+      this.opts.onStateChange?.(s);
+    } catch {
+      // observer errors must never break the child lifecycle — same swallow contract as onLine.
+    }
+  }
+
+  // Plain method (not the `state` getter) so a specific read in start()'s catch block isn't
+  // narrowed by TS across the preceding `setState("running")` call — see that call site's comment.
+  private readState(): ManagedProcessState {
+    return this._state;
+  }
 
   recentLines(n: number): string[] {
     return this.ring.slice(-n);
@@ -64,7 +96,7 @@ export class ManagedProcess {
     if (this.state === "running" || this.state === "starting") {
       throw new Error(`${this.opts.name} already ${this.state}`);
     }
-    this.state = "starting";
+    this.setState("starting");
     const timeoutMs = this.opts.readyTimeoutMs ?? 60_000;
 
     let child: ChildProcess;
@@ -76,7 +108,7 @@ export class ManagedProcess {
         detached: this.opts.detached ?? false,
       });
     } catch (e) {
-      this.state = "failed";
+      this.setState("failed");
       throw new Error(`${this.opts.name}: spawn failed synchronously: ${(e as Error).message}`);
     }
     this.child = child;
@@ -122,7 +154,7 @@ export class ManagedProcess {
       if (this.child === child) {
         this.pid = null;
         this.child = null;
-        if (this.state === "running") this.state = "failed";
+        if (this.state === "running") this.setState("failed");
       }
     });
     child.on("error", (e) => {
@@ -136,10 +168,17 @@ export class ManagedProcess {
 
     try {
       await readiness;
-      this.state = "running";
+      this.setState("running");
     } catch (e) {
-      // stop() may have claimed the transition ("stopped") while we were starting — don't clobber it.
-      if (this.state === "starting") this.state = "failed";
+      // stop() may have claimed the transition ("stopped") while we were starting — don't clobber
+      // it. Deliberately reads via readState(), NOT the `state` getter: TS's control-flow analysis
+      // (mis-)narrows `this.state` here to exclude "starting", reasoning from `this.setState
+      // ("running")` two lines above in the same `try` — it can't know that a concurrent stop()
+      // (an entirely separate method call, invoked by external code while this start() is
+      // suspended at `await readiness`) can reassign `_state` in between, which is exactly the race
+      // this branch exists to detect. A plain method call (unlike an accessor read) isn't narrowed
+      // by TS across statements, so readState() sidesteps the false positive with no cast needed.
+      if (this.readState() === "starting") this.setState("failed");
       if (this.child === child) {
         this.child = null;
         this.pid = null;
@@ -156,7 +195,7 @@ export class ManagedProcess {
   async stop(timeoutMs = 10_000): Promise<void> {
     const child = this.child;
     const pid = this.pid;
-    this.state = "stopped";
+    this.setState("stopped");
     if (!child) return;
     this.child = null;
     this.pid = null;

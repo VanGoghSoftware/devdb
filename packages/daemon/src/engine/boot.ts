@@ -16,7 +16,17 @@ export class EngineRuntime {
   private procs = new Map<string, ManagedProcess>();
   storconDbUri: string;
 
-  constructor(private cfg: DevdbConfig, private state: StateDb, private logs: LogsService) {
+  constructor(
+    private cfg: DevdbConfig,
+    private state: StateDb,
+    private logs: LogsService,
+    // Task 3 (phase 3): announces "engine.status() may have changed" for ANY supervised component
+    // (broker/storage_controller/safekeeper/pageserver) dying or restarting outside a service-
+    // initiated write — index.ts forwards this to /api/events as an `engine.health` invalidation
+    // hint. Deliberately optional/positional (matches ComputeManager's onStatusChange shape) so
+    // boot.test.ts's existing 3-arg construction stays valid untouched.
+    private onComponentStateChange?: (component: string, state: string) => void,
+  ) {
     let pw = state.settings.get("storcon_db_password");
     if (!pw) {
       pw = randomBytes(24).toString("hex");
@@ -41,6 +51,11 @@ export class EngineRuntime {
 
   private async launch(spec: { name: string; bin: string; args: string[]; readyNeedle: string }): Promise<void> {
     // onLine → stdout (docker logs) AND LogsService (SSE + recent() replay, `daemon:<name>`).
+    // onStateChange → onComponentStateChange, if index.ts wired one in (Task 3, phase 3). Only
+    // the four components launched through here get this hook — storcon_db/EmbeddedPostgres is
+    // deliberately excluded (it never goes through launch()/ManagedProcess at all): its state only
+    // changes during boot/shutdown, when no SSE client can be connected to observe it anyway;
+    // GET /api/status (this class's status() below) remains the source of truth for it either way.
     const proc = new ManagedProcess({
       ...spec,
       readyTimeoutMs: 120_000,
@@ -48,6 +63,7 @@ export class EngineRuntime {
         console.log(`[${spec.name}] ${line}`);
         this.logs.ingest(`daemon:${spec.name}`, line);
       },
+      onStateChange: (s) => this.onComponentStateChange?.(spec.name, s),
     });
     this.procs.set(spec.name, proc);
     await proc.start();

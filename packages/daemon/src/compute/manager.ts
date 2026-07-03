@@ -34,7 +34,21 @@ export class ComputeManager {
     private cfg: DevdbConfig,
     private logger: Logger,
     private waitReady: typeof waitComputeReady = waitComputeReady,
+    // Task 3 (phase 3): announces "statusOf(branchId) may have changed" — index.ts forwards this
+    // to /api/events as an `endpoint.status` invalidation hint. Coarse by design: over-firing is
+    // harmless (events are hints, not payloads), missing a transition is not. Kept optional and
+    // positional (like waitReady above) so every existing construction in this file's tests, which
+    // predate this arg, stays valid untouched.
+    private onStatusChange?: (branchId: string) => void,
   ) {}
+
+  private notifyStatus(branchId: string): void {
+    try {
+      this.onStatusChange?.(branchId);
+    } catch {
+      // observer must never break the compute lifecycle — swallow, same contract as onLine fanout.
+    }
+  }
 
   statusOf(branchId: string): EndpointStatus {
     const c = this.computes.get(branchId);
@@ -90,6 +104,7 @@ export class ComputeManager {
     };
     if (a.onLine) entry.listeners.push(a.onLine);
     this.computes.set(a.branch.id, entry);
+    this.notifyStatus(a.branch.id); // reservation: statusOf(branchId) just flipped "stopped" -> "starting"
 
     let dirCreated: string | null = null;
     try {
@@ -156,12 +171,18 @@ export class ComputeManager {
             }
           }
         },
+        // Task 3 (phase 3): the ONLY seam that reports a crash-after-running — no ComputeManager
+        // method call happens when compute_ctl dies on its own after start() has already returned.
+        // Without this, that transition (statusOf flipping "running" -> "failed") would never
+        // reach /api/events at all.
+        onStateChange: () => this.notifyStatus(a.branch.id),
       });
       await entry.proc.start();
       // Structural readiness gate (handover §4.3): the needle fires ~80-140ms before apply_spec
       // commits the branch's SCRAM verifier; block until compute_ctl_up{status="running"}.
       await this.waitReady(metricsPort);
       entry.phase = "running";
+      this.notifyStatus(a.branch.id); // phase flip: statusOf(branchId) just became "running"
       return { port };
     } catch (e) {
       // Failure cleanup follows stop()'s settlement order. Map entry first and unconditionally:
@@ -191,6 +212,7 @@ export class ComputeManager {
         }
       }
       if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
+      this.notifyStatus(a.branch.id); // terminal: statusOf(branchId) is back to "stopped" post-cleanup
       if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
       if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
@@ -334,6 +356,7 @@ export class ComputeManager {
     const entry = this.computes.get(branchId);
     if (!entry) return;
     entry.phase = "stopping";
+    this.notifyStatus(branchId); // phase flip: statusOf(branchId) just became "stopping"
     try {
       if (entry.proc) await entry.proc.stop(30_000);
     } finally {
@@ -342,6 +365,7 @@ export class ComputeManager {
       if (entry.port !== null) this.reservedPorts.delete(entry.port);
       if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
       if (entry.internalHttpPort !== null) this.reservedPorts.delete(entry.internalHttpPort);
+      this.notifyStatus(branchId); // terminal: entry removed, statusOf(branchId) is back to "stopped"
     }
   }
 

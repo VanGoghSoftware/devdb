@@ -56,10 +56,14 @@ async function main(): Promise<void> {
     // Phase 3 Task 1: constructed here so GET /api/events has a live EventsService to subscribe
     // against from daemon boot. Task 2 wires this same instance into every mutation service below
     // (projects/branches/endpoints/timetravel) so their create/delete/swap/status seams publish
-    // to it; Task 3 (MCP tool wrappers) is a separate emission surface, still pending.
+    // to it; Task 3 wires it into EngineRuntime/ComputeManager's async-observer hooks below (for
+    // transitions no service write initiates — a crash, or an engine component dying/restarting).
     const events = new EventsService();
     const logger = createLogger(logs);
-    engine = new EngineRuntime(cfg, state, logs);
+    // Task 3 (phase 3): the 4th ctor arg is the async-observer hook for engine components dying/
+    // restarting with no service write (e.g. pageserver crashing mid-session) — publishes a
+    // coarse `engine.health` invalidation hint for /api/events subscribers to react to.
+    engine = new EngineRuntime(cfg, state, logs, () => events.publish({ type: "engine.health" }));
     await engine.start();
 
     // Boot reconciliation (T16; extracted to state/reconcile.ts under Fix 4 for direct unit
@@ -79,7 +83,14 @@ async function main(): Promise<void> {
     const storcon = new StorconClient();
     const pageserver = new PageserverClient();
     const safekeeper = new SafekeeperClient();
-    computes = new ComputeManager(cfg, logger);
+    // Task 3 (phase 3): the 4th ctor arg is the async-observer hook for a compute crashing (or
+    // failing to start) with no service write in progress — publishes an `endpoint.status` hint,
+    // resolving projectId from state so SSE clients scoped to a project still see it. `undefined`
+    // for the 3rd (waitReady) arg keeps the real poller default; only this ctor's tail changes.
+    computes = new ComputeManager(cfg, logger, undefined, (branchId) => {
+      const b = state.branches.byId(branchId);
+      events.publish({ type: "endpoint.status", branchId, projectId: b?.projectId });
+    });
     const queue = new BranchQueue();
     // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
     // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.

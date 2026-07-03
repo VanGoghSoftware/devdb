@@ -525,4 +525,86 @@ describe("ComputeManager", () => {
     startMock.mockResolvedValueOnce(undefined);
     await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54333 });
   });
+
+  // Task 3 (phase 3): onStatusChange is the async-observer seam index.ts wires to /api/events —
+  // it must fire at every point statusOf(branchId) may have changed with no caller-visible write:
+  // map-slot reservation (statusOf flips from "stopped" to "starting" the instant start() is
+  // called, before any await), the phase flip to "running" after waitReady settles, the phase
+  // flip to "stopping" at the top of stop(), and the terminal "stopped" once the entry is removed.
+  // Drives waitReady manually (like the "statusOf reports 'starting'..." test above) to get a hook
+  // point BEFORE it resolves — the mocked ManagedProcess's `state` never advances on its own
+  // (unlike the real class), so it has to be driven to "running" by hand for statusOf() to agree.
+  it("onStatusChange fires across the compute lifecycle: reserve, running, stopping, gone", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    let resolveWaitReady!: () => void;
+    const deferredWaitReady = vi.fn(
+      () => new Promise<void>((resolve) => { resolveWaitReady = resolve; }),
+    );
+    const cfg = freshCfg();
+    const ticks: string[] = [];
+    const branch = fakeBranch();
+    const manager = new ComputeManager(
+      cfg, fakeLogger(), deferredWaitReady,
+      (branchId) => ticks.push(`${branchId}:${manager.statusOf(branchId)}`),
+    );
+
+    const startPromise = manager.start({ branch, pgVersion: 17 });
+    await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
+    const constructedProc = ManagedProcessMock.mock.results[0]!.value as { state: string };
+    constructedProc.state = "running"; // needle fired — models the real class's own transition
+    resolveWaitReady();
+    await startPromise;
+
+    await manager.stop(branch.id);
+
+    expect(ticks[0]).toBe(`${branch.id}:starting`); // map-slot reservation, before any await
+    expect(ticks).toContain(`${branch.id}:running`); // phase flip after waitReady resolves
+    expect(ticks).toContain(`${branch.id}:stopping`); // stop()'s phase flip
+    expect(ticks[ticks.length - 1]).toBe(`${branch.id}:stopped`); // entry removed — statusOf falls back to "stopped"
+  });
+
+  // A launch that fails readiness must still announce its terminal state: without this, a
+  // failed start's map entry cleanup (this file's other failure-cleanup tests) would be
+  // invisible to any /api/events subscriber that only ever heard "starting".
+  it("a failed start announces the terminal state after cleanup", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    const readinessError = new Error("compute readiness timed out after 50000ms");
+    const failingWaitReady = vi.fn().mockRejectedValueOnce(readinessError);
+    const cfg = freshCfg();
+    const ticks: string[] = [];
+    const branch = fakeBranch();
+    const manager = new ComputeManager(
+      cfg, fakeLogger(), failingWaitReady,
+      (branchId) => ticks.push(manager.statusOf(branchId)),
+    );
+
+    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute readiness timed out after 50000ms");
+
+    expect(ticks[ticks.length - 1]).toBe("stopped"); // entry deleted by the catch's cleanup
+  });
+
+  // The per-compute ManagedProcess is also wired with its own onStateChange (not just the three
+  // ComputeManager-driven notifyStatus call sites above) — a crash AFTER running (no ComputeManager
+  // method call at all; the mocked ManagedProcess instance settles its own state independently)
+  // must still reach onStatusChange, or a compute dying mid-flight would go unreported forever.
+  it("a crash-after-running on the underlying ManagedProcess reaches onStatusChange via its own onStateChange wiring", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    const cfg = freshCfg();
+    const ticks: string[] = [];
+    const branch = fakeBranch();
+    const manager = new ComputeManager(
+      cfg, fakeLogger(), fakeWaitReady(),
+      (branchId) => ticks.push(`${branchId}:${manager.statusOf(branchId)}`),
+    );
+
+    await manager.start({ branch, pgVersion: 17 });
+    ticks.length = 0; // only care about what happens after start() has already settled
+
+    const opts = ManagedProcessMock.mock.calls[0]![0] as { onStateChange?: (s: string) => void };
+    expect(opts.onStateChange).toBeTypeOf("function");
+    opts.onStateChange!("failed"); // simulate the crash the mock itself doesn't model
+
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0]).toMatch(new RegExp(`^${branch.id}:`));
+  });
 });
