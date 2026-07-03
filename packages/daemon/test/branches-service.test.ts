@@ -6,12 +6,18 @@ import { ProjectsService } from "../src/services/projects.js";
 import { LogsService } from "../src/services/logs.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { Logger } from "../src/logging/logger.js";
 import type { EndpointStatus } from "@devdb/shared";
 
 // Amendment A2: typed fakes satisfying the narrow service-facing interfaces from
 // services/engine-api.ts — no `as never` casts. Every method the interfaces declare must
 // exist on the fake (even ones a given test never exercises) or this file fails to typecheck.
-function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi } {
+//
+// Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
+// service's deps now require it (ProjectsDeps), for compensation-path logging.
+function fakes(): {
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
+} {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
     getLsnByTimestamp: vi.fn(async () => ({ lsn: "0/0", kind: "present" })),
@@ -39,7 +45,8 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
-  return { storcon, pageserver, safekeeper, computes };
+  const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+  return { storcon, pageserver, safekeeper, computes, logger };
 }
 
 async function seeded() {

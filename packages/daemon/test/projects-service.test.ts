@@ -6,6 +6,7 @@ import { slugify } from "../src/services/slug.js";
 import { LogsService } from "../src/services/logs.js";
 import { BranchQueue } from "../src/state/queue.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { Logger } from "../src/logging/logger.js";
 import type { BranchRow } from "../src/state/repos.js";
 import type { EndpointStatus } from "@devdb/shared";
 import { StorconClient } from "../src/engine/storcon-client.js";
@@ -23,9 +24,12 @@ import { loadConfig } from "../src/config.js";
 // jobs for that branch. Bundled here (not threaded through every call site individually) so
 // every existing `new ProjectsService({ state, ...f })` call keeps working unchanged; tests that
 // need to occupy a lane by hand destructure `f.queue` directly (see the two tests below).
+//
+// Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
+// service's deps now require it (ProjectsDeps), for compensation-path logging.
 function fakes(): {
   storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
-  queue: BranchQueue;
+  queue: BranchQueue; logger: Logger;
 } {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
@@ -51,7 +55,8 @@ function fakes(): {
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
-  return { storcon, pageserver, safekeeper, computes, queue: new BranchQueue() };
+  const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+  return { storcon, pageserver, safekeeper, computes, queue: new BranchQueue(), logger };
 }
 
 describe("slugify", () => {
@@ -68,7 +73,7 @@ describe("engine clients satisfy the narrow service interfaces (A2 type-level co
     const _storcon: StorconApi = new StorconClient();
     const _pageserver: PageserverApi = new PageserverClient();
     const _safekeeper: SafekeeperApi = new SafekeeperClient();
-    const _computes: ComputesApi = new ComputeManager(cfg);
+    const _computes: ComputesApi = new ComputeManager(cfg, { error: vi.fn(), warn: vi.fn(), info: vi.fn() });
     // Structural satisfaction above IS the check — if any interface method is missing or has
     // an incompatible signature, this file fails to typecheck (tsc / `vitest run --typecheck`).
     expect([_storcon, _pageserver, _safekeeper, _computes].every(Boolean)).toBe(true);

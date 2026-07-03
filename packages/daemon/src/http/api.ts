@@ -201,7 +201,7 @@ export function buildServer(deps: Deps): FastifyInstance {
   // would — an unauthenticated way to hold open arbitrarily many never-closing connections against
   // this daemon by hitting distinct nonsense component names, each backed by nothing.
   const DAEMON_LOG_COMPONENTS = new Set([
-    "storcon_db", "storage_broker", "storage_controller", "safekeeper", "pageserver",
+    "storcon_db", "storage_broker", "storage_controller", "safekeeper", "pageserver", "app",
   ]);
   app.get("/api/daemon/logs/:component", async (req, reply) => {
     const { component } = req.params as { component: string };

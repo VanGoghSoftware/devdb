@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { EndpointStatus, PgVersion } from "@devdb/shared";
 import type { DevdbConfig } from "../config.js";
 import type { BranchRow } from "../state/repos.js";
+import type { Logger } from "../logging/logger.js";
 import { engineDirs } from "../engine/configs.js";
 import { ManagedProcess } from "../engine/process.js";
 import { computeConfigJson } from "./spec.js";
@@ -23,7 +24,7 @@ export class ComputeManager {
   private computes = new Map<string, RunningCompute>();
   private reservedPorts = new Set<number>();
 
-  constructor(private cfg: DevdbConfig) {}
+  constructor(private cfg: DevdbConfig, private logger: Logger) {}
 
   statusOf(branchId: string): EndpointStatus {
     const c = this.computes.get(branchId);
@@ -203,7 +204,7 @@ export class ComputeManager {
       // referencing the SAME pg_data path is an invariant we don't understand yet, not a routine
       // occurrence. Still reap all of them (better an over-eager kill than a leaked writer), but
       // this must be loud: silently reaping N>1 would hide whatever produced the collision.
-      console.error(
+      this.logger.error(
         `reapOrphanedPostgres: invariant violation — ${matches.length} processes reference ` +
         `${pgDataDir} (expected at most 1, mkdtemp paths should be unique): pids ${matches.join(", ")}`,
       );
@@ -234,7 +235,7 @@ export class ComputeManager {
     // Give SIGKILL a brief window to actually land before returning to the caller (which
     // immediately attempts rm() on the directory this process still has open).
     if (!(await this.pollForExit(pid, 10, 100))) {
-      console.error(`reapOrphanedPostgres: pid ${pid} still alive ~1s after SIGKILL — proceeding anyway`);
+      this.logger.error(`reapOrphanedPostgres: pid ${pid} still alive ~1s after SIGKILL — proceeding anyway`);
     }
   }
 
@@ -275,14 +276,14 @@ export class ComputeManager {
       await rm(dir, { recursive: true, force: true });
     } catch (e) {
       if ((e as { code?: string }).code !== "ENOTEMPTY") {
-        console.error(`${ctx}: rm() failed unexpectedly for ${dir} — giving up (not retried):`, e);
+        this.logger.error(`${ctx}: rm() failed unexpectedly for ${dir} — giving up (not retried)`, e);
       } else {
-        console.error(`${ctx}: rm() hit ENOTEMPTY for ${dir} after reaping — retrying reap+rm once:`, e);
+        this.logger.error(`${ctx}: rm() hit ENOTEMPTY for ${dir} after reaping — retrying reap+rm once`, e);
         await this.reapOrphanedPostgres(dir);
         try {
           await rm(dir, { recursive: true, force: true });
         } catch (e2) {
-          console.error(`${ctx}: retry of reap+rm also failed for ${dir} — giving up:`, e2);
+          this.logger.error(`${ctx}: retry of reap+rm also failed for ${dir} — giving up`, e2);
         }
       }
     }

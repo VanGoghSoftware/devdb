@@ -85,14 +85,14 @@ export class EndpointsService {
         // believes exists. Best-effort tear the compute back down and mark the branch failed
         // before surfacing the original persist error.
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
-          console.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure:`, stopErr));
+          this.deps.logger.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure`, stopErr));
         try {
           this.deps.state.branches.updateEndpoint(branch.id, {
             status: "failed", port: null,
             error: (persistErr as Error).message?.slice(0, 2000) ?? String(persistErr),
           });
         } catch (e2) {
-          console.error(`compensation failed — could not persist "failed" status for branch ${branch.id}:`, e2);
+          this.deps.logger.error(`compensation failed — could not persist "failed" status for branch ${branch.id}`, e2);
         }
         throw persistErr;
       }

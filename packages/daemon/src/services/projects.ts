@@ -3,6 +3,7 @@ import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
 import type { LogsService } from "./logs.js";
+import type { Logger } from "../logging/logger.js";
 import type { BranchQueue } from "../state/queue.js";
 import { newHexId } from "../engine/ids.js";
 import { generatePassword } from "../compute/scram.js";
@@ -29,6 +30,7 @@ export interface ProjectsDeps {
   safekeeper: SafekeeperApi;
   computes: ComputesApi;
   queue: BranchQueue;
+  logger: Logger;
 }
 
 // oracle: tenant config values src/mgmt/service/project.rs:95-108
@@ -104,9 +106,9 @@ export class ProjectsService {
       // compensation: never leave a live tenant on the engine for a create that failed after
       // tenantCreate succeeded (best-effort — loud on failure rather than silently swallowed).
       await this.deps.pageserver.tenantDelete(projectId).catch((c) =>
-        console.error(`compensation failed — orphaned tenant ${projectId} on pageserver:`, c));
+        this.deps.logger.error(`compensation failed — orphaned tenant ${projectId} on pageserver`, c));
       await this.deps.safekeeper.tenantDelete(projectId).catch((c) =>
-        console.error(`compensation failed — orphaned tenant ${projectId} on safekeeper:`, c));
+        this.deps.logger.error(`compensation failed — orphaned tenant ${projectId} on safekeeper`, c));
       throw e;
     }
   }
@@ -203,8 +205,8 @@ export class ProjectsService {
       } catch (e) {
         const isFkViolation = (e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT");
         if (!isFkViolation || attempt >= MAX_FINAL_SWEEPS) throw e;
-        console.error(
-          `projects.delete(${project.id}): FK constraint on final row-delete (attempt ${attempt}/${MAX_FINAL_SWEEPS}) — a branch likely appeared after the last sweep; re-draining:`,
+        this.deps.logger.error(
+          `projects.delete(${project.id}): FK constraint on final row-delete (attempt ${attempt}/${MAX_FINAL_SWEEPS}) — a branch likely appeared after the last sweep; re-draining`,
           e,
         );
         await this.drainBranches(project.id);

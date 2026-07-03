@@ -15,6 +15,7 @@ import { EndpointsService } from "./services/endpoints.js";
 import { TimeTravelService } from "./services/timetravel.js";
 import { SqlService } from "./services/sql.js";
 import { LogsService } from "./services/logs.js";
+import { createLogger } from "./logging/logger.js";
 import { BranchQueue } from "./state/queue.js";
 import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js";
 import { engineDirs } from "./engine/configs.js";
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
   try {
     const state = openState(join(cfg.dataDir, "state.db"));
     const logs = new LogsService();
+    const logger = createLogger(logs);
     engine = new EngineRuntime(cfg, state, logs);
     await engine.start();
 
@@ -71,17 +73,19 @@ async function main(): Promise<void> {
     const storcon = new StorconClient();
     const pageserver = new PageserverClient();
     const safekeeper = new SafekeeperClient();
-    computes = new ComputeManager(cfg);
+    computes = new ComputeManager(cfg, logger);
     const queue = new BranchQueue();
     // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
     // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.
     // Fix 1 (final review wave): `queue` wired into ProjectsService too — delete()'s per-leaf
     // teardown now runs inside queue.run(leaf.id, ...), the SAME lane BranchesService/
     // EndpointsService already serialize start()/stop()/create()/delete() through for a branch id.
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
-    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs });
-    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs });
-    const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints });
+    // Task 4: `logger` wired via the shared ProjectsDeps interface (routes compensation-path
+    // console.error calls through LogsService's daemon:app channel, in addition to stderr).
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, logger });
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, logger });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, logger });
+    const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, logger });
     const sql = new SqlService({ branches, endpoints });
 
     const app = buildServer({ cfg, state, engine, logs, services: { projects, branches, endpoints, timetravel, sql } });

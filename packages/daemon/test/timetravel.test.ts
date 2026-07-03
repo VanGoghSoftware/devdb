@@ -9,6 +9,7 @@ import { TimeTravelService } from "../src/services/timetravel.js";
 import { LogsService } from "../src/services/logs.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { Logger } from "../src/logging/logger.js";
 import type { EndpointStatus } from "@devdb/shared";
 
 // Fix 3 (review): a small typed BranchDetail fixture builder — replaces the `({}) as never`
@@ -33,7 +34,12 @@ function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetai
 // Amendment A2 (controller, extended to this task): typed fakes satisfying the narrow
 // service-facing interfaces from services/engine-api.ts — no `as never` casts. Mirrors
 // branches-service.test.ts / endpoints-service.test.ts's fakes().
-function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi } {
+//
+// Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
+// service's deps now require it (ProjectsDeps), for compensation-path logging.
+function fakes(): {
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
+} {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
     getLsnByTimestamp: vi.fn(async () => ({ lsn: "0/AA", kind: "present" })),
@@ -61,7 +67,8 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
-  return { storcon, pageserver, safekeeper, computes };
+  const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+  return { storcon, pageserver, safekeeper, computes, logger };
 }
 
 // TimeTravelService depends on EndpointsService only through its unqueued *Locked internals

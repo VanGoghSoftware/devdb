@@ -104,9 +104,9 @@ export class BranchesService {
         // compensation: never leave a live timeline on the engine for a create that failed after
         // timelineCreate succeeded (best-effort — loud on failure rather than silently swallowed).
         await this.deps.pageserver.timelineDelete(project.id, timelineId).catch((c) =>
-          console.error(`compensation failed — orphaned timeline ${timelineId} on pageserver:`, c));
+          this.deps.logger.error(`compensation failed — orphaned timeline ${timelineId} on pageserver`, c));
         await this.deps.safekeeper.timelineDelete(project.id, timelineId).catch((c) =>
-          console.error(`compensation failed — orphaned timeline ${timelineId} on safekeeper:`, c));
+          this.deps.logger.error(`compensation failed — orphaned timeline ${timelineId} on safekeeper`, c));
         if ((e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
           throw new DevdbError(409, `branch identity conflicts with an existing one`);
         }

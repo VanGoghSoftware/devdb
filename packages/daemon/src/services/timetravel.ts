@@ -214,9 +214,9 @@ export class TimeTravelService {
         // compensation paths).
         if (newTimelineCreated) {
           await this.deps.pageserver.timelineDelete(branch.projectId, newTimelineId).catch((c) =>
-            console.error(`compensation failed — orphaned timeline ${newTimelineId} on pageserver:`, c));
+            this.deps.logger.error(`compensation failed — orphaned timeline ${newTimelineId} on pageserver`, c));
           await this.deps.safekeeper.timelineDelete(branch.projectId, newTimelineId).catch((c) =>
-            console.error(`compensation failed — orphaned timeline ${newTimelineId} on safekeeper:`, c));
+            this.deps.logger.error(`compensation failed — orphaned timeline ${newTimelineId} on safekeeper`, c));
         }
         // The swap never happened on any path that reaches here — restoreSwap is the last
         // operation in the try block above, so branch.id is still the original, unchanged
@@ -225,7 +225,7 @@ export class TimeTravelService {
         // failure, not swallowed — same discipline as the two deletes above).
         if (wasRunning) {
           await this.deps.endpoints.startLocked(lane, branch.id).catch((c) =>
-            console.error(`compensation failed — endpoint for branch ${branch.id} not restarted after a failed restore:`, c));
+            this.deps.logger.error(`compensation failed — endpoint for branch ${branch.id} not restarted after a failed restore`, c));
         }
         throw e;
       }
