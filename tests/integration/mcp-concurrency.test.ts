@@ -15,9 +15,9 @@ const connStr = (text: string) => text.match(/postgresql:\/\/\S+/)![0];
 // touches concurrently: the per-branch BranchQueue lanes (state/queue.ts, Task 1) serializing
 // each branch's own create->start->delete sequence, and ComputeManager's single process-wide
 // `reservedPorts` Set (compute/manager.ts) arbitrating the SAME port range across DIFFERENT
-// branches' concurrent endpoint starts (see allocatePort's real tryBind() probe + the
-// synchronous `reservedPorts.add(port)` right after each await resolves — compute/ports.ts,
-// compute/manager.ts:96-97).
+// branches' concurrent endpoint starts (see allocatePort's reserve-then-probe: it claims each
+// candidate into the shared reservedPorts set synchronously, BEFORE its real tryBind() probe's
+// await, so two interleaved starts can never be handed the same port — compute/ports.ts).
 describe("mcp concurrency (parked §4.6, the product's core promise)", () => {
   let dev: Devdb;
   let bootstrap: Client;

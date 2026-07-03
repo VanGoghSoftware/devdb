@@ -97,4 +97,15 @@ describe("allocatePort", () => {
     expect(rejections[0]).toBeInstanceOf(PortExhaustedError);
     expect(reserved).toEqual(new Set(fulfilled)); // exactly the handed-out ports stay claimed
   });
+  it("releases the claim and propagates when the probe rejects — no leak on a throwing probe", async () => {
+    const reserved = new Set<number>();
+    const boom = new Error("probe exploded");
+    await expect(
+      allocatePort({ min: 56400, max: 56401 }, 56400, reserved, () => Promise.reject(boom)),
+    ).rejects.toBe(boom);
+    // Pre-fix the candidate stayed claimed: `delete` ran only after a `false` return, never on a
+    // throw, so a rejecting probe leaked its claim into the shared set. The finally releases it on
+    // either path — the throw propagates unchanged, but nothing is left reserved.
+    expect(reserved.size).toBe(0);
+  });
 });
