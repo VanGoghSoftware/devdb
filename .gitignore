@@ -5,3 +5,5 @@ dist/
 .devdb-data/
 .superpowers/
 .idea/
+.DS_Store
+.claude/settings.local.json
