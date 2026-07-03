@@ -36,19 +36,27 @@ describe("mcp handshake", () => {
   });
 
   // Task 9 flip (was Task 8's tripwire: "has no tools/list handler yet — listTools() rejects with
-  // Method not found"). Task 9 registers the 5 read tools (get_status, list_projects,
+  // Method not found"). Task 9 registers the first 5 read tools (get_status, list_projects,
   // create_project, list_branches, get_branch) — registerTool()'s side effect (see the sibling
   // test's comment above) wires up the real tools/list JSON-RPC handler, so listTools() now
   // genuinely resolves instead of rejecting with -32601. This is the natural regression check for
   // Task 8's own assumption ("no tools yet") no longer holding, and proves the handshake-level
   // (not just unit-level, see mcp-tools.test.ts) tool surface is live end-to-end over the real
   // Streamable-HTTP transport.
-  it("lists exactly the 5 registered read tools via a real tools/list round-trip", async () => {
+  //
+  // Updated for Tasks 10-11: those tasks registered 5 more tools (create_branch, stop_endpoint,
+  // delete_branch, reset_branch, restore_branch) alongside Task 9's original 5, bringing the full
+  // MCP surface to 10 — this assertion now covers all of them so a future registration drift here
+  // is caught at the handshake level, not just in mcp-tools.test.ts's unit-level registration check.
+  it("lists all 10 registered tools via a real tools/list round-trip", async () => {
     const client = new Client({ name: "test", version: "1.0.0" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${dev.base}/mcp`)));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["create_project", "get_branch", "get_status", "list_branches", "list_projects"].sort(),
+      [
+        "create_branch", "create_project", "delete_branch", "get_branch", "get_status",
+        "list_branches", "list_projects", "reset_branch", "restore_branch", "stop_endpoint",
+      ].sort(),
     );
     await client.close();
   });
