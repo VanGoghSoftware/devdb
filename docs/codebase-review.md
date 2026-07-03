@@ -124,3 +124,9 @@ Found six credible issues at or above P4, mostly around queue semantics, failure
 Scope: whole-surface code scan over TimeTravelService, endpoint locked API, compute manager, HTTP time-travel routes, and time-travel tests; no tests were run.
 
 Findings: 7 new findings. The highest-risk areas are reset/create serialization, non-atomic restore/reset failure paths between engine and DB state, and compute stop cleanup when orphaned postgres reaping is incomplete.
+
+
+## 2026-07-03 02:46 CEST - Model-backed whole-surface scan
+Scope: whole-surface code scan; no tests were run.
+
+Found 6 new issues: SSE backpressure can buffer without bound, compute startup logs are missed, compute log subscriptions leak through branch deletion, LogsService channel maps are unbounded, the testcontainers retry workaround can leave live failed-attempt containers during the run, and boot reconciliation lacks coverage for failed/error-preservation cases.
