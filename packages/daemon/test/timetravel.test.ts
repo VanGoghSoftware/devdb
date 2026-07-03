@@ -297,4 +297,44 @@ describe("TimeTravelService", () => {
     expect(startLocked).toHaveBeenCalledWith(project2.mainBranch.id);
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
+
+  // Regression (P3, initial-stop strand): the FIRST stop — the one that quiesces a running
+  // endpoint BEFORE the swap's try/catch — used to sit OUTSIDE that try/catch. If it threw, the
+  // method exited before the compensation path, leaving the previously-running branch stranded
+  // stopped even though no timeline/swap work happened and the restore ultimately failed. The
+  // initial stop must be under the same discipline: a stop failure restarts the original endpoint
+  // and rethrows, and — since no timeline was created yet — must NOT try to delete one.
+  it("restoreInPlace restarts the original endpoint when the INITIAL stop fails (no strand)", async () => {
+    const { f, mainBranch, state } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValue("running");
+    const queue = new BranchQueue();
+    const project2 = await new ProjectsService({ state, queue, ...f }).create({ name: "stopfail" });
+    const branches = new BranchesService({ state, queue, ...f });
+    // A real, typed BranchDetail for the compensating restart's return (no `as never` cast);
+    // resolving rather than rejecting keeps the compensation's best-effort .catch() quiet.
+    const restarted = await branches.detail(branches.byIdOr404(project2.mainBranch.id));
+    const startLocked = vi.fn(async () => restarted);
+    const stopLocked = vi.fn(async () => { throw new Error("stop boom"); });
+    const tt2 = new TimeTravelService({
+      state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
+    });
+
+    await expect(tt2.restoreInPlace(project2.mainBranch.id, "2026-07-02T10:00:00Z"))
+      .rejects.toThrow(/stop boom/);
+
+    expect(stopLocked).toHaveBeenCalledWith(project2.mainBranch.id);
+    // The strand fix: the swap never began (the stop is its first side effect), so branch.id is
+    // still the ORIGINAL, unchanged identity — the previously-running endpoint is restarted on
+    // THAT id, not left stopped.
+    expect(startLocked).toHaveBeenCalledWith(project2.mainBranch.id);
+    // ...and strictly AFTER the failed stop — the restart is a COMPENSATION for it, never a
+    // pre-stop start (invocationCallOrder is vitest's global 1-indexed call sequence).
+    expect(stopLocked.mock.invocationCallOrder[0]!)
+      .toBeLessThan(startLocked.mock.invocationCallOrder[0]!);
+    // The stop failed before any timeline was created — the newTimelineCreated guard must keep the
+    // compensation from deleting a timeline that never existed.
+    expect(f.pageserver.timelineDelete).not.toHaveBeenCalled();
+    expect(f.safekeeper.timelineDelete).not.toHaveBeenCalled();
+    void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
+  });
 });
