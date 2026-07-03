@@ -527,4 +527,274 @@ describe("MCP read tools", () => {
       });
     });
   });
+
+  // Task 11: the four branch-mutation tools. Same primeRunningAfterStart() fixture as
+  // create_branch above (statusOf flips "stopped" once then "running" post-start, portOf returns
+  // a concrete port) — reused here so stop_endpoint/reset_branch/restore_branch's connection-
+  // string-bearing assertions have a real "running" endpoint to observe, not the fakes() default
+  // (statusOf always "stopped").
+  function primeRunningAfterStart(h: McpToolsHarness, port = 54301): void {
+    vi.mocked(h.engineFakes.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(h.engineFakes.computes.portOf).mockReturnValue(port);
+  }
+
+  describe("stop_endpoint", () => {
+    it("stops a running endpoint and reports it stopped, with a next-step hint naming get_branch", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      await h.call("create_branch", { project: "shop", name: "feature" });
+      // primeRunningAfterStart's "running" latch (consumed once as "stopped" by create_branch's
+      // own auto-start) is still in effect here — a real ComputeManager.statusOf() would report
+      // "stopped" once EndpointsService.stopLocked's own computes.stop() call has actually torn
+      // the compute down; this fake needs an explicit re-latch to reflect that same transition
+      // (mirrors endpoints-service.test.ts's "stop calls computes.stop and returns the branch as
+      // stopped" fixture, which never re-primes "running" in the first place).
+      vi.mocked(h.engineFakes.computes.statusOf).mockReturnValue("stopped");
+
+      const res = await h.call("stop_endpoint", { project: "shop", branch: "feature" });
+
+      expect(res.isError).toBeFalsy();
+      expect(h.engineFakes.computes.stop).toHaveBeenCalled();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstLine(firstText(res))).toMatch(/branch "feature"/);
+      expect(firstText(res)).toMatch(/stopped/);
+      expect(firstText(res)).toMatch(/get_branch/);
+    });
+
+    it("on a missing project returns an actionable error naming list_projects", async () => {
+      h = await makeReadToolsHarness();
+      const res = await h.call("stop_endpoint", { project: "nope", branch: "main" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_projects/);
+    });
+
+    it("on a missing branch returns an actionable error naming list_branches", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("stop_endpoint", { project: "shop", branch: "nope" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_branches/);
+    });
+  });
+
+  describe("delete_branch", () => {
+    it("deletes a childless branch and reports it", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      await h.call("create_branch", { project: "shop", name: "scratch" });
+
+      const res = await h.call("delete_branch", { project: "shop", branch: "scratch" });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstLine(firstText(res))).toMatch(/branch "scratch"/);
+      expect(firstText(res)).toMatch(/deleted/);
+
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).not.toMatch(/scratch/);
+    });
+
+    // The brief's headline scenario: a branch with children must refuse deletion and surface the
+    // service's own "delete them first" remediation (BranchesService.delete, services/branches.ts)
+    // verbatim through the MCP guard() error path, not a generic/opaque failure.
+    it("surfaces the children-exist remediation", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      await h.call("create_branch", { project: "shop", name: "parent" });
+      await h.call("create_branch", { project: "shop", name: "child", parent: "parent" });
+
+      const res = await h.call("delete_branch", { project: "shop", branch: "parent" });
+
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/delete them first/);
+      expect(firstText(res)).toMatch(/child/);
+    });
+
+    it("on a missing project returns an actionable error naming list_projects", async () => {
+      h = await makeReadToolsHarness();
+      const res = await h.call("delete_branch", { project: "nope", branch: "main" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_projects/);
+    });
+
+    it("on a missing branch returns an actionable error naming list_branches", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("delete_branch", { project: "shop", branch: "nope" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_branches/);
+    });
+  });
+
+  describe("reset_branch", () => {
+    it("resets a branch to its parent's current state and reports the match, including a connection string when running", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      await h.call("create_branch", { project: "shop", name: "dev" });
+      // resetToParent's swap re-starts the endpoint on the swapped identity only if it was
+      // running beforehand (services/timetravel.ts's swapOntoNewTimeline) — statusOf's mock is
+      // already latched to "running" by primeRunningAfterStart, so the post-swap detail() call
+      // observes a live endpoint and portOf still returns the primed port.
+
+      const res = await h.call("reset_branch", { project: "shop", branch: "dev" });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstText(res)).toMatch(/reset to parent/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+    });
+
+    it("refuses on a branch with no parent (main) and surfaces the remediation", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("reset_branch", { project: "shop", branch: "main" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/no parent/);
+    });
+
+    it("refuses when children exist and surfaces the remediation", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      await h.call("create_branch", { project: "shop", name: "dev" });
+      await h.call("create_branch", { project: "shop", name: "grandchild", parent: "dev" });
+      const res = await h.call("reset_branch", { project: "shop", branch: "dev" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/delete them first/);
+    });
+
+    it("on a missing project returns an actionable error naming list_projects", async () => {
+      h = await makeReadToolsHarness();
+      const res = await h.call("reset_branch", { project: "nope", branch: "main" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_projects/);
+    });
+
+    it("on a missing branch returns an actionable error naming list_branches", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("reset_branch", { project: "shop", branch: "nope" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_branches/);
+    });
+  });
+
+  describe("restore_branch", () => {
+    it("with as_new_branch: recovers non-destructively into a NEW branch and returns its connection string", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "recovered",
+      });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstLine(firstText(res))).toMatch(/branch "recovered"/);
+      expect(firstLine(firstText(res))).toMatch(/forked from "main"/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res).toLowerCase()).toMatch(/next:/);
+
+      // the SOURCE branch ("main") must be untouched — this is the non-destructive path.
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/recovered/);
+      expect(firstText(list)).toMatch(/main/);
+    });
+
+    it("with as_new_branch: passes projectId/sourceBranchId/name/isoTimestamp/createdBy through to branchAtTimestamp, folding the session client into context", async () => {
+      h = await makeReadToolsHarness({ clientInfo: { name: "claude-code", version: "9.9" } });
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+      const project = h.deps.services.projects.byNameOr404("shop");
+      const main = h.deps.services.branches.byProjectAndNameOr404(project.id, "main");
+      const spy = vi.spyOn(h.deps.services.timetravel, "branchAtTimestamp");
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "recovered",
+        context: { purpose: "recover deleted rows" },
+      });
+
+      expect(res.isError).toBeFalsy();
+      expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: project.id, sourceBranchId: main.id, name: "recovered",
+        isoTimestamp: "2026-07-01T00:00:00Z", createdBy: "mcp",
+        context: expect.objectContaining({
+          purpose: "recover deleted rows",
+          client: { name: "claude-code", version: "9.9" },
+        }),
+      }));
+    });
+
+    // Mirrors create_branch's Fix 1 (task-10 fix wave): the new branch is already durably created
+    // by the time ensureRunning() runs — a thrown auto-start failure must NOT be allowed to look
+    // like an opaque/generic error, and the branch must NOT be deleted (it's restartable via
+    // get_branch). Reuses whatever shared helper create_branch's partial-success handling factors
+    // into (see tools.ts) rather than duplicating the behavior ad hoc.
+    it("as_new_branch's auto-start failure reports a partial success naming the new branch + endpoint_error + recovery, and does NOT delete it", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      vi.mocked(h.engineFakes.computes.start).mockRejectedValueOnce(new Error("compute_ctl exited before ready"));
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "recovered",
+      });
+
+      expect(res.isError).toBe(true);
+      const body = firstText(res);
+      expect(firstLine(body)).toMatch(/project "shop"/);
+      expect(firstLine(body)).toMatch(/branch "recovered"/);
+      expect(body.toLowerCase()).toMatch(/created/);
+      expect(body).toMatch(/compute_ctl exited before ready/);
+      expect(body).toMatch(/get_branch/);
+      expect(body).toMatch(/delete_branch/);
+
+      // the branch STILL EXISTS — proving restore_branch did not compensate/delete it away.
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/recovered/);
+    });
+
+    it("without as_new_branch: restores in place, says the endpoint was auto-stopped and restarted, and includes a connection string", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z",
+      });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstLine(firstText(res))).toMatch(/project "shop"/);
+      expect(firstText(res)).toMatch(/restored in place/);
+      expect(firstText(res)).toMatch(/2026-07-01T00:00:00Z/);
+      expect(firstText(res).toLowerCase()).toMatch(/auto-stopped|auto-restart|restarted/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+
+      // Identity swap (services/timetravel.ts's swapOntoNewTimeline, oracle-derived): "main" is
+      // now a FRESH row at the resolved point, and the pre-restore row survives archived under a
+      // "main_pitr_archived_<ts>" name — same shape timetravel.test.ts's own restoreInPlace test
+      // asserts at the service level. Both are real rows and both legitimately appear in
+      // list_branches; the point of THIS test is that "main" itself is still there under its
+      // original name (an in-place restore, not a rename-away or a new sibling branch).
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/\bmain\b/);
+      expect(firstText(list)).toMatch(/main_pitr_archived_/);
+    });
+
+    it("on a missing project returns an actionable error naming list_projects", async () => {
+      h = await makeReadToolsHarness();
+      const res = await h.call("restore_branch", { project: "nope", branch: "main", to_timestamp: "2026-07-01T00:00:00Z" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_projects/);
+    });
+
+    it("on a missing branch returns an actionable error naming list_branches", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("restore_branch", { project: "shop", branch: "nope", to_timestamp: "2026-07-01T00:00:00Z" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/list_branches/);
+    });
+  });
 });

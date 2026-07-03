@@ -113,6 +113,42 @@ function guard<A>(name: string, deps: ToolCtx["deps"], fn: (a: A) => Promise<Too
   };
 }
 
+// Shared by create_branch and restore_branch's as_new_branch path (Task 11): both durably create
+// a NEW branch first, then auto-start its endpoint via ensureRunning() — and both need IDENTICAL
+// partial-success handling if that auto-start throws. The branch (the valuable data fork) already
+// exists at that point; letting the throw escape to guard() would turn a partial success into an
+// opaque, generic error, and an agent would retry the CREATE call with the same name, hit a 409
+// duplicate, and be stuck with an orphaned branch it doesn't know exists. Do NOT delete the branch
+// (the endpoint is restartable — EndpointsService.startLocked's own catch block already persisted
+// a durable `endpointError` on the branch row before re-throwing, services/endpoints.ts) — instead
+// read the branch back to surface that persisted error, and name the recovery so a retry uses
+// get_branch, never another create call.
+async function startNewBranchOrPartialSuccess(
+  deps: ToolCtx["deps"],
+  branch: { id: string; name: string },
+  contextLineArgs: { project: string; branch: string; parent?: string },
+): Promise<{ ok: true; detail: Awaited<ReturnType<typeof deps.services.branches.detail>> } | { ok: false; result: ToolResult }> {
+  try {
+    const detail = await deps.services.endpoints.ensureRunning(branch.id);
+    return { ok: true, detail };
+  } catch {
+    // Re-fetch the row by id (not `branches.detail(branch)` with the pre-start `branch` object in
+    // hand) — `detail()` only re-derives LIVE compute status/port on top of whatever row it's
+    // handed, it does NOT re-read the row from SQLite itself, so the stale in-memory `branch` from
+    // before ensureRunning() ran would still show `endpointError: null` even though startLocked's
+    // catch block just persisted it.
+    const failed = await deps.services.branches.detail(deps.services.branches.byIdOr404(branch.id));
+    return {
+      ok: false,
+      result: errorResult(
+        `${contextLine(contextLineArgs)}\n` +
+        `  branch CREATED, but its endpoint failed to start: ${failed.endpointError ?? "unknown error"}\n` +
+        `Next: fix the cause and call get_branch "${branch.name}" to retry the endpoint, or delete_branch "${branch.name}" to discard.`,
+      ),
+    };
+  }
+}
+
 export function registerTools(server: McpServer, ctx: ToolCtx): void {
   const { deps } = ctx;
 
@@ -242,39 +278,102 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
       projectId: p.id, name, parentBranchId: parentRow?.id, atLsn, createdBy: "mcp", context: merged,
     });
 
-    // Fix 1 (task-10 fix wave, Important): the branch (the valuable data fork) already exists at
-    // this point — ONLY the auto-start is wrapped here, so a pre-create failure (bad project/
-    // parent, above) still flows through the shared guard() normally. If ensureRunning() throws
-    // (port exhaustion, compute launch failure), letting that escape to guard() would turn a
-    // partial success into an opaque, generic error — the agent would see a failure, retry
-    // create_branch with the SAME name, hit a 409 duplicate, and be stuck with an orphaned branch
-    // it doesn't know exists. Do NOT delete the branch (the endpoint is restartable —
-    // EndpointsService.startLocked's own catch block already persisted a durable `endpointError` on
-    // the branch row before re-throwing, services/endpoints.ts) — instead read the branch back to
-    // surface that persisted error, and name the recovery so a retry uses get_branch, never another
-    // create_branch.
-    let detail;
-    try {
-      detail = await deps.services.endpoints.ensureRunning(branch.id);
-    } catch {
-      // Re-fetch the row by id (not `branches.detail(branch)` with the pre-start `branch` object
-      // in hand) — `detail()` only re-derives LIVE compute status/port on top of whatever row it's
-      // handed, it does NOT re-read the row from SQLite itself, so the stale in-memory `branch`
-      // from before ensureRunning() ran would still show `endpointError: null` even though
-      // startLocked's catch block just persisted it.
-      const failed = await deps.services.branches.detail(deps.services.branches.byIdOr404(branch.id));
-      return errorResult(
-        `${contextLine({ project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" })}\n` +
-        `  branch CREATED, but its endpoint failed to start: ${failed.endpointError ?? "unknown error"}\n` +
-        `Next: fix the cause and call get_branch "${branch.name}" to retry the endpoint, or delete_branch "${branch.name}" to discard.`,
+    // Fix 1 (task-10 fix wave, Important; factored into a shared helper in task 11 since
+    // restore_branch's as_new_branch path needs IDENTICAL handling) — see
+    // startNewBranchOrPartialSuccess()'s doc comment above for the full rationale.
+    const contextArgs = { project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" };
+    const started = await startNewBranchOrPartialSuccess(deps, branch, contextArgs);
+    if (!started.ok) return started.result;
+
+    const dto = toBranchDto(started.detail);
+    return text(
+      `${contextLine(contextArgs)}\n` +
+      `${renderBranch(dto, 0, null)}\n` +
+      `Next: wire the connection string into your worktree env; delete_branch when the task is done.`,
+    );
+  }));
+
+  server.registerTool("stop_endpoint", {
+    description: "Stop a branch's endpoint (frees its port).",
+    inputSchema: { project: z.string(), branch: z.string() },
+  }, guard("stop_endpoint", deps, async ({ project, branch }: { project: string; branch: string }) => {
+    const p = deps.services.projects.byNameOr404(project);
+    const b = deps.services.branches.byProjectAndNameOr404(p.id, branch);
+    const dto = toBranchDto(await deps.services.endpoints.stop(b.id));
+    return text(
+      `${contextLine({ project: p.name, branch: b.name })}\n` +
+      `  endpoint ${dto.endpointStatus}.\n` +
+      `Next: get_branch to restart it.`,
+    );
+  }));
+
+  server.registerTool("delete_branch", {
+    description: "Delete a branch. Fails if it has children (they are listed).",
+    inputSchema: { project: z.string(), branch: z.string() },
+  }, guard("delete_branch", deps, async ({ project, branch }: { project: string; branch: string }) => {
+    const p = deps.services.projects.byNameOr404(project);
+    const b = deps.services.branches.byProjectAndNameOr404(p.id, branch);
+    // A children-exist failure throws a DevdbError (services/branches.ts's delete()) naming the
+    // children and "delete them first" — guard() surfaces that message verbatim, no extra handling
+    // needed here.
+    await deps.services.branches.delete(b.id);
+    return text(`${contextLine({ project: p.name, branch: b.name })}\n  deleted.`);
+  }));
+
+  server.registerTool("reset_branch", {
+    description: "Discard a branch's changes; back to the parent's current state (the 'scrap and retry' move).",
+    inputSchema: { project: z.string(), branch: z.string() },
+  }, guard("reset_branch", deps, async ({ project, branch }: { project: string; branch: string }) => {
+    const p = deps.services.projects.byNameOr404(project);
+    const b = deps.services.branches.byProjectAndNameOr404(p.id, branch);
+    const dto = toBranchDto(await deps.services.timetravel.resetToParent(b.id));
+    const conn = dto.connectionString ? `\n  connection: ${dto.connectionString}` : "";
+    return text(
+      `${contextLine({ project: p.name, branch: dto.name })}\n` +
+      `  reset to parent.${conn}\n` +
+      `Next: get_branch to confirm the connection string, or reset_branch again after further edits.`,
+    );
+  }));
+
+  const RestoreBranchShape = {
+    project: z.string(), branch: z.string(), to_timestamp: z.string(),
+    as_new_branch: z.string().optional(), context: BranchContextInputSchema.optional(),
+  };
+  server.registerTool("restore_branch", {
+    description: "Restore a branch to a past ISO-8601 timestamp. Provide as_new_branch (a name) to recover non-destructively into a new branch (recommended); omit for in-place restore (the endpoint is auto-stopped and restarted around it).",
+    inputSchema: RestoreBranchShape,
+  }, guard("restore_branch", deps, async ({ project, branch, to_timestamp, as_new_branch, context }: z.infer<z.ZodObject<typeof RestoreBranchShape>>) => {
+    const p = deps.services.projects.byNameOr404(project);
+    const b = deps.services.branches.byProjectAndNameOr404(p.id, branch);
+
+    if (as_new_branch) {
+      // Same session-client merge discipline as create_branch: the caller's own fork context plus
+      // the server-captured clientInfo, `client` spread LAST so a spoofed context.client can never
+      // win (belt-and-suspenders with the schema itself having no `client` key at all).
+      const merged = { ...(context ?? {}), client: ctx.clientInfo() };
+      const nb = await deps.services.timetravel.branchAtTimestamp({
+        projectId: p.id, sourceBranchId: b.id, name: as_new_branch, isoTimestamp: to_timestamp,
+        createdBy: "mcp", context: merged,
+      });
+
+      const contextArgs = { project: p.name, branch: nb.name, parent: b.name };
+      const started = await startNewBranchOrPartialSuccess(deps, nb, contextArgs);
+      if (!started.ok) return started.result;
+
+      const dto = toBranchDto(started.detail);
+      return text(
+        `${contextLine(contextArgs)}\n` +
+        `${renderBranch(dto, 0, null)}\n` +
+        `Next: verify the recovered data, then keep it or delete_branch "${nb.name}" once you're done.`,
       );
     }
 
-    const dto = toBranchDto(detail);
+    const dto = toBranchDto(await deps.services.timetravel.restoreInPlace(b.id, to_timestamp));
+    const conn = dto.connectionString ? `\n  connection: ${dto.connectionString}` : "";
     return text(
-      `${contextLine({ project: p.name, branch: branch.name, parent: parentRow?.name ?? "main" })}\n` +
-      `${renderBranch(dto, 0, null)}\n` +
-      `Next: wire the connection string into your worktree env; delete_branch when the task is done.`,
+      `${contextLine({ project: p.name, branch: dto.name })}\n` +
+      `  restored in place to ${to_timestamp} (endpoint auto-stopped and restarted).${conn}\n` +
+      `Next: verify the restored data.`,
     );
   }));
 }
