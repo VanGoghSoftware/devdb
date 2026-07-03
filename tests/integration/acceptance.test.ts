@@ -32,7 +32,9 @@ describe("phase-1 acceptance (spec v1 items 1-4, REST edition)", () => {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "agent/demo-task" }),
     })).json();
-    await sql("DELETE FROM notes", br.id);
+    const deleteResult = await sql("DELETE FROM notes", br.id);
+    expect(deleteResult.rowCount).toBe(1);
+    expect((await sql("SELECT count(*)::int AS n FROM notes", br.id)).rows[0].n).toBe(0);
     expect((await sql("SELECT count(*)::int AS n FROM notes")).rows[0].n).toBe(1);
 
     // Cheap addition: the branch tree is intact via the listing endpoint — parent/child links,

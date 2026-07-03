@@ -57,7 +57,10 @@ async function connectWithRetry(makeClient: () => pg.Client, attempts = 5, delay
 export class SqlService {
   constructor(private deps: { branches: BranchesService; endpoints: EndpointsService }) {}
 
-  async run(branchId: string, query: string): Promise<{ rows: unknown[]; rowCount: number; fields: string[] }> {
+  async run(
+    branchId: string,
+    query: string,
+  ): Promise<{ rows: unknown[]; rowCount: number; fields: string[]; truncated: boolean }> {
     if (!query.trim()) throw new DevdbError(400, "empty query");
     // ensureRunning is queued and idempotent (EndpointsService.ensureRunning shares startLocked's
     // queued body with start() — see endpoints.ts) — safe to call on every SQL request regardless
@@ -71,14 +74,36 @@ export class SqlService {
     const client = await connectWithRetry(() => new pg.Client({
       host: "127.0.0.1", port, user: "postgres",
       password: detail.password, database: "postgres",
-      statement_timeout: 30_000, connectionTimeoutMillis: 10_000,
+      statement_timeout: 30_000,
+      // statement_timeout is a session setting the submitted SQL can override (SET statement_timeout=0);
+      // query_timeout is driver-side and cannot be — the finally-end() then drops the connection,
+      // cancelling the backend.
+      query_timeout: 35_000,
+      connectionTimeoutMillis: 10_000,
     }));
     try {
       const res = await client.query(query);
-      const rows = (res.rows ?? []).slice(0, 1000);
-      return { rows, rowCount: res.rowCount ?? rows.length, fields: (res.fields ?? []).map((f) => f.name) };
+      // Simple-query protocol returns an ARRAY of results for multi-statement strings; report the last
+      // result carrying rows (psql display convention).
+      const results = Array.isArray(res) ? res : [res];
+      const last =
+        [...results].reverse().find((r) => (r.rows?.length ?? 0) > 0) ?? results[results.length - 1]!;
+      const allRows = last.rows ?? [];
+      const rows = allRows.slice(0, 1000);
+      return {
+        rows,
+        rowCount: last.rowCount ?? allRows.length,
+        fields: (last.fields ?? []).map((f: { name: string }) => f.name),
+        truncated: allRows.length > rows.length,
+      };
     } finally {
       await client.end();
     }
   }
 }
+
+/**
+ * Accepted limitations:
+ * 1. Full result materializes in daemon memory before capping to 1000 rows — streaming/pagination is a later-phase concern.
+ * 2. Object-keyed rows collapse duplicate column names — alias columns if you need both; object rows chosen deliberately for agent/MCP ergonomics.
+ */

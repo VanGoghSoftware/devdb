@@ -22,11 +22,12 @@ import { DevdbError } from "../src/services/errors.js";
 // Typed explicitly (rather than inferred from the factory's own initial-value literal) so that
 // later mockResolvedValueOnce()/mockRejectedValueOnce() calls with differently-shaped row objects
 // (e.g. { id, name } vs. { n }) aren't rejected against a `never[]`/literal type narrowed from
-// this file's very first empty-array default.
+// this file's very first empty-array default. The return type also accepts an array (for multi-statement queries).
 interface FakePgQueryResult { rows: unknown[]; rowCount: number | null; fields: { name: string }[] }
+type FakePgQueryReturnType = FakePgQueryResult | FakePgQueryResult[];
 const mockConnect = vi.fn(async () => {});
 const mockEnd = vi.fn(async () => {});
-const mockQuery = vi.fn<(query: string) => Promise<FakePgQueryResult>>(
+const mockQuery = vi.fn<(query: string) => Promise<FakePgQueryReturnType>>(
   async () => ({ rows: [], rowCount: 0, fields: [] }),
 );
 // Live-found (this task): real pg.Client instances are single-use — a SECOND .connect() call on
@@ -116,7 +117,7 @@ describe("SqlService", () => {
     expect(endpoints.ensureRunning).toHaveBeenCalledWith("branch-1");
   });
 
-  it("connects to 127.0.0.1:<port> as postgres with the branch's password, 30s statement timeout, 10s connect timeout", async () => {
+  it("connects to 127.0.0.1:<port> as postgres with the branch's password, 30s statement timeout, 35s query timeout, 10s connect timeout", async () => {
     const branches = fakeBranches();
     const { endpoints } = fakeEndpoints({ port: 54307, password: "hunter2" });
     const sql = new SqlService({ branches, endpoints });
@@ -126,7 +127,9 @@ describe("SqlService", () => {
     expect(ClientMock).toHaveBeenCalledWith({
       host: "127.0.0.1", port: 54307, user: "postgres",
       password: "hunter2", database: "postgres",
-      statement_timeout: 30_000, connectionTimeoutMillis: 10_000,
+      statement_timeout: 30_000,
+      query_timeout: 35_000,
+      connectionTimeoutMillis: 10_000,
     });
     expect(mockConnect).toHaveBeenCalledTimes(1);
   });
@@ -140,7 +143,7 @@ describe("SqlService", () => {
     expect(ClientMock).not.toHaveBeenCalled();
   });
 
-  it("returns rows/rowCount/fields from a successful query", async () => {
+  it("returns rows/rowCount/fields/truncated from a successful query", async () => {
     mockQuery.mockResolvedValueOnce({
       rows: [{ id: 1, name: "a" }, { id: 2, name: "b" }],
       rowCount: 2,
@@ -156,10 +159,11 @@ describe("SqlService", () => {
       rows: [{ id: 1, name: "a" }, { id: 2, name: "b" }],
       rowCount: 2,
       fields: ["id", "name"],
+      truncated: false,
     });
   });
 
-  it("caps returned rows at 1000 even when the query returns more", async () => {
+  it("caps returned rows at 1000 even when the query returns more, and sets truncated flag", async () => {
     const rows = Array.from({ length: 1500 }, (_, i) => ({ n: i }));
     mockQuery.mockResolvedValueOnce({ rows, rowCount: 1500, fields: [{ name: "n" }] });
     const branches = fakeBranches();
@@ -174,6 +178,7 @@ describe("SqlService", () => {
     // rowCount reports the query's TRUE count (1500), not the capped rows.length — the cap is a
     // response-size guard, not a lie about how many rows actually matched.
     expect(out.rowCount).toBe(1500);
+    expect(out.truncated).toBe(true);
   });
 
   it("falls back rowCount to the (possibly capped) rows.length when the driver reports rowCount as null", async () => {
@@ -186,6 +191,24 @@ describe("SqlService", () => {
     const out = await sql.run("branch-1", "CREATE TABLE t (n int)");
 
     expect(out.rowCount).toBe(2);
+  });
+
+  it("handles multi-statement queries by reporting the last result with rows (psql convention)", async () => {
+    // Simple-query protocol returns an ARRAY of results for multi-statement strings.
+    mockQuery.mockResolvedValueOnce([
+      { rows: [], rowCount: 0, fields: [] }, // CREATE TABLE result (no rows)
+      { rows: [{ id: 1 }, { id: 2 }], rowCount: 2, fields: [{ name: "id" }] }, // SELECT result
+    ]);
+    const branches = fakeBranches();
+    const { endpoints } = fakeEndpoints();
+    const sql = new SqlService({ branches, endpoints });
+
+    const out = await sql.run("branch-1", "CREATE TABLE t (id int); SELECT * FROM t");
+
+    expect(out.rows).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(out.rowCount).toBe(2);
+    expect(out.fields).toEqual(["id"]);
+    expect(out.truncated).toBe(false);
   });
 
   it("always ends the client connection, even when the query throws", async () => {

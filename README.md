@@ -16,12 +16,19 @@ Create a project (comes with a `main` branch):
 Start `main`'s endpoint and connect:
 
     curl -X POST http://localhost:4400/api/branches/<mainBranchId>/endpoint/start
+    # the start response includes connectionString — use it directly with psql
     psql 'postgresql://postgres:<password>@localhost:<port>/postgres'
 
 Branch it (instant, copy-on-write) and get an isolated database:
 
     curl -X POST http://localhost:4400/api/projects/<projectId>/branches \
       -H 'content-type: application/json' -d '{"name":"agent/my-task"}'
+
+Query via the API:
+
+    curl -X POST http://localhost:4400/api/sql \
+      -H 'content-type: application/json' \
+      -d '{"branchId":"<branchId>","query":"SELECT 1 AS ok"}'
 
 Time travel:
 
