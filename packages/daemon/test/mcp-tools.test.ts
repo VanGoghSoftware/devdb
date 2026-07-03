@@ -595,6 +595,21 @@ describe("MCP read tools", () => {
       expect(firstText(list)).not.toMatch(/scratch/);
     });
 
+    // Fix 3 (task-11 fix wave, fold): the response contract requires every SUCCESS to name a
+    // next step, same as every other mutation tool (create_branch/reset_branch/stop_endpoint all
+    // already do) — delete_branch's success previously stopped at "deleted." with nothing after.
+    it("a successful delete includes a next-step hint", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      await h.call("create_branch", { project: "shop", name: "scratch" });
+
+      const res = await h.call("delete_branch", { project: "shop", branch: "scratch" });
+
+      expect(res.isError).toBeFalsy();
+      expect(firstText(res).toLowerCase()).toMatch(/next:/);
+      expect(firstText(res)).toMatch(/list_branches|create_branch/);
+    });
+
     // The brief's headline scenario: a branch with children must refuse deletion and surface the
     // service's own "delete them first" remediation (BranchesService.delete, services/branches.ts)
     // verbatim through the MCP guard() error path, not a generic/opaque failure.
@@ -652,6 +667,20 @@ describe("MCP read tools", () => {
       const res = await h.call("reset_branch", { project: "shop", branch: "main" });
       expect(res.isError).toBe(true);
       expect(firstText(res)).toMatch(/no parent/);
+    });
+
+    // Fix 2 (task-11 fix wave, fold): "branch X has no parent" alone names the failure but not a
+    // next step — an agent hitting this on "main" (the only branch that can ever have no parent —
+    // only project.create() ever creates a parentless branch, per renderBranchTree's own doc
+    // comment above) has no way to self-correct from that phrase alone. Asserts the actual
+    // remediation TEXT (not just the bare "no parent" fact the prior test already covers) points
+    // at either resetting a child instead, or restore_branch as the past-point alternative.
+    it("the no-parent error on main names an actionable remediation (reset a child, or restore_branch instead)", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const res = await h.call("reset_branch", { project: "shop", branch: "main" });
+      expect(res.isError).toBe(true);
+      expect(firstText(res)).toMatch(/restore_branch/);
     });
 
     it("refuses when children exist and surfaces the remediation", async () => {
@@ -795,6 +824,167 @@ describe("MCP read tools", () => {
       const res = await h.call("restore_branch", { project: "shop", branch: "nope", to_timestamp: "2026-07-01T00:00:00Z" });
       expect(res.isError).toBe(true);
       expect(firstText(res)).toMatch(/list_branches/);
+    });
+
+    // Fix 1 (task-11 fix wave, CRITICAL — destructive footgun): the pre-fix handler branched on
+    // `if (as_new_branch)` — plain truthiness — while the schema accepted a bare
+    // `z.string().optional()`, so `as_new_branch: ""` (a caller who clearly INTENDED the
+    // non-destructive new-branch path but supplied an empty name) satisfied the schema, then fell
+    // through the falsy check straight into the DESTRUCTIVE in-place restore of the SOURCE branch
+    // — silent data loss, no error, nothing to signal the caller got the wrong path. The fix moves
+    // the rejection to the SCHEMA boundary (`z.string().trim().min(1).optional()`) so this fails
+    // BEFORE either restore path's handler body ever runs — asserted here by spying on BOTH
+    // `restoreInPlace` (the destructive path that must never fire) and `branchAtTimestamp` (the
+    // new-branch path, which also must never fire — an empty name isn't a valid new-branch name
+    // either) and proving neither was called, not just that the response looks like an error.
+    it("as_new_branch: \"\" (empty string) fails validation and does NOT fall through to the destructive in-place restore", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const restoreInPlaceSpy = vi.spyOn(h.deps.services.timetravel, "restoreInPlace");
+      const branchAtTimestampSpy = vi.spyOn(h.deps.services.timetravel, "branchAtTimestamp");
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "",
+      });
+
+      expect(res.isError).toBe(true);
+      // An actionable validation error — not a silent success and not an opaque crash.
+      expect(firstText(res).toLowerCase()).toMatch(/as_new_branch|empty|string/);
+
+      // The crux: NEITHER restore path's service method ran. Proves this failed at the validation
+      // boundary, before any side effect — not merely that the destructive path's OWN internal
+      // logic happened to bail out after already starting work.
+      expect(restoreInPlaceSpy).not.toHaveBeenCalled();
+      expect(branchAtTimestampSpy).not.toHaveBeenCalled();
+
+      // The source branch is provably untouched: still named "main", no archived sibling exists.
+      const list = await h.call("list_branches", { project: "shop" });
+      expect(firstText(list)).toMatch(/\bmain\b/);
+      expect(firstText(list)).not.toMatch(/_pitr_archived_/);
+    });
+
+    // Fix 1's "whitespace-only" companion — `.trim()` in the schema means a name of only spaces is
+    // ALSO rejected AT THE SCHEMA BOUNDARY (not silently trimmed down to "" and treated as
+    // present-with-empty-string, which would just move the footgun rather than closing it, and not
+    // merely failing LATER for an unrelated reason — e.g. slugify("   ") happens to produce an
+    // empty slug that some downstream validation might also reject, which would make this test
+    // pass for the wrong reason). Spies on BOTH service methods, same rigor as the crux empty-
+    // string test above, so a regression that let whitespace slip past the schema and only get
+    // caught deeper in branchAtTimestamp's own call chain is still caught as a real failure here.
+    it("as_new_branch: \"   \" (whitespace only) also fails validation at the schema boundary, not just a bare empty string", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      const restoreInPlaceSpy = vi.spyOn(h.deps.services.timetravel, "restoreInPlace");
+      const branchAtTimestampSpy = vi.spyOn(h.deps.services.timetravel, "branchAtTimestamp");
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "   ",
+      });
+
+      expect(res.isError).toBe(true);
+      expect(restoreInPlaceSpy).not.toHaveBeenCalled();
+      expect(branchAtTimestampSpy).not.toHaveBeenCalled();
+    });
+
+    // Fix 4 (task-11 fix wave, fold): the in-place path unconditionally claimed "endpoint
+    // auto-stopped and restarted" — but swapOntoNewTimeline (services/timetravel.ts) only restarts
+    // the endpoint on the swapped identity `if (wasRunning)` beforehand. A branch with NO running
+    // endpoint at restore time comes back STOPPED (no connectionString) — the old message would
+    // falsely claim a restart that never happened. The default harness fixture never calls
+    // create_branch/primeRunningAfterStart for "main" in this describe block's OTHER in-place test
+    // (which explicitly primes a running endpoint), so THIS test deliberately does NOT prime one —
+    // "main" starts genuinely stopped (fakes()'s own computes.statusOf default), exercising the
+    // false branch of the DTO-conditional message.
+    it("without as_new_branch, on a branch with NO running endpoint: does not falsely claim a restart, and points at get_branch", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      // No primeRunningAfterStart(h) call — main's endpoint is stopped (fakes() default:
+      // computes.statusOf always returns "stopped"), so swapOntoNewTimeline's `wasRunning` is
+      // false and it never calls startLocked on the swapped identity.
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z",
+      });
+
+      expect(res.isError).toBeFalsy();
+      const body = firstText(res);
+      expect(body).toMatch(/restored/);
+      // The false claim this fix removes: must NOT say the endpoint was restarted/auto-stopped-
+      // and-restarted when no endpoint was ever running to restart.
+      expect(body.toLowerCase()).not.toMatch(/restarted/);
+      expect(body.toLowerCase()).not.toMatch(/auto-stopped and restarted/);
+      // No connection string — the restored branch is genuinely stopped.
+      expect(body).not.toMatch(/postgresql:\/\//);
+      // Must still tell the caller how to get a connection: get_branch starts it.
+      expect(body).toMatch(/get_branch/);
+    });
+
+    // Fix 4's positive companion: re-asserts (alongside the existing "restores in place..." test
+    // above) that when the endpoint WAS running, the message DOES claim the restart — proving the
+    // conditional actually renders both branches of the DTO check, not just suppressing the claim
+    // unconditionally.
+    it("without as_new_branch, on a branch WITH a running endpoint: does claim the restart and includes a connection string", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z",
+      });
+
+      expect(res.isError).toBeFalsy();
+      const body = firstText(res);
+      expect(body.toLowerCase()).toMatch(/restarted/);
+      expect(body).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+    });
+
+    // Fix 5 (task-11 fix wave, fold): pins the SWAPPED-LIVE identity explicitly. The existing
+    // in-place test (above) already asserts a connection string appears and that BOTH "main" and
+    // the archived name appear somewhere in list_branches — but doesn't pin WHICH line the
+    // response's own FIRST line names. A regression that accidentally returned the ARCHIVED row's
+    // detail (e.g. wrong id passed to branches.detail after the swap) could still pass a loose
+    // "contains main somewhere" check if "main" happens to substring-match part of the archived
+    // name's prefix. This asserts the response's own context line (not just list_branches' output)
+    // names exactly "main" and does NOT include the archived suffix.
+    it("without as_new_branch: the response's own context line names the LIVE \"main\" identity, never the archived one", async () => {
+      h = await makeReadToolsHarness();
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z",
+      });
+
+      expect(res.isError).toBeFalsy();
+      const line = firstLine(firstText(res));
+      expect(line).toMatch(/branch "main"/);
+      expect(line).not.toMatch(/_pitr_archived_/);
+    });
+
+    // Fix 6 (task-11 fix wave, fold): restore_branch's as_new_branch path reuses create_branch's
+    // exact fork-context-merge spoof-safety property (`{ ...(context ?? {}), client: ctx.clientInfo() }`)
+    // but had no adversarial coverage of its own — mirrors create_branch's own "drops a
+    // caller-supplied context.client" test (above) so a regression specific to THIS callsite (e.g.
+    // someone copies the merge but gets the spread order backwards here while leaving
+    // create_branch's correct) is still caught.
+    it("as_new_branch: drops a caller-supplied context.client (schema has no such key) — the SERVER-captured session client always wins", async () => {
+      h = await makeReadToolsHarness({ clientInfo: { name: "claude-code", version: "9.9" } });
+      await h.call("create_project", { name: "shop" });
+      primeRunningAfterStart(h);
+
+      const res = await h.call("restore_branch", {
+        project: "shop", branch: "main", to_timestamp: "2026-07-01T00:00:00Z", as_new_branch: "recovered",
+        // `client` isn't part of the declared context schema — passed via an untyped bag to mirror
+        // an adversarial caller who ignores the declared schema, same discipline as
+        // create_branch's own spoof-safety test.
+        context: { purpose: "legit reason", client: { name: "FAKE", version: "0" } } as Record<string, unknown>,
+      });
+      expect(res.isError).toBeFalsy();
+
+      const list = await h.call("list_branches", { project: "shop" });
+      const body = firstText(list);
+      expect(body).toMatch(/claude-code/); // the server-captured session client
+      expect(body).not.toMatch(/FAKE/); // never the caller-spoofed one
     });
   });
 });

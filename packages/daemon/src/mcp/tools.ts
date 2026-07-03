@@ -317,7 +317,13 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     // children and "delete them first" — guard() surfaces that message verbatim, no extra handling
     // needed here.
     await deps.services.branches.delete(b.id);
-    return text(`${contextLine({ project: p.name, branch: b.name })}\n  deleted.`);
+    // Fix 3 (task-11 fix wave, fold): the response contract requires a next-step hint on every
+    // success — every other mutation tool in this file already names one; delete_branch's success
+    // previously stopped at "deleted." with nothing after.
+    return text(
+      `${contextLine({ project: p.name, branch: b.name })}\n  deleted.\n` +
+      `Next: list_branches to confirm, or create_branch to start a new working copy.`,
+    );
   }));
 
   server.registerTool("reset_branch", {
@@ -335,9 +341,19 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     );
   }));
 
+  // Fix 1 (task-11 fix wave, CRITICAL — destructive footgun): `as_new_branch` used to be a bare
+  // `z.string().optional()`, so an empty string satisfied the schema — and the handler branched on
+  // TRUTHINESS (`if (as_new_branch)`), so `as_new_branch: ""` (a caller who clearly INTENDED the
+  // non-destructive new-branch path but supplied an empty name) silently fell through to the
+  // DESTRUCTIVE in-place restore of the SOURCE branch. `.trim().min(1)` rejects an empty/
+  // whitespace-only name at the SDK's own inputSchema validation boundary — BEFORE either restore
+  // path's handler body ever runs, so a bad name fails safely (a validation error, no side effect)
+  // rather than silently diverting to the destructive path. `.trim()` matters on its own: without
+  // it, a whitespace-only name like "   " would pass `.min(1)` (length 3) and still reach the
+  // handler as a truthy-but-garbage value.
   const RestoreBranchShape = {
     project: z.string(), branch: z.string(), to_timestamp: z.string(),
-    as_new_branch: z.string().optional(), context: BranchContextInputSchema.optional(),
+    as_new_branch: z.string().trim().min(1).optional(), context: BranchContextInputSchema.optional(),
   };
   server.registerTool("restore_branch", {
     description: "Restore a branch to a past ISO-8601 timestamp. Provide as_new_branch (a name) to recover non-destructively into a new branch (recommended); omit for in-place restore (the endpoint is auto-stopped and restarted around it).",
@@ -346,7 +362,13 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     const p = deps.services.projects.byNameOr404(project);
     const b = deps.services.branches.byProjectAndNameOr404(p.id, branch);
 
-    if (as_new_branch) {
+    // Belt-and-suspenders alongside the schema fix above: branch on PRESENCE
+    // (`as_new_branch !== undefined`), not truthiness. Once the schema guarantees a supplied value
+    // is non-empty, this distinction is moot for THIS field specifically — but branching on
+    // presence rather than truthiness is the correct discipline for an optional-string "which path"
+    // selector in general (the schema is the one line of defense that can drift or be relaxed
+    // later; the handler's own branch condition should not silently rely on it never doing so).
+    if (as_new_branch !== undefined) {
       // Same session-client merge discipline as create_branch: the caller's own fork context plus
       // the server-captured clientInfo, `client` spread LAST so a spoofed context.client can never
       // win (belt-and-suspenders with the schema itself having no `client` key at all).
@@ -369,10 +391,21 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     }
 
     const dto = toBranchDto(await deps.services.timetravel.restoreInPlace(b.id, to_timestamp));
-    const conn = dto.connectionString ? `\n  connection: ${dto.connectionString}` : "";
+    // Fix 4 (task-11 fix wave, fold): swapOntoNewTimeline (services/timetravel.ts) only restarts
+    // the endpoint on the swapped identity `if (wasRunning)` beforehand — a branch with NO running
+    // endpoint at restore time comes back stopped, no connectionString. The pre-fix message
+    // unconditionally claimed "endpoint auto-stopped and restarted" regardless, which is simply
+    // false in that case. Rendered conditionally from the DTO instead: connectionString present
+    // (equivalently, endpointStatus === "running") means the restart genuinely happened, so the
+    // restart claim + connection string both render; otherwise the restored branch is stopped, so
+    // the message says so and points at get_branch (the same "how do I get a connection" next step
+    // every other stopped-endpoint response in this file already uses, e.g. get_branch's own
+    // `ensure_running` next-step hint above).
+    const body = dto.connectionString
+      ? `  restored in place to ${to_timestamp}; endpoint restarted, connection: ${dto.connectionString}`
+      : `  restored in place to ${to_timestamp} (endpoint is stopped — get_branch to start it).`;
     return text(
-      `${contextLine({ project: p.name, branch: dto.name })}\n` +
-      `  restored in place to ${to_timestamp} (endpoint auto-stopped and restarted).${conn}\n` +
+      `${contextLine({ project: p.name, branch: dto.name })}\n${body}\n` +
       `Next: verify the restored data.`,
     );
   }));

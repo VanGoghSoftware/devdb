@@ -107,7 +107,17 @@ export class TimeTravelService {
       archiveTag: "reset",
       detachAncestor: false,
       preflight: (branch) => {
-        if (!branch.parentBranchId) throw new DevdbError(400, `branch "${branch.name}" has no parent`);
+        // Fix 2 (task-11 fix wave, fold): "has no parent" alone names the failure but not a next
+        // step. Only project.create() ever creates a parentless branch (mcp/tools.ts's
+        // renderBranchTree doc comment) — i.e. this is reachable only on "main" — so the
+        // remediation names both alternatives an agent actually has: reset a CHILD branch instead,
+        // or use restore_branch to reach a past point on this same branch. Fixed here (not in the
+        // MCP tool wrapper) so REST callers get the same actionable message, not just MCP ones.
+        if (!branch.parentBranchId) {
+          throw new DevdbError(400,
+            `branch "${branch.name}" has no parent — reset needs a parent to reset to. ` +
+            `Reset a child branch instead, or use restore_branch to go to a past point on "${branch.name}".`);
+        }
         const children = this.deps.state.branches.listByParent(branch.id);
         if (children.length > 0) {
           throw new DevdbError(409,
