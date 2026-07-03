@@ -67,7 +67,7 @@ export class BranchesRepo {
   constructor(private db: Database.Database) {}
   create(a: {
     id: string; projectId: string; parentBranchId: string | null; name: string; slug: string;
-    timelineId: string; password: string; createdBy: string; context?: BranchContext | null;
+    timelineId: string; password: string; createdBy: BranchRow["createdBy"]; context?: BranchContext | null;
   }): BranchRow {
     this.db.prepare(
       `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, created_by, context)

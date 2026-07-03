@@ -59,7 +59,7 @@ export class ComputeManager {
     // committed. Do NOT expose "running" (detail() would hand out a connection string into the
     // first-start auth race). A crash during startup must still read as failed.
     if (c.phase === "starting") return c.proc.state === "failed" ? "failed" : "starting";
-    return c.proc.state as EndpointStatus;
+    return c.proc.state;
   }
 
   portOf(branchId: string): number | null {

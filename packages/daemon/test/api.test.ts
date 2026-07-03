@@ -673,8 +673,12 @@ describe("buildServer /api/status", () => {
     expect(res.json().healthy).toBe(false);
   });
 
+  // Fix 3 (fix wave 1): asserting the DEFAULT range here would pass even if the route hardcoded
+  // it instead of reading cfg.portRange — override the loaded cfg with a non-default range before
+  // buildServer so the assertion can only pass if the response actually echoes cfg.portRange.
   it("GET /api/status — includes portRange and storage (phase-4 modes hardcoded 'none')", async () => {
     const cfg = testCfg();
+    cfg.portRange = { min: 55500, max: 55599 };
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
@@ -685,7 +689,7 @@ describe("buildServer /api/status", () => {
 
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.portRange).toEqual({ min: 54300, max: 54339 }); // from the test config env (DEVDB_PORT_RANGE default)
+    expect(body.portRange).toEqual({ min: 55500, max: 55599 }); // proves it's cfg.portRange, not a hardcoded default
     expect(body.storage).toBe("none");
   });
 });
