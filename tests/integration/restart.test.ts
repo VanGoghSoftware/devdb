@@ -18,17 +18,15 @@ describe("restart resilience", () => {
     await c.query("INSERT INTO keep VALUES ('survives')");
     await c.end();
 
-    // dev.restart() (not dev.container.restart() directly) — see helpers/container.ts's
-    // documented testcontainers restart()-port-cache race: on this image (11 exposed ports),
-    // testcontainers occasionally throws "No host port found for host IP" from a stale internal
-    // inspect that races Docker's own (fast, correct) port republishing. dev.restart() confirms
-    // the container is genuinely back via an independent live check before treating that specific
-    // throw as fatal, and refreshes dev's OWN port cache either way so dev.base below is correct.
-    await dev.restart({ timeout: 60 });
-    // Wait for healthy again — same boot-wait pattern integration tests use elsewhere for a
-    // fresh container start (Wait.forHttp in helpers/container.ts), reimplemented here as a
-    // bounded poll since testcontainers' own wait strategy only runs on the initial `.start()`,
-    // not on a restart of an already-started container.
+    // dev.restart() delegates to testcontainers' restart(), which since 11.4.0 waits for all
+    // host port bindings to be republished and re-runs the startup wait strategy — the
+    // port-cache race this call previously had to defend against is fixed upstream (see the
+    // T16 epilogue in helpers/container.ts). timeout is milliseconds since testcontainers 11
+    // (60 would truncate to a 0s grace period, i.e. immediate SIGKILL).
+    await dev.restart({ timeout: 60_000 });
+    // Wait for healthy again. restart() resolving already guarantees /api/status answers 200
+    // (the wait strategy re-runs on restart), but that route returns 200 with healthy: false
+    // while engine processes are still coming up — this poll waits for the engine itself.
     let healthy = false;
     for (let i = 0; i < 120; i++) {
       try {

@@ -13,91 +13,39 @@ export async function buildImage(): Promise<void> {
   built = true;
 }
 
-// T16 finding, reproduced in isolation against this exact image (11 exposed ports: 4400 +
-// 54300-54309, matching the withExposedPorts() call below): testcontainers@10.28.0 calls
-// docker inspect() and rebuilds its internal port-binding cache (BoundPorts) IMMEDIATELY after
-// issuing a container start/restart, before Docker has finished re-publishing every exposed
-// port's NAT rule — an independent `docker inspect` run moments later always showed complete,
-// correct bindings for all 11 ports (proof the underlying container-level start/restart itself
-// is not the problem; this is a read-too-early race in testcontainers' own bookkeeping). It
-// throws "No host port found for host IP" from bound-ports.js's resolveHostPortBinding, and has
-// been observed from BOTH GenericContainer.start() (generic-container.js's startContainer(),
-// called via startDevdb() below) and StartedGenericContainer.restart() (Devdb.restart() below)
-// — same race, two different call sites in the same library version. On the restart() path,
-// critically, the throw happens BEFORE the internal boundPorts cache is updated, leaving
-// container.getMappedPort() PERMANENTLY stale (frozen at the pre-restart port) even though the
-// container is actually healthy again within about a second; a bare retry of restart() does not
-// reliably route around this either (reproduced 3 consecutive throws on a second restart round
-// in the same process). Two mitigations follow: retryStart() below retries the ENTIRE
-// GenericContainer(...).start() chain (a fresh, uniquely-named container each attempt — best-
-// effort stopped immediately on a caught failure rather than left for testcontainers' own
-// reaper/Ryuk to eventually clean up at session end, see retryStart()'s own doc comment for why
-// and how), and Devdb.restart() treats the specific throw as informational rather than fatal,
-// confirming the container is actually back via a live `docker port` + /api/status poll and
-// refreshing THIS Devdb instance's own `ports` map (never testcontainers' internal one, which the
-// restart failure path leaves stale).
-async function livePort(containerId: string, containerPort: number): Promise<number> {
-  const { stdout } = await execa("docker", ["port", containerId, `${containerPort}/tcp`]);
-  // Typical output: "0.0.0.0:55599\n[::]:55599" — take the first line's port number.
-  const first = stdout.split("\n")[0];
-  const match = first?.match(/:(\d+)$/);
-  if (!match) throw new Error(`could not parse "docker port ${containerId} ${containerPort}/tcp" output: ${stdout}`);
-  return Number(match[1]);
-}
-
-function isPortRace(e: unknown): boolean {
-  const message = e instanceof Error ? e.message : String(e);
-  return message.includes("No host port found for host IP");
-}
-
-// Fix 5 (review): traced through generic-container.js's startContainer() (testcontainers@10.28.0)
-// to confirm exactly where this throw lands — client.container.create() and client.container.
-// start() (the actual `docker create`+`docker start`) both run and SUCCEED before
-// BoundPorts.fromInspectResult() throws "No host port found for host IP"; the throw is purely in
-// testcontainers' own post-start port-binding bookkeeping. That means every failed attempt here
-// leaves a REAL, running Docker container behind — GenericContainer's `.start()` promise rejects
-// with no return value, so its container id is never exposed to this function; the only prior
-// safety net was testcontainers' own Ryuk reaper, which cleans up labeled containers but only at
-// session end (or on an explicit signal), not immediately. With 3 retry attempts possible per
-// startDevdb() call and this helper used by 6+ integration test files, a flaky CI run could
-// accumulate several live (if useless) `devdb:dev` containers for the lifetime of the whole test
-// run before Ryuk ever reaps them.
+// T16 epilogue: the testcontainers@10.28.0 port-binding race this helper used to work around
+// (~100 lines: retryStart() re-running the whole start() chain with per-attempt named containers,
+// a livePort()/`docker port` re-derivation of every mapping, and a restart() recovery path that
+// treated "No host port found for host IP" as informational) is fixed upstream —
+//   - the start() path in 11.0.1 (testcontainers-node#1032),
+//   - the restart() path in 11.4.0 (testcontainers-node#1087).
+// Both paths now call inspectContainerUntilPortsExposed(), which polls `docker inspect` every
+// 250ms (fixed 10s cap) until every port in HostConfig.PortBindings has a non-empty host-binding
+// array BEFORE rebuilding the internal BoundPorts cache, eliminating the read-too-early race that
+// threw "No host port found for host IP" and — on the restart() path — left getMappedPort()
+// permanently stale. Since 11.4.0 restart() also re-runs the startup wait strategy (the
+// Wait.forHttp below), so a resolved restart() means the API answers 200 again.
 //
-// Fix: assign each attempt a predictable name via .withName() BEFORE calling build() — a
-// reference to "the failed attempt" testcontainers itself never had to hand back — so that on a
-// caught port-race throw, this function can `docker stop` that exact container immediately
-// instead of waiting on Ryuk. Best-effort and guarded: `docker stop` on a container that doesn't
-// exist (the throw happened before `docker create` for some OTHER reason we don't fully
-// understand) or is already gone must never mask the real port-race error being retried around.
-async function retryStart(
-  build: (attemptName: string) => Promise<StartedTestContainer>, attempts = 3,
-): Promise<StartedTestContainer> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    const attemptName = `devdb-integration-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      return await build(attemptName);
-    } catch (e) {
-      if (!isPortRace(e)) throw e;
-      lastErr = e;
-      // Best-effort: stop the container this failed attempt actually created and started in
-      // Docker (confirmed live above the throw) so it isn't left running until Ryuk eventually
-      // reaps it. Never let a failure HERE (container already gone, name mismatch, docker CLI
-      // hiccup) mask or replace the port-race error this loop is retrying around — swallow and
-      // move on to the retry regardless.
-      try {
-        await execa("docker", ["stop", attemptName]);
-      } catch (stopErr) {
-        console.error(`retryStart: best-effort stop of failed attempt "${attemptName}" also failed (non-fatal, continuing retry):`, stopErr);
-      }
-      // A short pause before retrying the whole start() chain — the race is a timing window,
-      // not a persistent condition, so giving Docker a moment before the next attempt (which
-      // creates and starts an entirely new container) is cheap insurance against re-hitting it
-      // immediately.
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-  throw lastErr;
+// Re-verified against THIS image (all 11 exposed ports) with raw GenericContainer, no mitigation,
+// sequential start + restart({timeout}) cycles: on 10.28.0 the race hit 8 of 28 restarts, each
+// leaving all 11 getMappedPort() values frozen at their pre-restart ports (confirmed against
+// `docker port` ground truth); on 12.0.4 it hit 0 of 59 restarts and 0 of 20 starts. What DID
+// surface once on 12.0.4 is the fix's own bounded failure mode: when Docker takes longer than the
+// poll's fixed 10s cap to republish all 11 ports, restart() throws "Timed out after 10000ms while
+// waiting for container ports to be bound to the host". That throw still leaves the port cache
+// un-refreshed, but unlike the old race it is loud, specific, and cleanly recoverable: a second
+// restart() re-polls from a fresh inspect and rebuilds the cache (confirmed in the same stress
+// run — the very next restart of that container came back fully consistent). Devdb.restart()
+// below therefore retries exactly once on that timeout signature; every other failure, including
+// any resurrection of the old race message, surfaces immediately.
+const BIND_TIMEOUT_SIGNATURE = "waiting for container ports to be bound";
+
+// Tripwire, not a wait: after a successful start()/restart() on testcontainers >=11.4, every
+// exposed port is guaranteed resolvable (see epilogue above). If this throws, the upstream
+// port-binding fix has regressed — better to fail here naming the exact port than as an
+// unrelated-looking connection error deep inside a test.
+function assertAllPortsBound(container: StartedTestContainer, ports: number[]): void {
+  for (const p of ports) container.getMappedPort(p);
 }
 
 export interface Devdb {
@@ -105,11 +53,12 @@ export interface Devdb {
   container: StartedTestContainer;
   mappedPort(containerPort: number): number;
   /**
-   * Restarts the container. Resilient to the testcontainers restart() port-cache race
-   * documented above: on success (or on the specific benign throw, confirmed recovered), this
-   * daemon's own tracked ports refresh via a live `docker port` query for every exposed port —
-   * so `dev.base` / `dev.mappedPort()` stay correct for the rest of the test, unlike relying on
-   * testcontainers' own (potentially permanently stale, post-restart) getMappedPort() cache.
+   * Restarts the container. testcontainers >=11.4 waits for all host port bindings to be
+   * republished and re-runs the startup wait strategy, so on resolve /api/status answers 200
+   * and getMappedPort() reflects the post-restart bindings (they change on every restart).
+   * `timeout` is the docker stop grace period in MILLISECONDS (was seconds before
+   * testcontainers 11). Retries once if Docker exceeds the library's fixed 10s port-republish
+   * poll — see the T16 epilogue above.
    */
   restart(options?: { timeout: number }): Promise<void>;
   stop(): Promise<void>;
@@ -119,55 +68,35 @@ export async function startDevdb(env: Record<string, string> = {}): Promise<Devd
   await buildImage();
   const endpointPorts = Array.from({ length: 10 }, (_, i) => 54300 + i);
   const exposedPorts = [4400, ...endpointPorts];
-  const container = await retryStart((attemptName) =>
-    new GenericContainer(IMAGE)
-      .withName(attemptName)
-      .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
-      .withExposedPorts(...exposedPorts)
-      .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
-      .withStartupTimeout(240_000)
-      .start());
-
-  // Owned by this Devdb instance, not testcontainers — refreshed on every successful start()
-  // (here) and restart() (below), so base/mappedPort never depend on testcontainers' own
-  // internal cache staying in sync across a restart.
-  const ports = new Map<number, number>(exposedPorts.map((p) => [p, container.getMappedPort(p)]));
+  const container = await new GenericContainer(IMAGE)
+    .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
+    .withExposedPorts(...exposedPorts)
+    .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
+    .withStartupTimeout(240_000)
+    .start();
+  assertAllPortsBound(container, exposedPorts);
 
   return {
     get base() {
-      return `http://localhost:${ports.get(4400)}`;
+      return `http://localhost:${container.getMappedPort(4400)}`;
     },
     container,
     mappedPort: (p) => {
-      const mapped = ports.get(p);
-      if (mapped === undefined) throw new Error(`port ${p} was not exposed by startDevdb() — add it to exposedPorts`);
-      return mapped;
+      if (!exposedPorts.includes(p)) throw new Error(`port ${p} was not exposed by startDevdb() — add it to exposedPorts`);
+      return container.getMappedPort(p);
     },
     async restart(options) {
-      let raced: unknown;
       try {
         await container.restart(options);
-        for (const p of exposedPorts) ports.set(p, container.getMappedPort(p));
-        return;
       } catch (e) {
-        if (!isPortRace(e)) throw e;
-        raced = e; // hoisted so the confirmation-failure branch below can rethrow the ORIGINAL error
+        if (!(e instanceof Error) || !e.message.includes(BIND_TIMEOUT_SIGNATURE)) throw e;
+        // Docker occasionally (~1 in 60 restarts in the stress runs) takes >10s to republish
+        // all 11 ports; the retry restarts again and re-polls from scratch, which recovers.
+        await container.restart(options);
       }
-      // Landed in the documented race: confirm the container is actually back (bypassing
-      // testcontainers' now-permanently-stale cache) via our OWN live port + /api/status poll.
-      const id = container.getId();
-      let confirmed = false;
-      for (let i = 0; i < 30; i++) {
-        try {
-          const port4400 = await livePort(id, 4400);
-          const res = await fetch(`http://localhost:${port4400}/api/status`);
-          if (res.ok) { confirmed = true; break; }
-        } catch { /* container/port still settling */ }
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      if (!confirmed) throw raced; // genuinely didn't come back — surface the original error, not a swallowed timeout
-      for (const p of exposedPorts) ports.set(p, await livePort(id, p));
+      assertAllPortsBound(container, exposedPorts);
     },
+    // milliseconds since testcontainers 11 (10.x read this field as seconds)
     stop: async () => { await container.stop({ timeout: 30_000 }); },
   };
 }
