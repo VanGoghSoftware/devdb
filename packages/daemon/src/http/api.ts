@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { z, ZodError } from "zod";
-import { PgVersionSchema } from "@devdb/shared";
+import { PgVersionSchema, BranchContextSchema } from "@devdb/shared";
 import type { DevdbConfig } from "../config.js";
 import type { StateDb } from "../state/db.js";
 import type { EngineRuntime } from "../engine/boot.js";
@@ -248,10 +248,15 @@ export function buildServer(deps: Deps): FastifyInstance {
     return reply.status(204).send();
   });
 
+  // Task 12: REST fork-context parity — the spec requires non-MCP callers (this route) to be
+  // able to attach the same fork context (git_branch/workdir/agent/purpose/client) that MCP's
+  // create_branch tool does. createdBy below stays the literal "api" — this route is explicitly
+  // the non-MCP path.
   const CreateBranch = z.object({
     name: z.string(),
     parentBranchId: z.string().optional(),
     atLsn: z.string().optional(),
+    context: BranchContextSchema.optional(),
   });
   app.post("/api/projects/:id/branches", async (req, reply) => {
     const { id } = req.params as { id: string };

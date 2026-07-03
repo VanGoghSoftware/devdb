@@ -140,6 +140,40 @@ describe("buildServer branch routes", () => {
     expect(body.stickyPort).toBeUndefined();
   });
 
+  // Task 12: REST fork-context parity — non-MCP callers (e.g. a human or script hitting the
+  // REST API directly rather than through an MCP-connected agent) must be able to attach the
+  // same fork context (git_branch/workdir/agent/purpose/client) that create_branch (MCP) does,
+  // and it must round-trip through the response DTO. createdBy stays "api" here — this is
+  // explicitly the non-MCP path, distinguished from MCP's own createdBy: "mcp".
+  it("POST /api/projects/:id/branches — accepts an optional context body, round-trips it in the response DTO, createdBy stays 'api'", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const branches = fakeBranches();
+    const context = { git_branch: "feature/foo", workdir: "/repo/worktrees/foo", purpose: "manual test" };
+    const fakeBranch = { id: "branch-1", projectId: "project-1", name: "dev" };
+    const fakeDetail = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "dev", context });
+    vi.mocked(branches.create).mockResolvedValue(fakeBranch as unknown as Awaited<ReturnType<BranchesService["create"]>>);
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(),
+      services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects/project-1/branches",
+      payload: { name: "dev", context },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(branches.create).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: "project-1", name: "dev", createdBy: "api", context }),
+    );
+    const body = res.json();
+    expect(body.context).toEqual(context);
+    expect(body.createdBy).toBe("api");
+  });
+
   it("GET /api/projects/:id/branches — returns the service's array mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
