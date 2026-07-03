@@ -122,6 +122,20 @@ describe("TimeTravelService", () => {
     expect(state.branches.byProjectAndName(project.id, "recovered")).not.toBeNull();
   });
 
+  // Fix 2 (review, task-2-fix.md): service-level coverage — proves branchAtTimestamp actually
+  // PERSISTS the given context (not just accepts the param) by reading the row back from state,
+  // catching a regression where the field was threaded into the arg type but silently dropped
+  // before reaching branches.create().
+  it("branchAtTimestamp persists the given fork context on the created branch", async () => {
+    const { project, mainBranch, tt, state } = await seeded();
+    const ctx = { git_branch: "feat/recover", workdir: "/w3", agent: "mcp", purpose: "pitr recovery" };
+    const b = await tt.branchAtTimestamp({
+      projectId: project.id, sourceBranchId: mainBranch.id,
+      name: "recovered-ctx", isoTimestamp: "2026-07-02T10:00:00Z", context: ctx,
+    });
+    expect(state.branches.byId(b.id)!.context).toEqual(ctx);
+  });
+
   it("restoreInPlace swaps identity onto a new timeline and archives the old row", async () => {
     const { f, mainBranch, tt, state } = await seeded();
     const out = await tt.restoreInPlace(mainBranch.id, "2026-07-02T10:00:00Z");
@@ -130,6 +144,28 @@ describe("TimeTravelService", () => {
     expect(out.id).not.toBe(mainBranch.id);
     const archived = state.branches.byId(mainBranch.id)!;
     expect(archived.name).toContain("main_pitr_archived_");
+  });
+
+  // Fix 1 (review, task-2-fix.md): restoreSwap's new-live-row INSERT previously omitted
+  // `context`, so a branch created WITH fork context lost it silently on the swapped identity
+  // (the new live row got NULL). Restore/reset is an identity CONTINUATION of the same branch —
+  // its fork context must survive, exactly like `created_by` already does.
+  it("restoreInPlace carries the branch's fork context through the identity swap", async () => {
+    const { project, tt, branches, state } = await seeded();
+    const ctx = { git_branch: "feat/x", workdir: "/w", agent: "claude", purpose: "try a migration" };
+    const dev = await branches.create({ projectId: project.id, name: "dev", context: ctx });
+    const out = await tt.restoreInPlace(dev.id, "2026-07-02T10:00:00Z");
+    expect(out.context).toEqual(ctx);
+    expect(state.branches.byId(out.id)!.context).toEqual(ctx);
+  });
+
+  it("resetToParent carries the branch's fork context through the identity swap", async () => {
+    const { project, tt, branches, state } = await seeded();
+    const ctx = { git_branch: "feat/y", workdir: "/w2", agent: "mcp", purpose: "reset test" };
+    const dev = await branches.create({ projectId: project.id, name: "dev", context: ctx });
+    const out = await tt.resetToParent(dev.id);
+    expect(out.context).toEqual(ctx);
+    expect(state.branches.byId(out.id)!.context).toEqual(ctx);
   });
 
   it("restoreInPlace creates the new timeline ancestored on the branch's OWN timeline at the resolved lsn", async () => {

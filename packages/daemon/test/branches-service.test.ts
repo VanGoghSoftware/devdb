@@ -273,4 +273,14 @@ describe("BranchesService", () => {
     expect(b.name).toBe("dev");
     expect(branches.byIdOr404(b.id).name).toBe("dev");
   });
+
+  // Fix 2 (review, task-2-fix.md): service-level coverage — a repo-only test (branch-context.test.ts)
+  // wouldn't catch a regression where BranchesService.create stopped passing `context` through to
+  // the repo. Assert the PERSISTED row (read back from state), not just create()'s return value.
+  it("create persists the given fork context on the branch row", async () => {
+    const { project, branches, state } = await seeded();
+    const ctx = { git_branch: "feat/x", workdir: "/w", agent: "claude", purpose: "try a migration" };
+    const b = await branches.create({ projectId: project.id, name: "dev", context: ctx });
+    expect(state.branches.byId(b.id)!.context).toEqual(ctx);
+  });
 });

@@ -120,10 +120,11 @@ export class BranchesRepo {
       this.db.prepare("UPDATE branches SET name = ?, slug = ?, sticky_port = NULL WHERE id = ?")
         .run(a.archiveName, a.archiveSlug, a.oldBranchId);
       this.db.prepare(
-        `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, sticky_port, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO branches (id, project_id, parent_branch_id, name, slug, timeline_id, password, sticky_port, created_by, context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(a.newBranchId, old.projectId, old.parentBranchId, old.name, old.slug,
-        a.newTimelineId, old.password, old.stickyPort, old.createdBy);
+        a.newTimelineId, old.password, old.stickyPort, old.createdBy,
+        old.context ? JSON.stringify(old.context) : null);
       if (a.reparentedTimelineIds.length > 0) {
         const placeholders = a.reparentedTimelineIds.map(() => "?").join(",");
         this.db.prepare(
