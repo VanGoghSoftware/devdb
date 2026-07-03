@@ -4,11 +4,31 @@ import { BranchQueue } from "../src/state/queue.js";
 import { ProjectsService } from "../src/services/projects.js";
 import { BranchesService } from "../src/services/branches.js";
 import { EndpointsService, type EndpointsLockedApi } from "../src/services/endpoints.js";
+import type { BranchDetail } from "../src/services/branches.js";
 import { TimeTravelService } from "../src/services/timetravel.js";
 import { LogsService } from "../src/services/logs.js";
 import { EngineApiError } from "../src/engine/http.js";
 import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { EndpointStatus } from "@devdb/shared";
+
+// Fix 3 (review): a small typed BranchDetail fixture builder — replaces the `({}) as never`
+// casts the EndpointsLockedApi fakes below used to return, which bypassed the A2 typed-fake
+// contract entirely (an empty object cast past the type system, not structurally checked against
+// the real return shape at all). `overrides` lets individual call sites vary just the fields they
+// care about (e.g. branchId-bearing tests don't need one here since these fakes never read the
+// input branchId to build their return value) while everything else stays a valid BranchDetail.
+function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetail {
+  return {
+    id: "fixture-branch-id", projectId: "fixture-project-id", parentBranchId: null,
+    name: "fixture", slug: "fixture", timelineId: "t".repeat(32), password: "pw",
+    stickyPort: null, endpointStatus: "running", endpointError: null,
+    importStatus: "none", importError: null, createdBy: "test",
+    createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    port: 54300, connectionString: null, lastRecordLsn: null,
+    logicalSizeBytes: null, ancestorLsn: null,
+    ...overrides,
+  };
+}
 
 // Amendment A2 (controller, extended to this task): typed fakes satisfying the narrow
 // service-facing interfaces from services/engine-api.ts — no `as never` casts. Mirrors
@@ -51,8 +71,8 @@ function fakes(): { storcon: StorconApi; pageserver: PageserverApi; safekeeper: 
 // against that narrow interface, structurally identical to the real EndpointsService's surface.
 function fakeEndpointsLocked(): EndpointsLockedApi {
   return {
-    startLocked: vi.fn(async () => ({}) as never),
-    stopLocked: vi.fn(async () => ({}) as never),
+    startLocked: vi.fn(async () => branchDetailFixture()),
+    stopLocked: vi.fn(async () => branchDetailFixture()),
   };
 }
 
@@ -123,8 +143,10 @@ describe("TimeTravelService", () => {
   it("restoreInPlace stops a running endpoint before the swap and restarts it after", async () => {
     const { f, mainBranch, tt } = await seeded();
     vi.mocked(f.computes.statusOf).mockReturnValue("running");
-    const stopLocked = vi.fn(async () => ({}) as never);
-    const startLocked = vi.fn(async () => ({}) as never);
+    // Fix 3: typed BranchDetail fixtures rather than `({}) as never` — a fake return value that
+    // structurally matches EndpointsLockedApi's real contract.
+    const stopLocked = vi.fn(async () => branchDetailFixture());
+    const startLocked = vi.fn(async () => branchDetailFixture());
     // Rebuild tt with an endpoints fake we can assert call order/args on directly — the
     // seeded() default wires a real EndpointsService, which is exercised by the test above;
     // this test targets TimeTravelService's own orchestration of the *Locked calls.
@@ -136,9 +158,15 @@ describe("TimeTravelService", () => {
     const tt2 = new TimeTravelService({
       state, queue, branches, endpoints: { startLocked, stopLocked }, ...f,
     });
-    await tt2.restoreInPlace(main2.id, "2026-07-02T10:00:00Z");
+    const out = await tt2.restoreInPlace(main2.id, "2026-07-02T10:00:00Z");
     expect(stopLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: main2.id }), main2.id);
-    expect(startLocked).toHaveBeenCalled();
+    // Fix 2 (review): the post-swap restart must target the NEW (swapped) branch identity, not
+    // the original/archived one — before this fix, the fake accepted any lane/id, so a regression
+    // restarting on the archived id (or with the wrong lane) would still pass. `out.id` is the
+    // fresh identity restoreSwap minted; asserting against it (and explicitly NOT the original
+    // main2.id) proves startLocked was actually called for the branch the caller now holds.
+    expect(startLocked).toHaveBeenCalledWith(expect.objectContaining({ branchId: out.id }), out.id);
+    expect(startLocked).not.toHaveBeenCalledWith(expect.objectContaining({ branchId: main2.id }), main2.id);
     void mainBranch; // unused in this rebuilt-fixture test; kept for destructure symmetry
   });
 
@@ -153,8 +181,8 @@ describe("TimeTravelService", () => {
   it("restoreInPlace restarts a previously-running endpoint on the ORIGINAL branch when detach fails (no side effect from a failed attempt)", async () => {
     const { f, mainBranch, tt } = await seeded();
     vi.mocked(f.computes.statusOf).mockReturnValue("running");
-    const startLocked = vi.fn(async () => ({}) as never);
-    const stopLocked = vi.fn(async () => ({}) as never);
+    const startLocked = vi.fn(async () => branchDetailFixture());
+    const stopLocked = vi.fn(async () => branchDetailFixture());
     const state = openState(":memory:");
     const queue = new BranchQueue();
     const projects = new ProjectsService({ state, queue, ...f });
@@ -274,8 +302,8 @@ describe("TimeTravelService", () => {
   it("restoreInPlace compensates a restoreSwap failure: new timeline deleted on both engines, original endpoint restarted", async () => {
     const { f, mainBranch, tt, state } = await seeded();
     vi.mocked(f.computes.statusOf).mockReturnValue("running");
-    const startLocked = vi.fn(async () => ({}) as never);
-    const stopLocked = vi.fn(async () => ({}) as never);
+    const startLocked = vi.fn(async () => branchDetailFixture());
+    const stopLocked = vi.fn(async () => branchDetailFixture());
     const queue = new BranchQueue();
     const project2 = await new ProjectsService({ state, queue, ...f }).create({ name: "swapfail" });
     const branches = new BranchesService({ state, queue, ...f });
