@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { buildServer } from "../src/http/api.js";
 import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
-import type { BranchesService } from "../src/services/branches.js";
+import type { BranchesService, BranchDetail } from "../src/services/branches.js";
 import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
 import type { SqlService } from "../src/services/sql.js";
@@ -10,6 +10,24 @@ import { LogsService } from "../src/services/logs.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
+import { toBranchDto } from "../src/services/dto.js";
+
+// Task 3 (DTO mappers): a realistic, FULLY-populated BranchDetail fixture — including the
+// internal-only `password`/`stickyPort`/`importStatus`/`importError` columns — so route tests
+// below can prove redaction actually happens through the real HTTP response, not just that a
+// sparse fake happens to lack a `password` key to begin with (JSON.stringify drops `undefined`
+// values, so a fake missing a field would make a leaking mapper pass these tests too).
+function fakeBranchDetail(overrides: Partial<BranchDetail> = {}): BranchDetail {
+  return {
+    id: "branch-1", projectId: "project-1", parentBranchId: null, name: "dev", slug: "acme-dev-abc123",
+    timelineId: "t".repeat(32), password: "SECRET-PW", stickyPort: 54301,
+    endpointStatus: "stopped", endpointError: null, importStatus: "none", importError: null,
+    createdBy: "api", context: null,
+    createdAt: "2026-07-03T00:00:00.000Z", updatedAt: "2026-07-03T00:00:00.000Z",
+    port: null, connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, ancestorLsn: null,
+    ...overrides,
+  };
+}
 
 // buildServer's Deps.engine is typed against the concrete EngineRuntime class (unlike
 // ProjectsDeps, which was retyped to the narrow *Api interfaces in engine-api.ts under
@@ -93,14 +111,14 @@ describe("buildServer error handling", () => {
 });
 
 describe("buildServer branch routes", () => {
-  it("POST /api/projects/:id/branches — valid body creates a branch as createdBy 'api'", async () => {
+  it("POST /api/projects/:id/branches — valid body creates a branch as createdBy 'api', response DTO drops password", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const branches = fakeBranches();
     const fakeBranch = { id: "branch-1", projectId: "project-1", name: "dev" };
-    const fakeDetail = { ...fakeBranch, endpointStatus: "stopped", port: null, connectionString: null };
+    const fakeDetail = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "dev" });
     vi.mocked(branches.create).mockResolvedValue(fakeBranch as unknown as Awaited<ReturnType<BranchesService["create"]>>);
-    vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
@@ -116,16 +134,19 @@ describe("buildServer branch routes", () => {
     expect(branches.create).toHaveBeenCalledWith(
       expect.objectContaining({ projectId: "project-1", name: "dev", createdBy: "api" }),
     );
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
+    expect(body.stickyPort).toBeUndefined();
   });
 
-  it("GET /api/projects/:id/branches — returns the service's array as 200", async () => {
+  it("GET /api/projects/:id/branches — returns the service's array mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const projects = fakeProjects();
     const branches = fakeBranches();
-    const rows = [{ id: "branch-1" }, { id: "branch-2" }];
-    vi.mocked(branches.list).mockResolvedValue(rows as unknown as Awaited<ReturnType<BranchesService["list"]>>);
+    const rows = [fakeBranchDetail({ id: "branch-1" }), fakeBranchDetail({ id: "branch-2" })];
+    vi.mocked(branches.list).mockResolvedValue(rows);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
@@ -134,7 +155,8 @@ describe("buildServer branch routes", () => {
     const res = await app.inject({ method: "GET", url: "/api/projects/project-1/branches" });
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual(rows);
+    expect(res.json()).toEqual(rows.map(toBranchDto));
+    for (const b of res.json()) expect(b.password).toBeUndefined();
     expect(branches.list).toHaveBeenCalledWith("project-1");
   });
 
@@ -180,12 +202,15 @@ describe("buildServer branch routes", () => {
 });
 
 describe("buildServer endpoint routes", () => {
-  it("POST /api/branches/:id/endpoint/start — 200 with the service's BranchDetail", async () => {
+  it("POST /api/branches/:id/endpoint/start — 200 with the service's BranchDetail mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const endpoints = fakeEndpoints();
-    const fakeDetail = { id: "branch-1", endpointStatus: "running", port: 54300, connectionString: "postgresql://..." };
-    vi.mocked(endpoints.start).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["start"]>>);
+    const fakeDetail = fakeBranchDetail({
+      id: "branch-1", endpointStatus: "running", port: 54300,
+      connectionString: "postgresql://postgres:SECRET-PW@localhost:54300/postgres",
+    });
+    vi.mocked(endpoints.start).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
@@ -195,7 +220,10 @@ describe("buildServer endpoint routes", () => {
 
     expect(res.statusCode).toBe(200);
     expect(endpoints.start).toHaveBeenCalledWith("branch-1");
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
+    expect(body.connectionString).toContain("SECRET-PW"); // connstring is how the agent gets creds
   });
 
   it("POST /api/branches/:id/endpoint/start — 409 when the service maps PortExhaustedError", async () => {
@@ -216,12 +244,12 @@ describe("buildServer endpoint routes", () => {
     expect(res.json().error).toMatch(/DEVDB_PORT_RANGE/);
   });
 
-  it("POST /api/branches/:id/endpoint/stop — 200 with the service's BranchDetail", async () => {
+  it("POST /api/branches/:id/endpoint/stop — 200 with the service's BranchDetail mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const endpoints = fakeEndpoints();
-    const fakeDetail = { id: "branch-1", endpointStatus: "stopped", port: null, connectionString: null };
-    vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<EndpointsService["stop"]>>);
+    const fakeDetail = fakeBranchDetail({ id: "branch-1", endpointStatus: "stopped", port: null, connectionString: null });
+    vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
@@ -231,7 +259,9 @@ describe("buildServer endpoint routes", () => {
 
     expect(res.statusCode).toBe(200);
     expect(endpoints.stop).toHaveBeenCalledWith("branch-1");
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
   });
 
   it("GET /api/branches/:id/endpoint — returns { status, port } from branches.detail", async () => {
@@ -304,12 +334,12 @@ describe("buildServer time travel routes", () => {
     expect(res.json().error).toMatch(/ahead of this branch/);
   });
 
-  it("POST /api/branches/:id/restore { mode: in_place } — calls restoreInPlace and returns its BranchDetail", async () => {
+  it("POST /api/branches/:id/restore { mode: in_place } — calls restoreInPlace and returns its BranchDetail mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const timetravel = fakeTimetravel();
-    const fakeDetail = { id: "branch-2", name: "main", endpointStatus: "stopped", port: null, connectionString: null };
-    vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["restoreInPlace"]>>);
+    const fakeDetail = fakeBranchDetail({ id: "branch-2", name: "main", endpointStatus: "stopped", port: null, connectionString: null });
+    vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
@@ -322,10 +352,12 @@ describe("buildServer time travel routes", () => {
 
     expect(res.statusCode).toBe(200);
     expect(timetravel.restoreInPlace).toHaveBeenCalledWith("branch-1", "2026-07-02T10:00:00Z");
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
   });
 
-  it("POST /api/branches/:id/restore { mode: new_branch } — calls branchAtTimestamp scoped to the source branch's project, then returns branches.detail", async () => {
+  it("POST /api/branches/:id/restore { mode: new_branch } — calls branchAtTimestamp scoped to the source branch's project, then returns branches.detail mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const branches = fakeBranches();
@@ -335,8 +367,8 @@ describe("buildServer time travel routes", () => {
     );
     const newRow = { id: "branch-3", name: "rescued" };
     vi.mocked(timetravel.branchAtTimestamp).mockResolvedValue(newRow as unknown as Awaited<ReturnType<TimeTravelService["branchAtTimestamp"]>>);
-    const fakeDetail = { id: "branch-3", name: "rescued", endpointStatus: "stopped", port: null, connectionString: null };
-    vi.mocked(branches.detail).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<BranchesService["detail"]>>);
+    const fakeDetail = fakeBranchDetail({ id: "branch-3", name: "rescued", endpointStatus: "stopped", port: null, connectionString: null });
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
@@ -353,7 +385,9 @@ describe("buildServer time travel routes", () => {
       isoTimestamp: "2026-07-02T10:00:00Z", createdBy: "api",
     });
     expect(branches.detail).toHaveBeenCalledWith(newRow);
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
   });
 
   it("POST /api/branches/:id/restore — 400 when the body matches neither discriminated-union variant", async () => {
@@ -372,12 +406,12 @@ describe("buildServer time travel routes", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/branches/:id/reset — 200 with the service's BranchDetail", async () => {
+  it("POST /api/branches/:id/reset — 200 with the service's BranchDetail mapped to BranchDto (password dropped)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const timetravel = fakeTimetravel();
-    const fakeDetail = { id: "branch-4", name: "dev", endpointStatus: "stopped", port: null, connectionString: null };
-    vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail as unknown as Awaited<ReturnType<TimeTravelService["resetToParent"]>>);
+    const fakeDetail = fakeBranchDetail({ id: "branch-4", name: "dev", endpointStatus: "stopped", port: null, connectionString: null });
+    vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
@@ -387,7 +421,9 @@ describe("buildServer time travel routes", () => {
 
     expect(res.statusCode).toBe(200);
     expect(timetravel.resetToParent).toHaveBeenCalledWith("branch-1");
-    expect(res.json()).toEqual(fakeDetail);
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.password).toBeUndefined();
   });
 
   it("POST /api/branches/:id/reset — 409 when the service reports child branches block it", async () => {

@@ -14,6 +14,10 @@ describe("projects", () => {
     expect(res.status).toBe(201);
     const { project, mainBranch } = await res.json();
     expect(mainBranch.name).toBe("main");
+    // Task 3 (DTO mappers): the wire response must never carry the branch's internal password —
+    // agents use mainBranch.connectionString instead.
+    expect(mainBranch.password).toBeUndefined();
+    expect(mainBranch.connectionString === null || typeof mainBranch.connectionString === "string").toBe(true);
 
     const del = await fetch(`${dev.base}/api/projects/${project.id}`, { method: "DELETE" });
     expect(del.status).toBe(204);

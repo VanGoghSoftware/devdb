@@ -92,7 +92,7 @@ export class ProjectsService {
         tx();
       } catch (e) {
         if ((e as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
-          throw new DevdbError(409, `project or branch identity conflicts with an existing one: ${(e as Error).message}`);
+          throw new DevdbError(409, `project or branch identity conflicts with an existing one`);
         }
         throw e;
       }

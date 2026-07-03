@@ -42,6 +42,8 @@ export interface BranchDto {
   lastRecordLsn: string | null;
   logicalSizeBytes: number | null;
   createdBy: "ui" | "api" | "mcp";
+  context: BranchContext | null;
+  ancestorLsn: string | null;
   createdAt: string;
   updatedAt: string;
 }

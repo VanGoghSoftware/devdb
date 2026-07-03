@@ -13,6 +13,7 @@ import type { TimeTravelService } from "../services/timetravel.js";
 import type { LogsService } from "../services/logs.js";
 import type { SqlService } from "../services/sql.js";
 import { DevdbError } from "../services/errors.js";
+import { toBranchDto, toProjectDto } from "../services/dto.js";
 
 // T16 rider (ledgered at Task 12, optional): /api/status's top-level "version" comes from this
 // package's own package.json instead of a hand-maintained literal. Read once at module load —
@@ -214,12 +215,15 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.post("/api/projects", async (req, reply) => {
     const body = CreateProject.parse(req.body);
     const out = await deps.services.projects.create(body);
-    return reply.status(201).send(out);
+    return reply.status(201).send({
+      project: toProjectDto(out.project),
+      mainBranch: toBranchDto(await deps.services.branches.detail(out.mainBranch)),
+    });
   });
-  app.get("/api/projects", async () => deps.services.projects.list());
+  app.get("/api/projects", async () => deps.services.projects.list().map(toProjectDto));
   app.get("/api/projects/:id", async (req) => {
     const { id } = req.params as { id: string };
-    return deps.services.projects.byIdOr404(id);
+    return toProjectDto(deps.services.projects.byIdOr404(id));
   });
   app.delete("/api/projects/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -236,16 +240,16 @@ export function buildServer(deps: Deps): FastifyInstance {
     const { id } = req.params as { id: string };
     const body = CreateBranch.parse(req.body);
     const branch = await deps.services.branches.create({ projectId: id, ...body, createdBy: "api" });
-    return reply.status(201).send(await deps.services.branches.detail(branch));
+    return reply.status(201).send(toBranchDto(await deps.services.branches.detail(branch)));
   });
   app.get("/api/projects/:id/branches", async (req) => {
     const { id } = req.params as { id: string };
     deps.services.projects.byIdOr404(id);
-    return deps.services.branches.list(id);
+    return (await deps.services.branches.list(id)).map(toBranchDto);
   });
   app.get("/api/branches/:id", async (req) => {
     const { id } = req.params as { id: string };
-    return deps.services.branches.detail(deps.services.branches.byIdOr404(id));
+    return toBranchDto(await deps.services.branches.detail(deps.services.branches.byIdOr404(id)));
   });
   app.delete("/api/branches/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -255,11 +259,11 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   app.post("/api/branches/:id/endpoint/start", async (req) => {
     const { id } = req.params as { id: string };
-    return deps.services.endpoints.start(id);
+    return toBranchDto(await deps.services.endpoints.start(id));
   });
   app.post("/api/branches/:id/endpoint/stop", async (req) => {
     const { id } = req.params as { id: string };
-    return deps.services.endpoints.stop(id);
+    return toBranchDto(await deps.services.endpoints.stop(id));
   });
   app.get("/api/branches/:id/endpoint", async (req) => {
     const { id } = req.params as { id: string };
@@ -287,19 +291,19 @@ export function buildServer(deps: Deps): FastifyInstance {
     const { id } = req.params as { id: string };
     const body = Restore.parse(req.body);
     if (body.mode === "in_place") {
-      return deps.services.timetravel.restoreInPlace(id, body.to);
+      return toBranchDto(await deps.services.timetravel.restoreInPlace(id, body.to));
     }
     const src = deps.services.branches.byIdOr404(id);
     const b = await deps.services.timetravel.branchAtTimestamp({
       projectId: src.projectId, sourceBranchId: id, name: body.name,
       isoTimestamp: body.to, createdBy: "api",
     });
-    return deps.services.branches.detail(b);
+    return toBranchDto(await deps.services.branches.detail(b));
   });
 
   app.post("/api/branches/:id/reset", async (req) => {
     const { id } = req.params as { id: string };
-    return deps.services.timetravel.resetToParent(id);
+    return toBranchDto(await deps.services.timetravel.resetToParent(id));
   });
 
   // The SQL console executes arbitrary SQL as the postgres SUPERUSER on the branch's endpoint —
