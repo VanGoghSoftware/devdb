@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { buildServer } from "../src/http/api.js";
+import { countRawHeader } from "../src/mcp/http.js";
 import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
 import type { BranchesService } from "../src/services/branches.js";
@@ -52,9 +53,13 @@ async function expectGuardPassed(app: ReturnType<typeof buildServer>, headers: R
   expect(res.json()).toEqual({ error: "no valid MCP session — send an initialize request first" });
 }
 
-async function expectGuardRejected(app: ReturnType<typeof buildServer>, headers: Record<string, string | string[]>) {
+async function expectGuardRejected(
+  app: ReturnType<typeof buildServer>,
+  headers: Record<string, string | string[]>,
+  url = "/mcp",
+) {
   const res = await app.inject({
-    method: "POST", url: "/mcp",
+    method: "POST", url,
     headers: { "content-type": "application/json", ...headers },
     payload: { jsonrpc: "2.0", id: 1, method: "not-initialize" },
   });
@@ -82,6 +87,67 @@ function rawHttp10Request(port: number, path: string): Promise<{ statusLine: str
     socket.on("error", reject);
   });
 }
+
+// Fix 2 (wave 2): sends a raw request with the caller-supplied header BLOCK sent VERBATIM — used
+// to put two LITERAL lines of the same header name on the wire (e.g. two separate "Host:" lines),
+// which light-my-request's inject() cannot reproduce at all. Confirmed empirically (see this
+// file's git history / task-8-report.md) against a real `http.createServer`: Node's OWN raw
+// HTTP/1.1 parser does NOT collapse repeated header lines in `req.rawHeaders` the way
+// light-my-request does — two literal "Host: localhost" lines arrive as
+// ["Host","localhost","Host","localhost",...], each one individually a perfectly TRUSTED
+// hostname. That is exactly what makes this a DISCRIMINATING test of the
+// `countRawHeader(...) > 1` branch: req.headers.host (Node's own collapsed view) would read back
+// as the single trusted string "localhost" and canonicalHostname() would parse it cleanly (no
+// malformed-authority path to fall back on) — the ONLY thing that can reject this request is the
+// raw-rawHeaders duplicate count. Contrast with the existing inject()-based "duplicate Host"
+// tests below, which route two DIFFERENT hostnames through light-my-request's own comma-join
+// artifact ("localhost,evil.com") and 403 via the malformed-authority parse failure instead —
+// coverage that would still pass even if the countRawHeader check were deleted outright.
+function rawDuplicateHeaderRequest(port: number, headerLines: string): Promise<{ statusLine: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1", () => {
+      socket.write(`POST /mcp HTTP/1.1\r\n${headerLines}Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+    });
+    let data = "";
+    socket.on("data", (chunk) => { data += chunk.toString(); });
+    socket.on("end", () => resolve({ statusLine: data.split("\r\n")[0] ?? "" }));
+    socket.on("error", reject);
+  });
+}
+
+// Fix 2 (wave 2) — direct unit coverage of countRawHeader() itself. This is the ONLY way to get
+// discriminating coverage of the Origin duplicate-COUNT branch specifically: Node comma-joins
+// (rather than first-value-collapsing) repeated non-special-cased headers, so a raw-socket
+// request with two literal "Origin:" lines always produces an unparseable joined
+// req.headers.origin ("http://a, http://a") that 403s via canonicalOriginHostname()'s
+// malformed-parse path regardless of whether the `> 1` count check exists — verified empirically:
+// `new URL("http://a, http://a")` throws for ANY two Origin values, identical or not, so an
+// end-to-end request can never isolate this branch for Origin the way rawDuplicateHeaderRequest's
+// Host tests do. Testing the pure function directly sidesteps that entirely.
+describe("countRawHeader — direct unit coverage (Fix 2, wave 2)", () => {
+  it("counts a single occurrence as 1", () => {
+    expect(countRawHeader(["Host", "localhost", "X-Foo", "bar"], "host")).toBe(1);
+  });
+
+  it("counts two occurrences of the same name as 2 — case-insensitive, name at even indices", () => {
+    expect(countRawHeader(["Host", "a", "host", "b", "X-Foo", "bar"], "host")).toBe(2);
+  });
+
+  it("counts zero when the name is absent", () => {
+    expect(countRawHeader(["X-Foo", "bar", "X-Baz", "qux"], "host")).toBe(0);
+  });
+
+  it("does not match a value that happens to equal the name being searched for (only even indices — names — are compared)", () => {
+    // "host" appears at an ODD index here (as a VALUE, under an unrelated header name) — must not
+    // be counted, proving the every-other-element indexing is doing real work, not just calling
+    // .includes() on the flat array.
+    expect(countRawHeader(["X-Foo", "host", "X-Bar", "host"], "host")).toBe(0);
+  });
+
+  it("counts Origin the same way as Host (the branch this test suite specifically de-risks)", () => {
+    expect(countRawHeader(["Host", "localhost", "Origin", "http://a", "Origin", "http://a"], "origin")).toBe(2);
+  });
+});
 
 describe("registerMcp — Host/Origin guard", () => {
   it("allows a trusted loopback hostname even on a port other than the configured httpPort", async () => {
@@ -117,6 +183,36 @@ describe("registerMcp — Host/Origin guard", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  // --- Fix 1 (wave 2, CRITICAL): percent-encoded path must not bypass the guard ----------------
+
+  it("rejects an untrusted Host on a percent-encoded /%6dcp path that still routes to the /mcp handler (403, not 200)", async () => {
+    // The bug this closes: the guard used to gate on `req.url.split("?")[0] !== "/mcp"`, where
+    // req.url is the RAW, undecoded target. Fastify's router decodes the path before matching, so
+    // POST /%6dcp routes to the SAME /mcp handler while the raw string "/%6dcp" !== "/mcp" made
+    // the guard early-return WITHOUT validating Host/Origin at all — an untrusted Host sailed
+    // through to a 400 (session-less initialize rejection) instead of the 403 this asserts.
+    // Empirically reproduced pre-fix: this exact request returned 200-class/400 (guard skipped),
+    // not 403 — proving the guard must key off the ROUTER'S matched route, not the raw URL string.
+    const app = buildServer(fakeDeps());
+    const res = await expectGuardRejected(app, { host: "evil.example.com" }, "/%6dcp");
+    expect(res.json().error).toContain("evil.example.com");
+  });
+
+  it("still allows a TRUSTED Host through the same /%6dcp encoded path (guard runs, and passes)", async () => {
+    // Complements the rejection test above: proves the guard is now actually EVALUATING
+    // Host/Origin for this route (not just unconditionally 403ing every encoded path) — a
+    // trusted Host still reaches the normal session-less-400 fallthrough, exactly as plain /mcp
+    // does in expectGuardPassed.
+    const app = buildServer(fakeDeps());
+    const res = await app.inject({
+      method: "POST", url: "/%6dcp",
+      headers: { "content-type": "application/json", host: "localhost:4400" },
+      payload: { jsonrpc: "2.0", id: 1, method: "not-initialize" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: "no valid MCP session — send an initialize request first" });
+  });
+
   // --- Fix 1: fail CLOSED on missing/invalid Host ---------------------------------------------
 
   it("rejects a request with NO Host header at all (fail-closed, not fail-open) — real socket, HTTP/1.0", async () => {
@@ -148,6 +244,13 @@ describe("registerMcp — Host/Origin guard", () => {
   });
 
   // --- Fix 1: reject duplicate/ambiguous Host or Origin (raw-header check) --------------------
+  //
+  // NOTE: the two inject()-based tests below exercise light-my-request's OWN comma-join behavior
+  // ("localhost,evil.com"), which 403s via the malformed-authority parse failure in
+  // canonicalHostname()/canonicalOriginHostname() — NOT via the `countRawHeader(...) > 1` branch.
+  // They would still pass even if that branch were deleted outright. The Fix-2 (wave 2) block
+  // further below ("actually exercises the duplicate-header branch") is the DISCRIMINATING
+  // coverage — see rawDuplicateHeaderRequest's doc comment.
 
   it("rejects a duplicate Host header with 403 even though each individual value is trusted", async () => {
     // Two distinct Host lines on the wire collapse through light-my-request into a single
@@ -161,6 +264,37 @@ describe("registerMcp — Host/Origin guard", () => {
   it("rejects a duplicate Origin header with 403 even when Host is trusted", async () => {
     const app = buildServer(fakeDeps());
     await expectGuardRejected(app, { host: "localhost:4400", origin: ["http://localhost", "http://evil.com"] });
+  });
+
+  // --- Fix 2 (wave 2): actually exercise the duplicate-header branch (discriminating coverage) --
+
+  it("rejects TWO LITERAL Host lines with 403 via the raw-duplicate-count path, even though each individual value is trusted (real socket)", async () => {
+    const app = buildServer(fakeDeps());
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    try {
+      const address = app.server.address();
+      if (address === null || typeof address === "string") throw new Error("expected an AddressInfo");
+      const { statusLine } = await rawDuplicateHeaderRequest(address.port, "Host: localhost\r\nHost: localhost\r\n");
+      expect(statusLine).toContain("403");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects TWO LITERAL Origin lines with 403 via the raw-duplicate-count path, even though each individual value is trusted and Host is trusted (real socket)", async () => {
+    const app = buildServer(fakeDeps());
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    try {
+      const address = app.server.address();
+      if (address === null || typeof address === "string") throw new Error("expected an AddressInfo");
+      const { statusLine } = await rawDuplicateHeaderRequest(
+        address.port,
+        "Host: localhost\r\nOrigin: http://localhost\r\nOrigin: http://localhost\r\n",
+      );
+      expect(statusLine).toContain("403");
+    } finally {
+      await app.close();
+    }
   });
 
   // --- Fix 1: canonicalization — case, trailing dot, IPv6 --------------------------------------
@@ -178,6 +312,20 @@ describe("registerMcp — Host/Origin guard", () => {
   it("allows a bracketed IPv6 loopback Host ([::1])", async () => {
     const app = buildServer(fakeDeps());
     await expectGuardPassed(app, { host: "[::1]:4400" });
+  });
+
+  // --- Fix 3 (wave 2): reject userinfo authorities ---------------------------------------------
+
+  it("rejects a Host authority carrying userinfo (\"evil.com@localhost\") with 403, even though the hostname alone would be trusted", async () => {
+    // `new URL("http://evil.com@localhost")` parses to hostname "localhost" (TRUSTED) with
+    // username "evil.com" — canonicalHostname()'s prior behavior silently dropped the userinfo
+    // and returned the bare hostname, so a Host header carrying userinfo would sail through the
+    // allowlist unexamined. Not directly browser-reachable (browsers strip userinfo before
+    // sending a Host header), but a malformed authority carrying userinfo is invalid input that
+    // must be rejected outright, not silently reinterpreted as a different, trusted authority.
+    const app = buildServer(fakeDeps());
+    const res = await expectGuardRejected(app, { host: "evil.com@localhost" });
+    expect(res.json().error).toContain("evil.com@localhost");
   });
 
   // --- Fix 1: Origin present-untrusted vs absent -----------------------------------------------

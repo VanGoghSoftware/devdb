@@ -58,12 +58,21 @@ export class SessionStore {
     this.sessions.delete(id);
   }
 
-  // Removes the session immediately AND closes its transport (used for the DELETE teardown path
-  // — the one path WE initiate outside of sweep()/closeAll()). Swallows close() failures — an
-  // already-dead transport erroring on close must not block eviction of the session-store entry
-  // itself. Idempotent with removeEntry()/onclose: if the entry is already gone (e.g. the SDK's
-  // own onclose already fired and called removeEntry() first), this is a no-op — it does NOT
-  // call transport.close() a second time on an entry it no longer holds.
+  // Removes the session immediately AND closes its transport — the single-entry "remove + close"
+  // primitive that sweep()/closeAll() below each reimplement inline for their own multi-entry
+  // loops (Map.delete(id) + transport.close(), the same two steps, applied to one entry at a
+  // time). Fix 4 (wave 2): NOT actually called from src/ — the DELETE /mcp route (http.ts's
+  // requireSession) hands off to the SDK's own transport.handleRequest(), which internally closes
+  // the transport and fires transport.onclose → removeEntry() (pure removal, no close call; see
+  // removeEntry()'s own doc comment) — so this method has no production caller of its own. It is
+  // kept and exercised directly by mcp-session.test.ts as a unit-level proof of the exact
+  // remove+close contract sweep()/closeAll() both rely on (in particular the idempotent
+  // no-double-close interaction with removeEntry()/onclose covered by that test file's "Fix 2"
+  // describe block) — not because it currently sits on any live request path. Swallows close()
+  // failures — an already-dead transport erroring on close must not block eviction of the
+  // session-store entry itself. Idempotent with removeEntry()/onclose: if the entry is already
+  // gone (e.g. the SDK's own onclose already fired and called removeEntry() first), this is a
+  // no-op — it does NOT call transport.close() a second time on an entry it no longer holds.
   async delete(id: string): Promise<void> {
     const s = this.sessions.get(id);
     if (!s) return;

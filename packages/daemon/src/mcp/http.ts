@@ -36,9 +36,22 @@ const TRUSTED_LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "
 // insensitive hostname comparison) + strip a single trailing dot (a DNS FQDN's root-zone dot,
 // "localhost." vs "localhost", refer to the same name). Returns null on ANY parse failure —
 // callers must treat null as "reject", not "skip validation" (fail CLOSED, not fail open).
+//
+// Fix 3 (wave 2): rejects any authority carrying userinfo (a "user:pass@" or "user@" prefix). A
+// bare "host[:port]" authority (what a Host header legitimately carries) never includes userinfo
+// — a Host value of "evil.com@localhost" is not standard HTTP, and `new URL("http://" + authority)`
+// silently accepts it as a URL with a "localhost" hostname and an "evil.com" username, which
+// would let this authority canonicalize to (and be allowlisted as) the innocuous-looking
+// "localhost" while the "evil.com" component is dropped entirely rather than flagged. Not
+// directly browser-exploitable (browsers strip userinfo before ever sending a Host header), but a
+// malformed authority carrying userinfo is invalid input for this parse's stated contract — reject
+// it outright (return null → the caller's existing fail-closed handling) rather than silently
+// reinterpreting it as a different, trusted authority.
 function canonicalHostname(authority: string): string | null {
   try {
-    let hostname = new URL(`http://${authority}`).hostname.toLowerCase();
+    const url = new URL(`http://${authority}`);
+    if (url.username !== "" || url.password !== "") return null;
+    let hostname = url.hostname.toLowerCase();
     if (hostname.length > 1 && hostname.endsWith(".")) hostname = hostname.slice(0, -1);
     return hostname || null;
   } catch {
@@ -107,7 +120,17 @@ function isOriginAllowed(origin: string, cfg: Deps["cfg"]): boolean {
 // values, so only even indices (names) are compared. A count > 1 means the client (or a
 // rebinding-adjacent proxy) sent the same security-relevant header twice; per Fix 1 that is
 // ALWAYS ambiguous enough to reject outright rather than pick one value to validate.
-function countRawHeader(rawHeaders: string[], name: string): number {
+//
+// Exported (Fix 2, wave 2) so mcp-http.test.ts can unit-test the counting logic directly. This is
+// the ONLY way to get discriminating coverage for the Origin branch specifically: Node's parser
+// comma-joins (rather than first-value-collapses) duplicate values for any header not in its
+// small special-cased list, so `req.headers.origin` for two literal "Origin:" lines becomes an
+// unparseable joined string ("http://a, http://a") that 403s via canonicalOriginHostname()'s
+// malformed-parse path regardless of whether this function's `> 1` check exists at all — a raw
+// end-to-end socket test can never isolate the duplicate-COUNT branch from the malformed-parse
+// branch for Origin the way it can for Host (which Node collapses to first-value-wins, staying
+// individually parseable/trusted — see mcp-http.test.ts's rawDuplicateHeaderRequest tests).
+export function countRawHeader(rawHeaders: string[], name: string): number {
   let count = 0;
   for (let i = 0; i < rawHeaders.length; i += 2) {
     if (rawHeaders[i]?.toLowerCase() === name) count++;
@@ -125,15 +148,29 @@ export function registerMcp(app: FastifyInstance, deps: Deps): { closeAll: () =>
   const sweepTimer = setInterval(() => store.sweep(Date.now()), SWEEP_INTERVAL_MS);
   sweepTimer.unref();
 
-  // Host/Origin allowlist hook, scoped to /mcp only (registered directly on `app`, gated on
-  // req.url, rather than inside a child-context .register() plugin) — this endpoint is the only
-  // one on this Fastify instance carrying MCP's DNS-rebinding exposure (Streamable-HTTP is
-  // reachable from a browser tab; every other REST route here is a plain fetch()/curl target
-  // consumed by tooling, not a page-navigable endpoint the rebinding attack needs).
+  // Host/Origin allowlist hook, scoped to /mcp only (registered directly on `app`, gated on the
+  // ROUTER'S matched route, rather than inside a child-context .register() plugin) — this
+  // endpoint is the only one on this Fastify instance carrying MCP's DNS-rebinding exposure
+  // (Streamable-HTTP is reachable from a browser tab; every other REST route here is a plain
+  // fetch()/curl target consumed by tooling, not a page-navigable endpoint the rebinding attack
+  // needs).
   //
-  // Route match is the EXACT pathname "/mcp" (query string, if any, stripped before comparing),
-  // not a startsWith("/mcp") prefix — a prefix match would also catch a hypothetical future
-  // "/mcpfoo" route that has nothing to do with this guard's threat model.
+  // Fix 1 wave 2 (CRITICAL — closes a live guard bypass): gates on `req.routeOptions?.url`, the
+  // ROUTER'S matched route pattern, NOT `req.url` (the raw, undecoded request target). The
+  // previous `req.url.split("?")[0] !== "/mcp"` check compared against the raw string, but
+  // Fastify's router matches on the DECODED path — so `POST /%6dcp` (also `/m%63p`, `/mc%70`,
+  // `/%6Dcp`, ...) DECODES to "/mcp", routes to this exact /mcp handler, while the raw string
+  // "/%6dcp" !== "/mcp" made the guard early-return WITHOUT validating Host/Origin at all.
+  // Empirically reproduced pre-fix: `POST /%6dcp` + `Host: evil.example.com` sailed through to
+  // the handler (400 session-less-initialize, not 403) — a full bypass of the ONLY protection
+  // this unauthenticated endpoint has. `req.routeOptions.url` is populated by Fastify BEFORE
+  // onRequest hooks run (routing happens first in the request lifecycle) and holds the
+  // REGISTERED route pattern the router actually dispatched to — already decode-normalized,
+  // with no path-string comparison of any kind required. It is `undefined` for a 404 (no route
+  // matched at all), which correctly also fails the `!== "/mcp"` check below and skips the guard
+  // (a 404 never reaches a /mcp handler, so there is nothing to guard). Since both /mcp routes
+  // are registered as the literal string "/mcp" (no :param templating), routeOptions.url is
+  // exactly "/mcp" for every request dispatched there, however its URL was encoded on the wire.
   //
   // Fix 1 — this hook now fails CLOSED on every ambiguous or malformed case, not just a
   // present-and-untrusted one:
@@ -152,8 +189,7 @@ export function registerMcp(app: FastifyInstance, deps: Deps): { closeAll: () =>
   //      legitimately send none) — but a PRESENT Origin must resolve to an allowed hostname; it is
   //      no longer possible for a present-but-malformed Origin to slip through unchecked.
   app.addHook("onRequest", async (req, reply) => {
-    const pathname = req.url.split("?")[0];
-    if (pathname !== "/mcp") return;
+    if (req.routeOptions?.url !== "/mcp") return;
 
     const rawHeaders = req.raw.rawHeaders;
     if (countRawHeader(rawHeaders, "host") > 1) {
