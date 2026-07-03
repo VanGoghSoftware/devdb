@@ -174,7 +174,12 @@ export class BranchesService {
     return this.deps.queue.run(id, async () => {
       const current = this.deps.state.branches.byId(id);
       if (!current) throw new DevdbError(404, `branch ${id} not found`);
-      if (current.name !== name && this.deps.state.branches.byProjectAndName(current.projectId, name)) {
+      // Fix 1 (broker): renaming to the branch's OWN current name must be a true no-op — no DB
+      // write, no updated_at bump, no branch.updated event. Returning here, before updateName and
+      // before the publish, is what makes that hold; the duplicate-name 409 check below only ever
+      // runs for genuine renames (current.name !== name).
+      if (current.name === name) return current;
+      if (this.deps.state.branches.byProjectAndName(current.projectId, name)) {
         throw new DevdbError(409, `branch "${name}" already exists in this project`);
       }
       this.deps.state.branches.updateName(id, name);

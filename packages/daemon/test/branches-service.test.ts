@@ -377,25 +377,86 @@ describe("BranchesService", () => {
       ]);
     });
 
+    // Fix 1 (broker): renaming a branch to its OWN current name must be a TRUE no-op — no DB
+    // write (updatedAt unchanged), no branch.updated event. Wires a real EventsService +
+    // collector (same pattern as the "renames a child branch..." test above) so the assertion
+    // covers the actual publish call, not just the returned row.
+    it("renaming to its own current name is a true no-op: unchanged updatedAt, zero events", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const queue = new BranchQueue();
+      const events = new EventsService();
+      const seen: DevdbEvent[] = [];
+      const projects = new ProjectsService({ state, queue, ...f });
+      const { project } = await projects.create({ name: "acme" });
+      const branches = new BranchesService({ state, queue, events, ...f });
+      const b = await branches.create({ projectId: project.id, name: "a" });
+      events.subscribe((e) => seen.push(e)); // subscribe AFTER the seeding create() above
+
+      const out = await branches.rename(b.id, "a");
+
+      expect(out).toMatchObject({ id: b.id, name: "a" });
+      expect(out.updatedAt).toBe(b.updatedAt); // unchanged — proves no DB write happened
+      expect(seen.filter((e) => e.type === "branch.updated")).toEqual([]);
+    });
+
     it("refuses to rename the root branch with a 400 naming the reason", async () => {
-      const { project, mainBranch, branches } = await seeded();
+      const f = fakes();
+      const state = openState(":memory:");
+      const queue = new BranchQueue();
+      const events = new EventsService();
+      const seen: DevdbEvent[] = [];
+      const projects = new ProjectsService({ state, queue, ...f });
+      const { project, mainBranch } = await projects.create({ name: "acme" });
+      const branches = new BranchesService({ state, queue, events, ...f });
+      events.subscribe((e) => seen.push(e)); // subscribe AFTER the seeding create() above
       expect(mainBranch.parentBranchId).toBeNull();
+
       await expect(branches.rename(mainBranch.id, "primary")).rejects.toMatchObject({ statusCode: 400 });
+
       expect(project.id).toBe(mainBranch.projectId);
+      // Fix 3 (broker): a rejected rename must publish nothing.
+      expect(seen.filter((e) => e.type === "branch.updated")).toEqual([]);
     });
 
     it("409s on a duplicate name in the same project; renaming to its own name is a no-op success", async () => {
-      const { project, branches } = await seeded();
+      const f = fakes();
+      const state = openState(":memory:");
+      const queue = new BranchQueue();
+      const events = new EventsService();
+      const seen: DevdbEvent[] = [];
+      const projects = new ProjectsService({ state, queue, ...f });
+      const { project } = await projects.create({ name: "acme" });
+      const branches = new BranchesService({ state, queue, events, ...f });
       const a = await branches.create({ projectId: project.id, name: "a" });
       await branches.create({ projectId: project.id, name: "b" });
+      events.subscribe((e) => seen.push(e)); // subscribe AFTER the seeding creates above
+
       await expect(branches.rename(a.id, "b")).rejects.toMatchObject({ statusCode: 409 });
       await expect(branches.rename(a.id, "a")).resolves.toMatchObject({ name: "a" });
+
+      // Fix 3 (broker): the rejected 409 rename must publish nothing. (The self-rename no-op is
+      // covered separately above; this test's own no-op resolve above would also publish nothing,
+      // so the zero-count assertion holds across both calls.)
+      expect(seen.filter((e) => e.type === "branch.updated")).toEqual([]);
     });
 
     it("400s on a name failing NAME_RE", async () => {
-      const { project, branches } = await seeded();
+      const f = fakes();
+      const state = openState(":memory:");
+      const queue = new BranchQueue();
+      const events = new EventsService();
+      const seen: DevdbEvent[] = [];
+      const projects = new ProjectsService({ state, queue, ...f });
+      const { project } = await projects.create({ name: "acme" });
+      const branches = new BranchesService({ state, queue, events, ...f });
       const b = await branches.create({ projectId: project.id, name: "ok" });
+      events.subscribe((e) => seen.push(e)); // subscribe AFTER the seeding create() above
+
       await expect(branches.rename(b.id, "  ")).rejects.toMatchObject({ statusCode: 400 });
+
+      // Fix 3 (broker): a rejected rename must publish nothing.
+      expect(seen.filter((e) => e.type === "branch.updated")).toEqual([]);
     });
   });
 });

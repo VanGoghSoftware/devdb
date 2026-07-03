@@ -271,13 +271,18 @@ describe("buildServer branch routes", () => {
   // Task 4 (Phase 3): PATCH /api/branches/:id rename — the route delegates validation/semantics
   // entirely to BranchesService.rename (covered service-side in branches-service.test.ts); this
   // route test proves only the HTTP wiring: body -> service call -> detail() -> BranchDto.
-  it("PATCH /api/branches/:id — 200 with the renamed branch DTO", async () => {
+  it("PATCH /api/branches/:id — 200 with the renamed branch DTO (redacted, not a raw row)", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const branches = fakeBranches();
     const fakeRow = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "renamed" });
+    // Fix 2 (broker): detail()'s mock must be FULLY populated with the internal-only fields
+    // (password/stickyPort/importStatus/importError) — a sparse fake would make a leaking mapper
+    // pass this test too, since JSON.stringify drops undefined keys (same rationale as
+    // fakeBranchDetail's own doc comment above).
+    const fakeDetail = fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "renamed" });
     vi.mocked(branches.rename).mockResolvedValue(fakeRow);
-    vi.mocked(branches.detail).mockResolvedValue(fakeBranchDetail({ id: "branch-1", projectId: "project-1", name: "renamed" }));
+    vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
@@ -286,8 +291,14 @@ describe("buildServer branch routes", () => {
     const res = await app.inject({ method: "PATCH", url: "/api/branches/branch-1", payload: { name: "renamed" } });
 
     expect(res.statusCode).toBe(200);
-    expect(res.json().name).toBe("renamed");
+    const body = res.json();
+    expect(body).toEqual(toBranchDto(fakeDetail));
+    expect(body.name).toBe("renamed");
     expect(branches.rename).toHaveBeenCalledWith("branch-1", "renamed");
+    expect(body.password).toBeUndefined();
+    expect(body.stickyPort).toBeUndefined();
+    expect(body.importStatus).toBeUndefined();
+    expect(body.importError).toBeUndefined();
   });
 
   it("PATCH /api/branches/:id — zod 400 on a missing name", async () => {
