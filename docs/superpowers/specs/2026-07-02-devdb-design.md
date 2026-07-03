@@ -89,7 +89,7 @@ Modules with hard boundaries:
 ### State model (SQLite)
 
 - `projects` (id, name, pg_version, tenant_id, timestamps)
-- `branches` (id, project_id, parent_branch_id, name, slug, timeline_id, password, port, endpoint_status, import_status, import_error, created_by: `ui|api|mcp`, timestamps)
+- `branches` (id, project_id, parent_branch_id, name, slug, timeline_id, password, port, endpoint_status, import_status, import_error, created_by: `ui|api|mcp`, context: nullable JSON — fork context, see §MCP server, timestamps)
 - `jobs` (id, kind: import|export|restore, branch_id, status, error, log_path, lsn, size_bytes, timestamps)
 - `export_targets` (id, name, kind: s3|azure|local, config JSON)
 - `settings` (key, value)
@@ -100,7 +100,7 @@ Flat, unauthenticated, under `/api`:
 
 - `GET /api/status` — daemon + engine health, durability sync status, version
 - `POST|GET /api/projects` · `GET|DELETE /api/projects/:id`
-- `GET|POST /api/projects/:id/branches` — create: `{name, parent_branch_id?, at?: timestamp|lsn}`
+- `GET|POST /api/projects/:id/branches` — create: `{name, parent_branch_id?, at?: timestamp|lsn, context?}` — `context` = the same fork-context object MCP uses (see §MCP server), so non-MCP callers get parity
 - `GET|PATCH|DELETE /api/branches/:id` — includes connection string when running
 - `POST /api/branches/:id/endpoint/start|stop` · `GET /api/branches/:id/endpoint`
 - `POST /api/branches/:id/restore` `{to, mode: in_place | new_branch{name}}` · `POST /api/branches/:id/reset`
@@ -115,15 +115,17 @@ Delete rules (ported): branch with children can't be deleted (error lists childr
 
 In-daemon, Streamable HTTP at `http://localhost:4400/mcp`, official `@modelcontextprotocol/sdk`. Setup: `claude mcp add --transport http devdb http://localhost:4400/mcp`.
 
-**Design principles:** every success response is actionable text including the connection string when relevant and a "next step" hint; every error names its remediation. Timestamps are ISO 8601.
+**Design principles:** every success response is actionable text including the connection string when relevant and a "next step" hint, and opens with a context line naming the project and branch it acted on (plus parent, for forks) so agents and their transcripts always self-identify; every error names its remediation. Timestamps are ISO 8601.
 
-**Tools:** `list_projects`, `create_project {name, pg_version?}`, `list_branches {project}`, `create_branch {project, name, parent?, at_timestamp?}` (**auto-starts endpoint, returns connstring** — the "new worktree" move), `get_branch {project, branch, ensure_running?=true}` (the "switch" move), `stop_endpoint`, `delete_branch`, `reset_branch` (the "scrap and retry" move), `restore_branch {project, branch, to_timestamp, as_new_branch?}`, `import_database {project, branch_name, source_connection_string}` (async), `export_branch {project, branch, target}` (async), `get_job {id}`, `get_status`.
+**Tools:** `list_projects`, `create_project {name, pg_version?}`, `list_branches {project}`, `create_branch {project, name, parent?, at_timestamp?, context?}` (**auto-starts endpoint, returns connstring** — the "new worktree" move), `get_branch {project, branch, ensure_running?=true}` (the "switch" move), `stop_endpoint`, `delete_branch`, `reset_branch` (the "scrap and retry" move), `restore_branch {project, branch, to_timestamp, as_new_branch?, context?}`, `import_database {project, branch_name, source_connection_string}` (async), `export_branch {project, branch, target}` (async), `get_job {id}`, `get_status`.
+
+**Fork context (required):** every branch-creating tool (`create_branch`, `restore_branch` with `as_new_branch`, later `import_database`) takes a `context` object identifying the fork: `{git_branch?, workdir?, agent?, purpose?}` — the caller's current **git branch name**, its worktree/working directory, an agent/session label, and a one-line task description. The server adds what it can observe itself: `client: {name, version}` from the MCP `initialize` handshake (the transport itself is already recorded as `created_by`). The fields are optional in the tool schema (a bare call still works) but described as strongly recommended, and the shipped skills fill them automatically. Context is persisted on the branch (`branches.context`), returned by `get_branch`/`list_branches` and the REST branch DTOs, and rendered in the web UI's branch tree — this is how a human tells parallel agents' forks apart.
 
 ## Agent skills (`skills/`)
 
 Superpowers-convention SKILL.md files, installable to `~/.claude/skills` or a project's `.claude/skills`; they reference MCP tool names exactly and version with the daemon.
 
-1. **using-devdb** — branch-per-task discipline: branch `agent/<task-slug>` off `main`; write connstring into the worktree's env; never share a branch between concurrent agents; delete on completion.
+1. **using-devdb** — branch-per-task discipline: branch `agent/<task-slug>` off `main`; write connstring into the worktree's env; never share a branch between concurrent agents; delete on completion; always pass fork context on `create_branch` (`git_branch` via `git branch --show-current`, `workdir` = the worktree path, `purpose` = one line on the task).
 2. **safe-db-migrations** — rehearse on a branch, verify, apply to `main`; `restore_branch` as the undo for mistakes on `main`.
 3. **importing-databases** — bring an external DB in as `main`/snapshot branch; Docker reachability guidance (`host.docker.internal`).
 
@@ -132,7 +134,7 @@ Superpowers-convention SKILL.md files, installable to `~/.claude/skills` or a pr
 React 19 + Vite + **Mantine**, static build embedded in the daemon at `:4400`. No login. Fresh design — no neond visual/layout reuse.
 
 - **Dashboard** — projects, engine health, durability badge.
-- **Project view** — **git-graph-style branch tree** with endpoint status chips and per-branch actions (branch-from-here, copy connstring, start/stop, restore, reset, export, delete). Agent-created branches tagged.
+- **Project view** — **git-graph-style branch tree** with endpoint status chips and per-branch actions (branch-from-here, copy connstring, start/stop, restore, reset, export, delete). Agent-created branches tagged with their fork context — creating agent, its **git branch**, purpose — as an inline chip on the tree node, full context in the branch panel; whose-fork-is-whose must be readable at a glance.
 - **Branch panel** — connstring, live logs (SSE), job history, restore picker, danger zone.
 - **SQL console** — branch picker, query box, results table.
 - **Settings** — remote storage (none/S3/Azure) + sync status, export targets, port range.
@@ -194,9 +196,13 @@ docs/                user docs · docs/superpowers/specs/ design docs
 
 1. `docker compose up` → dashboard on `:4400` within seconds of engine readiness.
 2. Create project (PG 18) → `main` branch; connect with `psql`; create table + rows.
-3. `claude mcp add … /mcp`; agent runs `create_branch` → gets connstring → destructive changes on its branch; `main` unaffected; branch tree shows both.
+3. `claude mcp add … /mcp`; agent runs `create_branch` (with fork context) → gets connstring → destructive changes on its branch; `main` unaffected; branch tree shows both, the agent's branch carrying its fork context (git branch, purpose).
 4. Agent `reset_branch` → branch matches `main` again; `restore_branch --as-new-branch` recovers a pre-mistake timestamp.
 5. Import an external database into a new branch; watch progress live.
 6. Export a branch to MinIO (S3) and Azurite (Azure); `pg_restore` the artifact into vanilla Postgres successfully.
 7. With S3 durability on: destroy container + volume, recreate from bucket, branches and data return.
 8. `CREATE EXTENSION vector, postgis, pg_cron;` succeeds on a fresh branch.
+
+## Amendments
+
+- **2026-07-03 (Jordan): MCP fork context.** Branch-creating MCP tools must attach caller context — current **git branch name**, workdir, agent label, purpose, plus server-captured MCP client info — persisted on the branch (`branches.context`, additive migration in phase 2) and rendered in the UI branch tree, so parallel agents' forks are easily identifiable. MCP success responses also open with a context line naming the project/branch acted on. Sections updated: State model, REST API, MCP server (new "Fork context" paragraph), Agent skills, Web UI, v1 acceptance item 3.
