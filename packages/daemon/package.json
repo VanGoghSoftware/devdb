@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@devdb/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.8.0",
     "drizzle-orm": "^0.38.0",
     "execa": "^9.5.0",
