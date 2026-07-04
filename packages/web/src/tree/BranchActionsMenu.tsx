@@ -7,13 +7,21 @@ export function BranchActionsMenu(a: { branch: BranchDto; onOpenDrawer: () => vo
   const start = useStartEndpoint(); const stop = useStopEndpoint();
   const del = useDeleteBranch(); const reset = useResetBranch();
   const b = a.branch;
-  const copyConnstring = () => {
+  const copyConnstring = async () => {
     if (!b.connectionString) {
       notifications.show({ color: "yellow", message: "No connection string — endpoint is not running. Start it first." });
       return;
     }
-    void navigator.clipboard.writeText(b.connectionString);
-    notifications.show({ color: "green", message: "Connection string copied" });
+    if (!navigator.clipboard) {
+      notifications.show({ color: "red", message: "Clipboard is unavailable in this browser" });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(b.connectionString);
+      notifications.show({ color: "green", message: "Connection string copied" });
+    } catch {
+      notifications.show({ color: "red", message: "Failed to copy connection string" });
+    }
   };
   return (
     <Menu withinPortal position="bottom-end">

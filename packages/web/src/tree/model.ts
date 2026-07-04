@@ -6,18 +6,52 @@ export interface TreeNode { branch: BranchDto; children: TreeNode[] }
 // Branches form a strict tree (no merges) — parentBranchId linking. Orphans (parent deleted or
 // not yet fetched during an invalidation window) are promoted to roots rather than dropped: a
 // transiently-inconsistent tree must render, never crash or hide branches.
+//
+// Defensive hardening against malformed input (the daemon guarantees acyclic parent pointers, so
+// this should never trigger in practice, but a self-parent — parentBranchId === own id — or a
+// mutual cycle (A's parent is B, B's parent is A) must not silently vanish branches or hang a
+// later tree walk): raw parent→children linking below can legitimately contain back-edges (e.g. a
+// self-parent pushes itself into its own `children`). We never trust those raw arrays directly for
+// the output — instead we DFS-reassemble from the roots carrying a `visited` set, so a child
+// already placed elsewhere in the tree (a back-edge) is skipped rather than re-descended into.
+// Any node never reached this way (a pure-cycle component with no path from a real root, e.g. a
+// self-parent or an isolated mutual cycle) is then promoted to root and assembled the same way, so
+// the invariant "every input branch appears in the output exactly once, and the result is acyclic"
+// holds regardless of how malformed the parentBranchId pointers are.
 export function buildTree(branches: BranchDto[]): TreeNode[] {
   const nodes = new Map<string, TreeNode>(branches.map((b) => [b.id, { branch: b, children: [] }]));
+  const childrenOf = new Map<string, TreeNode[]>();
   const roots: TreeNode[] = [];
   for (const n of nodes.values()) {
     const parent = n.branch.parentBranchId ? nodes.get(n.branch.parentBranchId) : undefined;
-    if (parent) parent.children.push(n);
-    else roots.push(n);
+    if (parent) {
+      const list = childrenOf.get(parent.branch.id);
+      if (list) list.push(n); else childrenOf.set(parent.branch.id, [n]);
+    } else roots.push(n);
   }
+
   const byCreated = (a: TreeNode, z: TreeNode) => a.branch.createdAt.localeCompare(z.branch.createdAt);
-  const sortRec = (n: TreeNode) => { n.children.sort(byCreated); n.children.forEach(sortRec); };
+  const visited = new Set<string>();
+  // Reassemble `children` via DFS, breaking back-edges: a candidate child already visited (placed
+  // elsewhere, or an ancestor via a cycle) is skipped instead of re-descended into.
+  const assemble = (n: TreeNode): TreeNode => {
+    visited.add(n.branch.id);
+    const raw = childrenOf.get(n.branch.id) ?? [];
+    n.children = raw.filter((c) => !visited.has(c.branch.id)).map(assemble);
+    n.children.sort(byCreated);
+    return n;
+  };
   roots.sort(byCreated);
-  roots.forEach(sortRec);
+  roots.forEach(assemble);
+  // Anything left unvisited belongs to a cycle unreachable from a real root — promote to root
+  // (in createdAt order, for deterministic output) so it still renders instead of vanishing.
+  const strandedRoots = [...nodes.values()]
+    .filter((n) => !visited.has(n.branch.id))
+    .sort(byCreated);
+  for (const n of strandedRoots) {
+    if (visited.has(n.branch.id)) continue; // already pulled in as part of an earlier stranded node's cycle
+    roots.push(assemble(n));
+  }
   return roots;
 }
 
