@@ -40,6 +40,12 @@ describe("loadConfig", () => {
   it("rejects http port inside the endpoint range", () => {
     expect(() => loadConfig({ ...base, DEVDB_HTTP_PORT: "54310" })).toThrow(/54310/);
   });
+  it("rejects ranges overlapping the tracer/control-plane port 4318", () => {
+    expect(() => loadConfig({ ...base, DEVDB_PORT_RANGE: "4310-4320" })).toThrow(/4318/);
+  });
+  it("exposes the tracer sink port (4318)", () => {
+    expect(loadConfig(base).engine.tracerPort).toBe(4318);
+  });
 
   describe("DEVDB_WEB_DIST", () => {
     it("is null when unset", () => {

@@ -9,6 +9,9 @@ const ENGINE_PORTS = {
   pageserverPgPort: 64000,
   safekeeperPgPort: 5454,
   safekeeperHttpPort: 7676,
+  // oracle: src/preflight/mod.rs:17 TRACER_PORT = 4318 (reserved). The tracer sink (engine/tracer.ts)
+  // binds this; the storage_controller's --control-plane-url + the binaries' OTLP exporter target it.
+  tracerPort: 4318,
 } as const;
 
 const EnvSchema = z.object({
@@ -36,6 +39,7 @@ export interface DevdbConfig {
     pageserverPgPort: 64000;
     safekeeperPgPort: 5454;
     safekeeperHttpPort: 7676;
+    tracerPort: 4318;
   };
   mcpAllowedHosts: string[];
   mcpAllowedOrigins: string[];

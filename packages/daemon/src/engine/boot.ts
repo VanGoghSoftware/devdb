@@ -6,6 +6,7 @@ import type { StateDb } from "../state/db.js";
 import type { LogsService } from "../services/logs.js";
 import { ManagedProcess } from "./process.js";
 import { EmbeddedPostgres } from "./embedded-postgres.js";
+import { Tracer } from "./tracer.js";
 import {
   brokerSpec, engineDirs, pageserverIdentityToml, pageserverMetadataJson,
   pageserverSpec, pageserverToml, safekeeperRegistrationBody, safekeeperSpec, storconSpec,
@@ -14,6 +15,7 @@ import {
 export class EngineRuntime {
   private storconDb: EmbeddedPostgres;
   private procs = new Map<string, ManagedProcess>();
+  private tracer: Tracer;
   storconDbUri: string;
 
   constructor(
@@ -47,6 +49,14 @@ export class EngineRuntime {
       },
     });
     this.storconDbUri = this.storconDb.connectionUri();
+
+    // Catch-all sink on 127.0.0.1:4318 (oracle: neond src/daemon/tracer/mod.rs) — absorbs the
+    // binaries' OTLP trace exports AND the storage_controller's --control-plane-url upcalls, both
+    // of which target 4318. Constructed here, started first in start() / stopped last in stop().
+    this.tracer = new Tracer(cfg.engine.tracerPort, (line) => {
+      console.log(`[tracer] ${line}`);
+      this.logs.ingest("daemon:tracer", line);
+    });
   }
 
   private async launch(spec: { name: string; bin: string; args: string[]; readyNeedle: string }): Promise<void> {
@@ -72,6 +82,17 @@ export class EngineRuntime {
   // oracle: startup order src/daemon/mod.rs:182-232
   async start(): Promise<void> {
     try {
+      // First: the tracer sink, so it's listening before storcon/pageserver ever emit a trace or
+      // control-plane upcall. Bind failure is NON-FATAL (like neon, which logs + drops the tracer
+      // task): degrade to "no sink" — the 4318 noise resumes — rather than brick the daemon over a
+      // telemetry port. The port is reserved in config (DEVDB_PORT_RANGE can't overlap it), so a
+      // bind failure means something external holds 4318.
+      await this.tracer.start().catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[tracer] sink failed to bind 127.0.0.1:${this.cfg.engine.tracerPort} — engine trace/upcall noise will resume: ${msg}`);
+        this.logs.ingest("daemon:tracer", `sink failed to bind: ${msg}`);
+      });
+
       const dirs = engineDirs(this.cfg);
       await Promise.all(Object.values(dirs).map((d) => mkdir(d, { recursive: true })));
 
@@ -129,6 +150,7 @@ export class EngineRuntime {
       await this.procs.get(name)?.stop();
     }
     await this.storconDb.stop();
+    await this.tracer.stop(); // last — absorbs any shutdown-time trace/upcall traffic; no-ops if unbound
   }
 
   status(): Record<string, { state: string; pid: number | null }> {
