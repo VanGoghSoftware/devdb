@@ -15,6 +15,21 @@ vi.mock("../src/api/client.js", () => ({
 import { api } from "../src/api/client.js";
 import type { BranchDto } from "@devdb/shared";
 
+// BranchDrawer now mounts LogsTab (Task 13) unconditionally on its Logs tab, which reaches for a
+// real EventSource when no `makeSource` is injected — jsdom has none (mirrors app.test.tsx's own
+// stub for useEvents' startEvents, same root cause). This file's tests exercise BranchDrawer's own
+// concerns (rename, connstring, danger zone, etc.), not the log stream's content, so an inert stub
+// (no real connection, no automatic events) is all that's needed to keep the drawer's mount hermetic.
+// logs-tab.test.tsx covers the real SSE behavior via its own injected FakeES.
+class InertEventSource {
+  onopen: (() => void) | null = null;
+  onmessage: ((m: MessageEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor(public url: string) {}
+  close(): void {}
+}
+vi.stubGlobal("EventSource", InertEventSource);
+
 const branch: BranchDto = {
   id: "b1", projectId: "p1", parentBranchId: "b-main", name: "agent-fix", slug: "agent-fix-s",
   timelineId: "t".repeat(32), endpointStatus: "running", endpointError: null, port: 54303,

@@ -6,6 +6,8 @@ import { notifications } from "@mantine/notifications";
 import { useBranch, useDeleteBranch, useRenameBranch, useResetBranch, useStartEndpoint, useStopEndpoint } from "../api/hooks.js";
 import { StatusChip, ContextChip } from "../tree/chips.js";
 import { InfoTab } from "./InfoTab.js";
+import { LogsTab } from "./LogsTab.js";
+import { RestoreTab } from "./RestoreTab.js";
 
 export function maskConnstring(conn: string): string {
   // Mask the password segment of a URL's `//user:PASSWORD@` userinfo for ANY scheme, so a format
@@ -114,8 +116,8 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
             <Tabs.Tab value="restore">Restore</Tabs.Tab>
             <Tabs.Tab value="info">Info</Tabs.Tab>
           </Tabs.List>
-          <Tabs.Panel value="logs"><Text c="dimmed" pt="sm">Logs tab lands in Task 13.</Text></Tabs.Panel>
-          <Tabs.Panel value="restore"><Text c="dimmed" pt="sm">Restore tab lands in Task 13.</Text></Tabs.Panel>
+          <Tabs.Panel value="logs">{b && <LogsTab branchId={b.id} />}</Tabs.Panel>
+          <Tabs.Panel value="restore">{b && <RestoreTab branch={b} />}</Tabs.Panel>
           <Tabs.Panel value="info"><InfoTab branch={b} /></Tabs.Panel>
         </Tabs>
 
