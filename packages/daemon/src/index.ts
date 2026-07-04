@@ -84,6 +84,14 @@ async function main(): Promise<void> {
     await registry.adoptVolumeBuilds();
     const sweptTmp = await registry.sweepTmp();
     if (sweptTmp > 0) console.error(`boot: swept ${sweptTmp} interrupted pg_build extraction(s)`);
+    // FIX-5 (final review): no pull survives a restart, so any row still in downloading/validating
+    // was orphaned by a crash mid-pull — fail it (terminal + deletable) instead of leaving it
+    // stuck forever behind assertRemovable's in-flight 409. Must precede resolveActives so an
+    // orphan can never be an active-resolution candidate by way of a later status transition.
+    const failedInFlight = registry.failInterrupted();
+    if (failedInFlight > 0) {
+      console.error(`boot: failed ${failedInFlight} pg_build pull(s) interrupted by restart — delete via DELETE /api/pg-builds/{id}`);
+    }
     const { degraded } = registry.resolveActives();
     if (degraded.length > 0) {
       console.error(`boot: PG major(s) ${degraded.join(", ")} resolved BELOW their last-run minor — see /api/status pgBuilds (re-pull to clear)`);

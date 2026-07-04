@@ -265,6 +265,151 @@ describe("BuildRegistry", () => {
     expect(statusOf(() => registry.assertRemovable("no-such-build", []))).toBe(404);
   });
 
+  // FIX-1 (final whole-branch review): resolveActiveFor — the post-pull-failure recovery primitive
+  // — used to set/clear only the ACTIVE pointer, never the degraded flag. When recovery elects a
+  // build BELOW the major's recorded high-water (last-run) minor, the major silently runs
+  // downgraded until the next boot's resolveActives() — violating the never-silent-downgrade
+  // invariant on the one path (of boot / explicit-activate / recovery) that neither flags nor
+  // blocks. It must replicate resolveActives' high-water check for its single major.
+  it("resolveActiveFor flags the major degraded when it elects a build below the last-run high-water", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 } } });
+    await registry.seedBaked();
+    state.pgMajors.recordRun(16, 99); // high-water far above the only ready build
+
+    registry.resolveActiveFor(16); // recovery elects baked 16.9 < 99
+
+    expect(registry.pgbinFor(16).version).toBe("16.9"); // pointer restored, as before…
+    expect(registry.degradedMajors()).toEqual([16]);    // …but no longer silently
+  });
+
+  it("resolveActiveFor clears a stale degraded flag when it elects at/above the high-water", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 } } });
+    await registry.seedBaked();
+    state.pgMajors.recordRun(16, 99);
+    registry.resolveActives(); // 16.9 < 99 → degraded
+    expect(registry.degradedMajors()).toEqual([16]);
+
+    state.pgMajors.setLastRunMinor(16, 9); // consented rollback lowered the high-water
+    registry.resolveActiveFor(16);         // now elects 16.9 >= 9
+
+    expect(registry.degradedMajors()).toEqual([]);
+  });
+
+  it("resolveActiveFor with no ready candidate clears the active pointer AND the degraded flag", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 } } });
+    await registry.seedBaked();
+    state.pgMajors.recordRun(16, 99);
+    registry.resolveActives(); // degraded [16], baked-v16 active
+    expect(registry.degradedMajors()).toEqual([16]);
+
+    state.pgBuilds.setStatus("baked-v16", "failed", "gone"); // no ready rows left for 16
+    registry.resolveActiveFor(16);
+
+    expect(() => registry.pgbinFor(16)).toThrow(/no usable/);
+    expect(state.pgBuilds.byId("baked-v16")?.active).toBe(false);
+    expect(registry.degradedMajors()).toEqual([]); // no active build ⇒ not "degraded"
+  });
+
+  // FIX-2 (final whole-branch review): seedBaked used to skip any existing baked-v{major} row on
+  // the premise "a baked minor cannot change without a new image" — but a new image on the
+  // PERSISTED VOLUME is the supported upgrade path. A stale row minor makes recordRun record the
+  // wrong high-water and lets a later explicit activate of an equal-minor downloaded build pass
+  // the downgrade guard while really downgrading past the on-disk catalog.
+  it("seedBaked re-probes an existing baked row and updates its minor after an image upgrade", async () => {
+    const { install, builds } = await scaffold();
+    const v17 = await fakeInstallDir(install, "v17");
+    const versions: Record<string, { major: number; minor: number }> = { [v17]: { major: 17, minor: 5 } };
+    const { state, registry } = makeRegistry({ install, builds, versions });
+    await registry.seedBaked();
+    expect(state.pgBuilds.byId("baked-v17")).toMatchObject({ minor: 5, status: "ready" });
+
+    versions[v17] = { major: 17, minor: 6 }; // image upgraded: same dir, binary is now 17.6
+    await registry.seedBaked();              // next boot
+
+    expect(state.pgBuilds.byId("baked-v17")).toMatchObject({ minor: 6, status: "ready" });
+  });
+
+  it("seedBaked fails a baked row whose install dir vanished (image dropped the major) and resurrects it if the dir returns", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const v17 = await fakeInstallDir(install, "v17");
+    const { state, registry } = makeRegistry({
+      install, builds,
+      versions: { [v16]: { major: 16, minor: 9 }, [v17]: { major: 17, minor: 5 } },
+    });
+    await registry.seedBaked();
+    registry.resolveActives();
+    expect(state.pgBuilds.byId("baked-v17")).toMatchObject({ status: "ready", active: true });
+
+    await rm(v17, { recursive: true, force: true }); // new image no longer ships v17
+    await registry.seedBaked();                      // next boot
+
+    expect(state.pgBuilds.byId("baked-v17")?.status).toBe("failed"); // not a zombie ready row with a dangling path
+    registry.resolveActives();
+    expect(() => registry.pgbinFor(17)).toThrow(/no usable/);
+    expect(state.pgBuilds.byId("baked-v17")?.active).toBe(false);
+    expect(registry.pgbinFor(16).version).toBe("16.9"); // other majors unaffected
+
+    await fakeInstallDir(install, "v17"); // a later image re-adds the major
+    await registry.seedBaked();
+    expect(state.pgBuilds.byId("baked-v17")).toMatchObject({ status: "ready", minor: 5 });
+  });
+
+  // FIX-4 (final whole-branch review): rows that fail BEFORE setDigestPath keep path === "" — and
+  // FIX-3 now clears the path on every failure-rm, making empty-path a normal post-failure state.
+  // The in-use guard's prefix test (`pgbin.startsWith(row.path + "/")`) degenerates to
+  // startsWith("/") for such rows, matching EVERY running pgbin — so any running endpoint made
+  // every early-failed row un-deletable with a misleading "in use" 409.
+  it("assertRemovable: an empty-path failed row is never 'in use', even while endpoints run", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    state.pgBuilds.insert({
+      id: "early-fail", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "failed",
+    });
+
+    const row = registry.assertRemovable("early-fail", ["/data/pg_builds/v17/abc/bin/postgres"]);
+
+    expect(row.id).toBe("early-fail"); // no 409 "in use by a running endpoint"
+  });
+
+  // FIX-5 (final whole-branch review): a crash/restart mid-pull leaves a row in downloading/
+  // validating forever — boot never transitioned it, and assertRemovable's in-flight guard made
+  // it un-removable (stuck until the user wipes state.db). No pull survives a restart, so at boot
+  // any such row is definitionally orphaned: fail it so it becomes terminal + deletable.
+  it("failInterrupted (boot) fails orphaned in-flight rows so they become terminal and deletable", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    state.pgBuilds.insert({
+      id: "orphan-dl", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "downloading",
+    });
+    state.pgBuilds.insert({
+      id: "orphan-val", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "sha256:" + "f".repeat(64), path: join(builds, "v17", "f".repeat(16)), status: "validating",
+    });
+    state.pgBuilds.insert({
+      id: "fine", major: 16, source: "downloaded", releaseTag: "t",
+      imageDigest: "sha256:" + "9".repeat(64), path: join(builds, "v16", "9".repeat(16)), status: "ready",
+    });
+
+    const count = registry.failInterrupted();
+
+    expect(count).toBe(2);
+    expect(state.pgBuilds.byId("orphan-dl")).toMatchObject({ status: "failed", error: "interrupted by restart" });
+    expect(state.pgBuilds.byId("orphan-val")).toMatchObject({ status: "failed", error: "interrupted by restart" });
+    expect(state.pgBuilds.byId("fine")?.status).toBe("ready"); // terminal/ready rows untouched
+    // Previously these 409'd "pull in flight" forever; now they are removable.
+    expect(registry.assertRemovable("orphan-dl", []).id).toBe("orphan-dl");
+    expect(registry.assertRemovable("orphan-val", []).id).toBe("orphan-val");
+  });
+
   it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {
     const { install, builds } = await scaffold();
     const v16 = await fakeInstallDir(install, "v16");

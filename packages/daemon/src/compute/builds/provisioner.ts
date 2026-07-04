@@ -239,38 +239,38 @@ export class Provisioner {
     } catch (err) {
       // Any uncaught failure anywhere above (statfsFree/resolveDigest/extract/gate machinery/a
       // non-downgrade activate error) lands here. The row always exists — pull() inserted it
-      // before the pipeline started — so record the failure on it.
+      // before the pipeline started — so record the failure on it. The status flip + logging are
+      // deliberately IMMEDIATE (not lane-gated): they are non-destructive, and failing the row as
+      // early as possible means a concurrent laned activate(id) 409s ("not ready") rather than
+      // committing to a row whose teardown is already queued.
       state.pgBuilds.setStatus(id, "failed", firstLine(err));
       this.log(id, `pull failed: ${firstLine(err)}`);
       deps.logger.error(`pg_build ${id} pull failed`, err);
       this.publish();
-      // A throw reaching here from PAST the rename (a non-409 activate malfunction, or
-      // recomposeDistrib throwing) leaves a fully-extracted finalDir on disk with the row marked
-      // failed. Clean it up — mirrors the gate-failure rm below — so byDigest's ready-preference
-      // (which happily returns this failed row) doesn't let a same-digest retry through only to
-      // have its rename(tmpDir, finalDir) fail ENOTEMPTY against the leftover dir.
-      if (finalDirRef.current !== undefined) {
-        await rm(finalDirRef.current, { recursive: true, force: true }).catch(() => {});
-      }
-      // Fix round 1 (compensation gaps): a failure reaching here AFTER activate(id) already
-      // succeeded means the major's previously-active row was cleared (by activate()) but the new
-      // row — now marked failed above — never gets to serve as the replacement. Without recovery the
-      // major has NO active ready build until the next boot's resolveActives(); re-resolving here
-      // restores the older/baked build immediately, not just at next boot.
+      // Destructive + pointer compensation for a failure PAST the rename (a non-409 activate
+      // malfunction, or recomposeDistrib throwing):
+      //  - rm the fully-extracted finalDir (mirrors the gate-failure rm below) so byDigest's
+      //    ready-preference (which happily returns this failed row) doesn't let a same-digest
+      //    retry through only to have its rename(tmpDir, finalDir) fail ENOTEMPTY;
+      //  - FIX-3(a) (final review): clear the row's stored path right after — a failed row must
+      //    not keep claiming a digest dir a successful same-digest retry will re-create, or a
+      //    later DELETE of the failed row would rm the retry's live directory (see remove());
+      //  - restore the major's active pointer if the failed auto-activate stranded it.
       //
-      // Fix round 2 (review of the above): the recovery runs INSIDE the mutation lane and is a
-      // GUARDED, MAJOR-SCOPED gap-filler — no longer the un-laned global resolveActives() it was:
-      //  - laned: it queues behind any activate()/remove() that chained on during the failed auto-
-      //    activate, so it can't interleave with one mid-body. An un-laned resolveActives() could
-      //    elect a build a concurrent remove() then deletes out from under the pointer (re-
-      //    stranding the major), or clobber a concurrent explicit activate() — the exact races
-      //    runMutation exists to serialize away.
+      // FIX-3 / Fable Minor #5 (final review): the WHOLE compensation — not just the pointer
+      // recovery — runs INSIDE the mutation lane. The rm used to run un-laned here, so it could
+      // microtask-interleave with a concurrent laned activate() mid-body (between its
+      // registry.activate and its recomposeDistrib), deleting the very directory that activation
+      // was committing to. Laned, it strictly follows any in-flight activate/remove instead.
+      //
+      // Fix round 2 (review of the round-1 recovery) still applies to the pointer half — it is a
+      // GUARDED, MAJOR-SCOPED gap-filler, not the un-laned global resolveActives() it once was:
       //  - guarded: if a concurrent laned mutation already left this major with an active ready
-      //    build, that IS a sane state — leave it. An unconditional re-pick would silently override
-      //    a deliberate non-newest activation that won the lane.
-      //  - scoped: resolveActiveFor(major) re-resolves ONLY the major this pipeline broke. The
-      //    global resolveActives() also re-picked every OTHER major, silently re-upgrading an
-      //    explicitly-pinned one on this wholly unrelated pull's failure.
+      //    build, that IS a sane state — leave it. An unconditional re-pick would silently
+      //    override a deliberate non-newest activation that won the lane.
+      //  - scoped: resolveActiveFor(major) re-resolves ONLY the major this pipeline broke (and
+      //    FIX-1: re-derives its degraded flag). The global resolveActives() also re-picked every
+      //    OTHER major, silently re-upgrading an explicitly-pinned one on this pull's failure.
       // Errors are logged, never rethrown: this pipeline's promise is void'd in pull() (fire-and-
       // forget), so a throw escaping here would be an unhandled rejection, breaking pull()'s
       // contract that a failure only ever lands on the row.
@@ -280,15 +280,21 @@ export class Provisioner {
       // most likely throw again. The pg_distrib farm self-heals per activate()'s doc below —
       // composePgDistrib re-derives from the registry on every call and boot recomposes before
       // engine.start(); baked-backed majors are unaffected regardless (baked always wins its slot).
-      if (activatedRef.current) {
+      if (finalDirRef.current !== undefined || activatedRef.current) {
         await this.runMutation(async () => {
-          const hasActiveReady = state.pgBuilds.listByMajor(major)
-            .some((r) => r.active && r.status === "ready");
-          if (!hasActiveReady) {
-            this.deps.registry.resolveActiveFor(major);
-            this.publish();
+          if (finalDirRef.current !== undefined) {
+            await rm(finalDirRef.current, { recursive: true, force: true }).catch(() => {});
+            state.pgBuilds.updatePath(id, "");
           }
-        }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure active-pointer recovery failed`, e));
+          if (activatedRef.current) {
+            const hasActiveReady = state.pgBuilds.listByMajor(major)
+              .some((r) => r.active && r.status === "ready");
+            if (!hasActiveReady) {
+              this.deps.registry.resolveActiveFor(major);
+            }
+          }
+          this.publish();
+        }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure compensation failed`, e));
       }
     }
   }
@@ -315,6 +321,7 @@ export class Provisioner {
     if (detectedMajor !== major) {
       const msg = `image contained postgres ${detectedMajor}.${minor}, expected major ${major}`;
       await rm(tmpDir, { recursive: true, force: true });
+      state.pgBuilds.updatePath(id, ""); // FIX-3(a): failure-rm'd the dir ⇒ drop the row's claim on it
       state.pgBuilds.setStatus(id, "failed", msg);
       this.log(id, msg);
       this.publish();
@@ -361,6 +368,15 @@ export class Provisioner {
       ]);
     } catch (err) {
       await rm(finalDir, { recursive: true, force: true }); // no 250 MB corpses
+      // FIX-3(a) (final review): the failed row must not keep claiming the digest-named dir. A
+      // successful retry of the SAME image re-creates that exact dir (identity is the digest), and
+      // a later DELETE of this failed row would then rm the retry's live directory out from under
+      // the active build. Cleared here (and in the outer catch / mismatch branch above), an
+      // empty path is the normal terminal state of a failure-rm'd row — FIX-4's guards treat it
+      // as never-in-use. No lane needed for THIS rm: the row is still `validating`, so no
+      // activate/remove can be operating on it, and a concurrent remove of a same-path SIBLING
+      // row skips its rm while this row still claims the path (remove()'s FIX-3(b) check).
+      state.pgBuilds.updatePath(id, "");
       const msg = firstLine(err);
       state.pgBuilds.setStatus(id, "failed", msg);
       this.log(id, `validation gate failed: ${msg}`);
@@ -439,10 +455,22 @@ export class Provisioner {
   // "is this row safe to remove right now" check and the `await rm(row.path)` that follows it
   // must not have a concurrent activate() for the same row observe/flip the row in between (see
   // this class's own runMutation doc comment for the exact race this closes).
+  //
+  // FIX-3(b) (final review): the rm runs only when this row is the SOLE claimant of a non-empty
+  // path. Rows legitimately share a path — a gate-failed attempt and its successful retry of the
+  // same image share a digest and therefore the digest-named dir (state/repos.ts byDigest doc) —
+  // and assertRemovable checks the ROW, never whether a sibling still claims the directory.
+  // Without this, DELETE of an old failed attempt rm'd the READY, ACTIVE build's dir out from
+  // under it (endpoint starts ENOENT until the next boot re-failed it). The ROW is deleted
+  // regardless — belt-and-suspenders with FIX-3(a)'s path-clear on every failure rm.
   async remove(id: string, runningPgbins: string[]): Promise<void> {
     await this.runMutation(async () => {
       const row: PgBuildRow = this.deps.registry.assertRemovable(id, runningPgbins);
-      await rm(row.path, { recursive: true, force: true });
+      const siblingClaimsPath = this.deps.state.pgBuilds.list()
+        .some((r) => r.id !== id && r.path === row.path);
+      if (row.path !== "" && !siblingClaimsPath) {
+        await rm(row.path, { recursive: true, force: true });
+      }
       this.deps.state.pgBuilds.delete(id);
       await this.deps.recomposeDistrib();
       this.publish();

@@ -53,6 +53,22 @@ describe("PgBuildsRepo", () => {
     expect(s.pgBuilds.list().map((r) => r.id).sort()).toEqual(["new", "old"]);
   });
 
+  // FIX-2 (final whole-branch review): seedBaked's re-probe needs a minor-only setter — setDetected
+  // would clobber sizeBytes, setStatus doesn't touch minor. Both a raise (image upgraded) and a
+  // lower (image replaced with an older build) must be recorded truthfully; the downgrade GUARD
+  // lives in pgMajors/activate, not here.
+  it("updateMinor updates only the minor — raise and lower — leaving every other column alone", () => {
+    const s = mem();
+    s.pgBuilds.insert({
+      id: "b", major: 17, minor: 5, source: "baked", releaseTag: "baked",
+      imageDigest: "", path: "/i/v17", status: "ready", sizeBytes: 777,
+    });
+    s.pgBuilds.updateMinor("b", 6);
+    expect(s.pgBuilds.byId("b")).toMatchObject({ minor: 6, status: "ready", path: "/i/v17", sizeBytes: 777 });
+    s.pgBuilds.updateMinor("b", 4);
+    expect(s.pgBuilds.byId("b")?.minor).toBe(4);
+  });
+
   it("setDigestPath fills digest+path on an in-flight row; byDigest prefers a ready row over a failed one at the same digest", () => {
     const s = mem();
     s.pgBuilds.insert({ id: "r1", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "", path: "", status: "downloading" });

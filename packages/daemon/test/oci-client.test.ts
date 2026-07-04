@@ -463,6 +463,29 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     await expect(access(destDir)).rejects.toThrow(); // whole pull rolled back, not just the one link
   });
 
+  // Fable Minor #6 (final whole-branch review, folded into the FIX pass — defense-in-depth):
+  // assertSafeExtractedTree walks CHILDREN of destDir but never lstats the renamed assembled node
+  // itself. `usr/local` CAN end up a symlink after extraction (here: an in-prefix `usr/local/`
+  // dir member so the layer isn't skipped, then a `usr/local` symlink member replacing the
+  // still-empty dir — bsdtar 3.5.3 performs that replace, exit 0). Pre-fix, exists() follows the
+  // link, rename() moves the LINK to destDir, and the walk then validates whatever tree the link
+  // points at in destDir's OWN frame — never the link itself. (In this fixture the target
+  // dangles post-rename, so the pre-fix failure surfaces as a confusing mid-walk ENOENT after
+  // the rename already happened; a target that resolves in destDir's frame would be validated
+  // as if it were the install.) The assembled node must be a REAL directory, checked pre-rename.
+  it("rejects a layer where usr/local itself is a symlink — the install root must be a real directory", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/", type: "5" }, // in-prefix member: the layer is applied, not skipped
+      { name: "usr/local", type: "2", linkname: "../../victim" }, // replaces the empty dir
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/not a real directory/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(lstat(destDir)).rejects.toThrow(); // the symlink was never renamed into place
+  });
+
   it("rejects a special-file (FIFO) member — no place in a pg install", async () => {
     const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
       { name: "usr/local/bin/postgres", type: "0", content: "ok" }, // benign regular content alongside

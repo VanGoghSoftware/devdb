@@ -451,7 +451,10 @@ export function buildServer(deps: Deps): FastifyInstance {
   // "recheck what I have" is the common case; an explicit array (e.g. probing a not-yet-installed
   // major before pulling it) is the exception. THE only egress trigger besides pull() itself —
   // both hit the OCI registry over the network, everything else in this block is local-only.
-  const CheckBody = z.object({ majors: z.array(z.number().int()).optional() });
+  // FIX-7 (final review): majors are bounded by PgVersionSchema (int, gte 14) like PullBody's —
+  // an unbounded int reached provisioner.check, whose raw fetch error on a nonsense major
+  // surfaced as a 500 on a public route instead of this 400.
+  const CheckBody = z.object({ majors: z.array(PgVersionSchema).optional() });
   app.post("/api/pg-builds/check", async (req) => {
     const body = CheckBody.parse(req.body ?? {});
     const majors = body.majors ?? deps.registry.installedMajors();

@@ -23,14 +23,16 @@ export function toBranchDto(b: BranchDetail): BranchDto {
 // caller passes in — a prefix match against `row.path + "/"` (not exact equality against a full
 // pgbin path) because BuildRegistry.assertRemovable uses the same "startsWith(path + '/')" test
 // for its own in-use guard (registry.ts), and this mapper is meant to agree with that guard's
-// notion of "in use" rather than encode a second, subtly different one.
+// notion of "in use" rather than encode a second, subtly different one. FIX-4 (final review):
+// both sites skip the prefix test for path === "" rows (early-failed / failure-rm'd builds own
+// no directory) — startsWith("/") would otherwise match EVERY running pgbin.
 export function toPgBuildDto(row: PgBuildRow, runningPgbins: string[]): PgBuildDto {
   return {
     id: row.id, major: row.major, minor: row.minor,
     version: row.minor === null ? null : `${row.major}.${row.minor}`,
     source: row.source, releaseTag: row.releaseTag, imageDigest: row.imageDigest,
     status: row.status, active: row.active,
-    inUse: runningPgbins.some((p) => p.startsWith(row.path + "/")),
+    inUse: row.path !== "" && runningPgbins.some((p) => p.startsWith(row.path + "/")),
     sizeBytes: row.sizeBytes, error: row.error, createdAt: row.createdAt,
   };
 }

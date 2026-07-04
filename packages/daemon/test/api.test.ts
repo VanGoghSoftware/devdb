@@ -1297,6 +1297,26 @@ describe("buildServer pg-builds routes", () => {
     expect(provisioner.check).toHaveBeenCalledWith([18]);
   });
 
+  // FIX-7 (final whole-branch review): CheckBody accepted any int — provisioner.check then threw
+  // the raw fetch error on the first bad major, a 500 on a public route. The majors must be
+  // bounded by PgVersionSchema (gte 14) at the route, same as the pull route's PullBody.
+  it("POST /api/pg-builds/check — zod 400 on an out-of-range major, provisioner never called", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const provisioner = fakeProvisioner();
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    for (const majors of [[9], [17, 0], [-1]]) {
+      const res = await app.inject({ method: "POST", url: "/api/pg-builds/check", payload: { majors } });
+      expect(res.statusCode).toBe(400);
+    }
+    expect(provisioner.check).not.toHaveBeenCalled();
+  });
+
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #3, P4): an unknown :id must 404, not 409
   // — these two routes use a REAL BuildRegistry (not the generic fakeRegistry() vi.fn() stand-in)
   // specifically so registry.activate()/assertRemovable()'s real byId(id)===null branch is what

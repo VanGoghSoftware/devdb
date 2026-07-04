@@ -442,6 +442,14 @@ export class OciClient implements OciPuller {
       if (!(await exists(assembled))) {
         throw new Error(`image ${a.repository}@${a.digest} has no content under ${a.prefix}`);
       }
+      // Fable Minor #6 (final review, defense-in-depth): assertSafeExtractedTree walks CHILDREN of
+      // destDir but never lstats the renamed node itself — if `usr/local` ended up a SYMLINK (a
+      // layer can replace the still-empty dir with one; bsdtar 3.5.3 permits it), renaming it to
+      // destDir would make the walk validate whatever tree the link points AT, never the link.
+      // Require the assembled install root to be a real directory BEFORE it becomes destDir.
+      if (!(await lstat(assembled)).isDirectory()) {
+        throw new Error(`extracted ${a.prefix} in ${a.repository}@${a.digest} is not a real directory — refusing to install`);
+      }
       await rename(assembled, a.destDir);
       // Validate the REAL extracted tree in destDir coordinates (symlink containment + special-file
       // rejection). On any unsafe entry, roll back the just-created tree before surfacing the error.

@@ -227,6 +227,12 @@ export class PgBuildsRepo {
   setDetected(id: string, a: { minor: number; sizeBytes: number | null }): void {
     this.db.prepare("UPDATE pg_builds SET minor = ?, size_bytes = ? WHERE id = ?").run(a.minor, a.sizeBytes, id);
   }
+  // Minor-only update — FIX-2's baked re-probe (seedBaked): an image upgrade on the persisted
+  // volume changes a baked dir's binary in place, so its row minor must follow the re-detected
+  // truth (raise OR lower — the downgrade guard lives in pgMajors/activate, not in this column).
+  updateMinor(id: string, minor: number): void {
+    this.db.prepare("UPDATE pg_builds SET minor = ? WHERE id = ?").run(minor, id);
+  }
   updatePath(id: string, path: string): void {
     this.db.prepare("UPDATE pg_builds SET path = ? WHERE id = ?").run(path, id);
   }

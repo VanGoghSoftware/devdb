@@ -36,21 +36,49 @@ export class BuildRegistry {
   }) {}
 
   // Scans pgInstallDir for v<digits> dirs (skipping vanilla_* — the storcon-internal postgres,
-  // not a tenant version). Detects each baked dir's version once per boot and upserts a stable
-  // baked-v{major} row. Idempotent: an existing baked-v{major} id is left untouched — a baked
-  // dir's minor cannot change without a new container image, so re-detecting is pointless work.
+  // not a tenant version). Detects each baked dir's version EVERY boot and upserts a stable
+  // baked-v{major} row.
+  //
+  // FIX-2 (final whole-branch review): this used to skip any existing baked-v{major} row on the
+  // premise "a baked minor cannot change without a new image" — but a NEW IMAGE ON THE PERSISTED
+  // VOLUME is the supported upgrade path (README). A stale row then (a) feeds recordRun the old
+  // minor while the real binary + neon catalog on disk are newer, and (b) lets a later explicit
+  // activate of an equal-minor downloaded build pass the downgrade guard while genuinely
+  // downgrading past the catalog. So existing rows are RE-PROBED: minor drift is written back
+  // (repo updateMinor), a previously-failed row whose dir returned is resurrected to ready, a row
+  // whose probe fails is marked failed (never crash boot for a row we can mark instead), and —
+  // the trailing pass — a baked row whose install dir VANISHED (the image dropped that major) is
+  // failed rather than left as a zombie ready+active row with a dangling path (the downloaded-row
+  // presence sweep in adoptVolumeBuilds never looks at baked rows).
   async seedBaked(): Promise<void> {
     const entries = await readdir(this.deps.pgInstallDir).catch(() => [] as string[]);
+    const seen = new Set<string>();
     for (const name of entries) {
       const m = /^v(\d+)$/.exec(name);
       if (!m) continue; // also excludes vanilla_v17 etc.
       const path = join(this.deps.pgInstallDir, name);
       const id = `baked-${name}`;
-      if (this.deps.state.pgBuilds.byId(id)) continue;
+      seen.add(id);
+      const existing = this.deps.state.pgBuilds.byId(id);
+      if (existing) {
+        try {
+          const { minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
+          if (existing.minor !== minor) this.deps.state.pgBuilds.updateMinor(id, minor);
+          if (existing.status !== "ready") this.deps.state.pgBuilds.setStatus(id, "ready");
+        } catch (e) {
+          this.deps.state.pgBuilds.setStatus(id, "failed", "baked build failed version re-probe at boot");
+          this.deps.logger.error(`baked build at ${path} failed version re-probe`, e);
+        }
+        continue;
+      }
       const { major, minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
       this.deps.state.pgBuilds.insert({
         id, major, minor, source: "baked", releaseTag: "baked", imageDigest: "", path, status: "ready",
       });
+    }
+    for (const row of this.deps.state.pgBuilds.list()) {
+      if (row.source !== "baked" || seen.has(row.id) || row.status === "failed") continue;
+      this.deps.state.pgBuilds.setStatus(row.id, "failed", "baked build dir missing at boot");
     }
   }
 
@@ -101,6 +129,23 @@ export class BuildRegistry {
     }
   }
 
+  // FIX-5 (final whole-branch review) — boot-only, called right after sweepTmp in index.ts: fail
+  // every row still in an in-flight status (downloading/validating). No pull survives a daemon
+  // restart (the pipeline is in-process and fire-and-forget), so at boot any such row is
+  // definitionally orphaned by a crash mid-pull. Left alone it would be stuck forever AND
+  // un-removable — assertRemovable 409s in-flight rows — forcing a state.db wipe. Failing it
+  // makes it terminal + deletable; its path (if any) is kept so a DELETE can reclaim the dir
+  // (remove()'s shared-path sibling check protects a same-digest retry's dir). Returns the count.
+  failInterrupted(): number {
+    let count = 0;
+    for (const row of this.deps.state.pgBuilds.list()) {
+      if (row.status !== "downloading" && row.status !== "validating") continue;
+      this.deps.state.pgBuilds.setStatus(row.id, "failed", "interrupted by restart");
+      count += 1;
+    }
+    return count;
+  }
+
   // rm -rf every pgBuildsDir/v*/.tmp-* (interrupted-install leftovers). Returns the count removed.
   async sweepTmp(): Promise<number> {
     const majors = await readdir(this.deps.pgBuildsDir).catch(() => [] as string[]);
@@ -148,24 +193,35 @@ export class BuildRegistry {
   }
 
   // Scoped, single-major variant of resolveActives(): re-pick (or clear) ONE major's active
-  // pointer using the same winner rule. Unlike resolveActives it touches no other major and does
-  // NOT recompute degraded flags — it's a targeted recovery primitive, not boot re-derivation. The
-  // post-pull-failure path (Provisioner.runPipeline's catch) uses it to restore the "an active
-  // ready build exists" invariant for the single major it just broke; re-deriving every major there
-  // (as the global resolveActives it replaced did) would clobber an unrelated, explicitly-pinned
-  // major on a wholly unrelated pull's failure. No ready candidate ⇒ clear the major's active flag:
-  // a just-failed pull row keeps active=1 (setStatus doesn't touch it), which would otherwise 409
-  // assertRemovable/GC forever as "the active build". Degradation self-heals at the next boot's
-  // resolveActives() or the next explicit activate().
+  // pointer using the same winner rule, AND re-derive that one major's degraded flag. Unlike
+  // resolveActives it touches no other major — it's a targeted recovery primitive, not boot
+  // re-derivation. The post-pull-failure path (Provisioner.runPipeline's catch) uses it to
+  // restore the "an active ready build exists" invariant for the single major it just broke;
+  // re-deriving every major there (as the global resolveActives it replaced did) would clobber an
+  // unrelated, explicitly-pinned major on a wholly unrelated pull's failure. No ready candidate ⇒
+  // clear the major's active flag: a just-failed pull row keeps active=1 (setStatus doesn't touch
+  // it), which would otherwise 409 assertRemovable/GC forever as "the active build" — and clear
+  // the degraded flag too (no active build is a 409-on-use state, not a silently-degraded one).
+  //
+  // FIX-1 (final whole-branch review): this used to leave `degraded` alone entirely — when
+  // recovery elected a build BELOW the major's recorded high-water minor (reachable: a failed
+  // auto-activate whose recompose threw, the previous ≥high-water build removed in the same lane
+  // window), the major ran degraded with no flag/banner/log until the NEXT BOOT's resolveActives.
+  // This daemon runs for days; that was the one path (boot / explicit activate / recovery) that
+  // neither flagged nor blocked a downgrade — replicate resolveActives' high-water check here.
   resolveActiveFor(major: number): void {
     const ready = this.deps.state.pgBuilds.listByMajor(major)
       .filter((r) => r.status === "ready" && r.minor !== null);
     if (ready.length === 0) {
       this.deps.state.pgBuilds.clearActive(major);
+      this.degraded.delete(major);
       return;
     }
     ready.sort(byActivePreference);
     this.deps.state.pgBuilds.setActiveExclusive(ready[0]!.id);
+    const lastRun = this.deps.state.pgMajors.lastRunMinor(major);
+    if (lastRun !== null && ready[0]!.minor! < lastRun) this.degraded.add(major);
+    else this.degraded.delete(major);
   }
 
   // The currently-active ready build for a major, or a 409 telling the caller how to fix it —
@@ -255,7 +311,12 @@ export class BuildRegistry {
     if (row.status === "downloading" || row.status === "validating") {
       throw new DevdbError(409, `pg_build ${id} has a pull in flight — wait for it to finish or fail`);
     }
-    if (runningPgbins.some((p) => p.startsWith(row.path + "/"))) {
+    // FIX-4 (final whole-branch review): rows that failed before setDigestPath (and, post FIX-3,
+    // every failure-rm'd row) carry path === "" — the prefix test would degenerate to
+    // startsWith("/"), matching EVERY running pgbin and 409ing the cleanup of any early-failed
+    // row whenever anything at all was running. An empty-path row owns no directory: never in use.
+    // (services/dto.ts's inUse mapper applies the identical rule — keep them in agreement.)
+    if (row.path !== "" && runningPgbins.some((p) => p.startsWith(row.path + "/"))) {
       throw new DevdbError(409, `pg_build ${id} is in use by a running endpoint`);
     }
     return row;
