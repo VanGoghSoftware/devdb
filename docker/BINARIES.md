@@ -117,6 +117,18 @@ SUPPORTED_PG_VERSIONS = [14, 15, 16, 17]
 deferred to Phase 5 — do not add it here. Task 3's `PgVersionSchema` should
 enumerate exactly `[14, 15, 16, 17]` and default to the highest (`17`).
 
+## Runtime-pulled builds are not part of this inventory
+
+Everything above is the image's baked, digest-pinned set — fixed at build time and covered by the
+pinned digest at the top of this doc. Since the dynamic-pg-builds phase, DevDB can additionally pull
+official Neon compute builds at runtime onto the `/data` volume, under
+`/data/pg_builds/v{major}/{shortDigest}` (a content-addressed directory name derived from the pulled
+image's sha256 digest — not the release tag, which is recorded as metadata alongside it, not as the
+path). These live entirely **outside** this image's inventory and its digest pin: they're pulled,
+verified, and validated independently per install, and the registry (SQLite `pg_builds` table)
+records the resolved tag and image digest for each one. See the README's
+[Postgres builds](../README.md#postgres-builds) section for the user-facing surfaces (Settings/REST/MCP).
+
 ## Runtime interface (for Task 3+)
 
 Set by `docker/Dockerfile`:
