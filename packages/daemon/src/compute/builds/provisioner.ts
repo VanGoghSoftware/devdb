@@ -82,7 +82,10 @@ export class Provisioner {
     const out: Record<string, CheckResult> = {};
     for (const major of majors) {
       const { digest } = await this.deps.oci.resolveDigest(this.repoFor(major), "latest");
-      const isNew = this.deps.state.pgBuilds.byDigest(digest) === null;
+      // byDigest is intentionally ready-preferred: absent a ready row, it returns a failed one
+      // instead (so pull() can retry). That makes a bare "found a row" check wrong here — a row
+      // that failed at this exact digest is NOT installed, so only a ready row counts.
+      const isNew = this.deps.state.pgBuilds.byDigest(digest)?.status !== "ready";
       const result: CheckResult = { tag: "latest", digest, isNew, at: new Date().toISOString() };
       this.lastCheck.set(major, result);
       out[String(major)] = result;
@@ -140,6 +143,11 @@ export class Provisioner {
     const { state } = deps;
     const repo = this.repoFor(major);
     let jobStatus: "done" | "failed" = "failed";
+    // Populated by extractFixupAndGate the instant the tmp dir is renamed into place — i.e. only
+    // once a real, on-disk finalDir exists. Stays unset for any failure before that point
+    // (preflight/resolveDigest/extract/detectVersion-mismatch), so the outer catch below never
+    // tries to rm a ""/undefined path.
+    const finalDirRef: { current: string | undefined } = { current: undefined };
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
       // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
@@ -177,7 +185,7 @@ export class Provisioner {
       const jobId = crypto.randomUUID();
       state.raw.prepare("INSERT INTO jobs (id, kind, status) VALUES (?, 'pg_build_pull', 'running')").run(jobId);
       try {
-        await this.extractFixupAndGate(id, major, tag, digest, tmpDir);
+        await this.extractFixupAndGate(id, major, tag, digest, tmpDir, finalDirRef);
         jobStatus = state.pgBuilds.byId(id)?.status === "ready" ? "done" : "failed";
       } finally {
         state.raw.prepare("UPDATE jobs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
@@ -191,6 +199,14 @@ export class Provisioner {
       this.log(id, `pull failed: ${firstLine(err)}`);
       deps.logger.error(`pg_build ${id} pull failed`, err);
       this.publish();
+      // A throw reaching here from PAST the rename (a non-409 activate malfunction, or
+      // recomposeDistrib throwing) leaves a fully-extracted finalDir on disk with the row marked
+      // failed. Clean it up — mirrors the gate-failure rm below — so byDigest's ready-preference
+      // (which happily returns this failed row) doesn't let a same-digest retry through only to
+      // have its rename(tmpDir, finalDir) fail ENOTEMPTY against the leftover dir.
+      if (finalDirRef.current !== undefined) {
+        await rm(finalDirRef.current, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 
@@ -199,6 +215,7 @@ export class Provisioner {
   // stuck in "downloading"/"validating" on an unexpected throw.
   private async extractFixupAndGate(
     id: string, major: number, tag: string, digest: string, tmpDir: string,
+    finalDirRef: { current: string | undefined },
   ): Promise<void> {
     const { deps } = this;
     const { state } = deps;
@@ -229,6 +246,7 @@ export class Provisioner {
     // same mutable tag at different digests coexist side by side.
     const finalDir = join(deps.cfg.pgBuildsDir, `v${major}`, shortDigest(digest));
     await rename(tmpDir, finalDir);
+    finalDirRef.current = finalDir; // from here on, a throw reaching runPipeline's catch must rm it
     state.pgBuilds.updatePath(id, finalDir);
     state.pgBuilds.setDetected(id, { minor, sizeBytes });
     state.pgBuilds.setStatus(id, "validating");

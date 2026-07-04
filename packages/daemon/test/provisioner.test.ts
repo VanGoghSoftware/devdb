@@ -369,6 +369,35 @@ describe("Provisioner", () => {
     expect(job.status).toBe("failed");
   });
 
+  it("non-409 activate() failure cleans up finalDir so a same-digest retry isn't poisoned by ENOTEMPTY", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    const activateSpy = vi.spyOn(registry, "activate").mockImplementation(() => {
+      throw new Error("sqlite: disk I/O error"); // a genuine malfunction, NOT a downgrade 409
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    expect(row.error).toMatch(/disk I\/O error/);
+    // The extracted dir must be gone — left behind, it would poison a same-digest retry: the
+    // retry's rename(tmpDir, finalDir) would fail ENOTEMPTY against the leftover.
+    await expect(access(row.path)).rejects.toThrow();
+
+    // Un-break activate() and retry at the SAME digest: the retry must reach ready, proving the
+    // cleanup actually unpoisoned the content-addressed dir rather than just deleting evidence.
+    activateSpy.mockRestore();
+    const { buildId: retryId } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(retryId)?.status).toBe("ready"));
+    expect(state.pgBuilds.byId(retryId)?.active).toBe(true);
+  });
+
   it("activate() 409 (deliberate downgrade re-pull) stays tolerated: ready-but-inactive, pipeline completes", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);
@@ -407,5 +436,26 @@ describe("Provisioner", () => {
 
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_B.slice(7, 19)}`);
     expect(provisioner.updateAvailableFor(16)).toBeNull();
+  });
+
+  it("check(): a FAILED row at the current digest does not count as installed — isNew stays true", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    // 17's `latest` resolves to DIGEST_A — the only row at that digest is `failed` (e.g. a prior
+    // gate failure or a non-409 activate malfunction). byDigest is ready-preferred: absent a ready
+    // row it still returns this failed one, so check() must not mistake "a row exists" for
+    // "installed" — nothing is actually on disk for this digest.
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+
+    state.pgBuilds.insert({
+      id: "failed-17", major: 17, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed",
+    });
+
+    const result = await provisioner.check([17]);
+
+    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: true });
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
   });
 });
