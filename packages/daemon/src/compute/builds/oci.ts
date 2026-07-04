@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { access, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, posix, resolve, sep } from "node:path";
+import { access, lstat, mkdir, mkdtemp, readdir, readlink, rename, rm } from "node:fs/promises";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -67,6 +67,10 @@ function parseBearerChallenge(header: string | null): { realm: string; service?:
 }
 
 const mb = (n: number): string => `${(n / 1e6).toFixed(1)} MB`;
+
+// A content-address is exactly `sha256:` + 64 lowercase hex. Anything else (a tag like `latest`, a
+// truncated/wrong-cased hex, another algo) is NOT content-addressed and must never be fetched-and-trusted.
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 function exists(p: string): Promise<boolean> {
   return access(p).then(
@@ -143,57 +147,19 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
       throw new Error(`unsafe layer entry: ${name}`);
     }
   }
-  // (3) Regular files ('-') and directories ('d') always live under the prefix unchecked. A real
-  //     compute-node image ships hundreds of legitimate IN-TREE relative symlinks under usr/local
-  //     (`lib/libpq.so.5 -> libpq.so.5.17`, extension template links) — rejecting every symlink
-  //     outright (the original C1 rule) would fail every real pull. So links ('l' symlink, 'h'
-  //     hardlink) get a TARGET-CONTAINMENT check instead of a blanket ban: reject the whole layer
-  //     if the target is absolute, or if it resolves outside the prefix. Device/char/fifo/socket
-  //     members ('b'/'c'/'p'/'s') have no place in a postgres install and are still rejected
-  //     outright, same as any unrecognized type.
-  //
-  //     Symlink vs hardlink targets are NOT resolved the same way — verified empirically (both
-  //     bsdtar 3.5.3 here and GNU tar 1.34 in the container image, `node:22-bookworm-slim`):
-  //       - Symlink ('l') lines end " <name> -> <target>"; <target> is the raw link string, which
-  //         for a RELATIVE target is resolved relative to the SYMLINK's OWN DIRECTORY (real
-  //         symlink/POSIX semantics) — e.g. `lib/libx.so.5 -> libx.so.5.17` means `lib/libx.so.5.17`.
-  //       - Hardlink ('h') lines end " <name> link to <target>" (a DIFFERENT separator — "link to",
-  //         not "->") and <target> is already an ARCHIVE-ROOT-RELATIVE path, same shape as any
-  //         member name — e.g. `bin/hardlinked link to lib/orig.txt` refers to `lib/orig.txt` from
-  //         the archive root, NOT `bin/lib/orig.txt`. Applying the symlink's dirname-join formula to
-  //         a hardlink target would silently mis-resolve it. So hardlink targets are prefix-checked
-  //         directly (post-normalize), exactly like the per-prefix NAME check in (2) above.
-  //     Types+targets come from `tar -tvf` (ls-style header line), zipped to names by index — both
-  //     listings emit one line per member in archive order.
-  const verbose = (await execFileP("tar", ["-tvf", a.spool], { maxBuffer: 64 * 1024 * 1024 })).stdout
-    .split("\n")
-    .filter((line) => line.length > 0);
-  if (verbose.length !== names.length) {
-    throw new Error(`unsafe layer: tar listing count mismatch (${names.length} names vs ${verbose.length} typed)`);
-  }
-  for (const [i, name] of names.entries()) {
-    if (!name.startsWith(a.prefix)) continue;
-    const line = verbose[i] ?? "";
-    const type = line.charAt(0);
-    if (type === "-" || type === "d") continue;
-    if (type === "l" || type === "h") {
-      const separator = type === "l" ? " -> " : " link to "; // GNU tar & bsdtar agree on both strings
-      const marker = `${name}${separator}`;
-      const idx = line.indexOf(marker);
-      if (idx === -1) throw new Error(`unsafe layer entry: ${name} (type "${type}", unparsed link target)`);
-      const target = line.slice(idx + marker.length);
-      if (target.length === 0) throw new Error(`unsafe layer entry: ${name} (type "${type}", empty link target)`);
-      if (target.startsWith("/")) throw new Error(`unsafe layer entry: ${name} (type "${type}", absolute target "${target}")`);
-      // Symlink: target is dirname-relative. Hardlink: target is already archive-root-relative
-      // (see comment above) — do NOT join it against the member's dirname.
-      const resolved = type === "l" ? posix.normalize(posix.join(posix.dirname(name), target)) : posix.normalize(target);
-      if (!resolved.startsWith(a.prefix)) {
-        throw new Error(`unsafe layer entry: ${name} (type "${type}", target "${target}" escapes prefix)`);
-      }
-      continue;
-    }
-    throw new Error(`unsafe layer entry: ${name} (type "${type || "?"}")`);
-  }
+  // (3) Member TYPE and link TARGETS are deliberately NOT inspected here. The previous mechanism
+  //     parsed `tar -tvf` ls-style text to derive link type/target and validated it pre-extraction;
+  //     a security re-review found that fragile — the text is metadata-injectable (owner/group
+  //     strings can carry ` -> ` markers) and it validated link targets in ARCHIVE coordinates,
+  //     which don't match the final tree after the `usr/local` subtree is renamed onto destDir
+  //     (a `usr/local/x -> ../local/y` looks in-prefix in archive coords but escapes destDir once
+  //     moved). Instead we let tar extract, then validate the REAL filesystem post-rename in destDir
+  //     coordinates (assertSafeExtractedTree, called from pullPrefix). tar's own defaults already
+  //     block the dangerous WRITES this pass used to guard: `..`/absolute/through-symlink paths are
+  //     refused, and a hardlink whose target isn't an already-extracted in-subtree member fails the
+  //     extract outright (verified: bsdtar 3.5.3 + GNU tar 1.34, no `-P`). A symlink is still WRITTEN
+  //     verbatim regardless of target, and a special file (fifo/device/socket) is still materialized
+  //     — those two are exactly what the post-rename walk rejects.
 
   // Belt-and-suspenders for the whiteout `rm`s below: even though (1)/(2) already reject `..` and
   // absolute names, assert each resolved target still sits under the extract root before deleting.
@@ -229,6 +195,53 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
     assertUnder(target);
     await rm(target, { recursive: true, force: true });
   }
+}
+
+// Extract-then-validate link containment: after the assembled `usr/local` subtree has been renamed
+// onto destDir, walk the REAL filesystem (`readdir` + `lstat`, NEVER following a symlink) and reject
+// anything that has no place in a postgres install. This replaces the old `tar -tvf` text parse:
+//   - It is coordinate-correct. Link targets are resolved in destDir's OWN frame — the frame the OS
+//     will actually dereference them in — so a `usr/local/x -> ../local/y` that resolved in-prefix in
+//     archive coordinates now correctly resolves OUTSIDE destDir and is rejected.
+//   - It is metadata-immune. We read the extracted link with `readlink`, never a header/`-tvf` line,
+//     so injected owner/group ` -> /evil` text in an archive header can't influence containment.
+//   - Containment is per-link and independent: every symlink is validated against destDir on its own,
+//     so no chain of symlinks can compose an escape (each hop is individually in-tree).
+// A symlink is a validated LEAF — we never descend THROUGH it (lstat reports a symlink-to-dir as a
+// symlink, not a directory), so recursion can't be lured out of the tree by a symlinked subdir.
+// Hardlinks need no check here: tar only materializes a hardlink whose target is an already-extracted
+// in-subtree member (an out-of-subtree/absolute/`..` target fails the extract), so it lands as an
+// ordinary regular file inside destDir.
+async function assertSafeExtractedTree(destDir: string): Promise<void> {
+  const destDirResolved = resolve(destDir);
+  const walk = async (dir: string): Promise<void> => {
+    for (const name of await readdir(dir)) {
+      const abs = join(dir, name);
+      const st = await lstat(abs);
+      if (st.isSymbolicLink()) {
+        const target = await readlink(abs);
+        // Absolute target: escapes the tree by definition. Relative target: resolve it from the
+        // link's OWN directory (POSIX symlink semantics) and require the result to stay within destDir.
+        if (isAbsolute(target)) {
+          throw new Error(`unsafe extracted entry: ${relative(destDir, abs)} -> ${target} (absolute symlink target)`);
+        }
+        const resolved = resolve(dirname(abs), target);
+        if (resolved !== destDirResolved && !resolved.startsWith(destDirResolved + sep)) {
+          throw new Error(`unsafe extracted entry: ${relative(destDir, abs)} -> ${target} (symlink escapes install tree)`);
+        }
+        continue; // leaf — do NOT recurse through the symlink even if it points at a directory
+      }
+      if (st.isBlockDevice() || st.isCharacterDevice() || st.isFIFO() || st.isSocket()) {
+        throw new Error(`unsafe extracted entry: ${relative(destDir, abs)} -> special file (device/fifo/socket)`);
+      }
+      if (st.isDirectory()) {
+        await walk(abs);
+        continue;
+      }
+      // Regular file — the only remaining case for a tar-materialized member; allowed.
+    }
+  };
+  await walk(destDir);
 }
 
 export class OciClient implements OciPuller {
@@ -291,6 +304,13 @@ export class OciClient implements OciPuller {
     const arch = this.arch();
     const entry = index.manifests.find((m) => m.platform?.os === "linux" && m.platform?.architecture === arch);
     if (!entry) throw new Error(`no linux/${arch} manifest in index ${repo}@${ref}`);
+    // Pin the selected descriptor to a real content-address BEFORE it is fetched. If a hostile/broken
+    // index points the arch descriptor at a mutable ref (a tag, or a malformed digest), verifyManifestDigest
+    // on the fetched arch-manifest would be a silent no-op — so we'd fetch-and-trust arbitrary bytes.
+    // Fail closed on anything that isn't sha256:<64hex>, before any arch-manifest/blob fetch.
+    if (!SHA256_DIGEST.test(entry.digest)) {
+      throw new Error(`index ${repo}@${ref} linux/${arch} descriptor digest is not a sha256 content-address: ${entry.digest}`);
+    }
     return entry.digest;
   }
 
@@ -351,6 +371,14 @@ export class OciClient implements OciPuller {
         throw new Error(`image ${a.repository}@${a.digest} has no content under ${a.prefix}`);
       }
       await rename(assembled, a.destDir);
+      // Validate the REAL extracted tree in destDir coordinates (symlink containment + special-file
+      // rejection). On any unsafe entry, roll back the just-created tree before surfacing the error.
+      try {
+        await assertSafeExtractedTree(a.destDir);
+      } catch (err) {
+        await rm(a.destDir, { recursive: true, force: true });
+        throw err;
+      }
     } finally {
       await rm(spoolDir, { recursive: true, force: true });
       await rm(extractRoot, { recursive: true, force: true });

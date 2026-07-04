@@ -50,14 +50,24 @@ async function buildLayerTarGz(files: Record<string, string>): Promise<Buffer> {
 // body), two zero blocks terminate the archive. `tar -tf`/`-tvf` list these verbatim (verified:
 // bsdtar 3.5.3 preserves `..` and leading `/` in listings, and encodes member type as the first
 // char of the `-tvf` mode string). ---
-type TarType = "0" | "2" | "5" | "1"; // regular | symlink | dir | hardlink
+type TarType = "0" | "2" | "5" | "1" | "6"; // regular | symlink | dir | hardlink | fifo
 interface TarEntry {
   name: string;
   type: TarType;
   content?: string;
   linkname?: string;
+  uname?: string; // owner name — used to plant a fake " -> /evil" marker in header metadata
+  gname?: string; // group name
 }
-function tarHeader(o: { name: string; type: string; size: number; linkname?: string; mode?: number }): Buffer {
+function tarHeader(o: {
+  name: string;
+  type: string;
+  size: number;
+  linkname?: string;
+  mode?: number;
+  uname?: string;
+  gname?: string;
+}): Buffer {
   const h = Buffer.alloc(512, 0);
   const put = (s: string, off: number, len: number): void => {
     Buffer.from(s, "utf8").copy(h, off, 0, Math.min(Buffer.byteLength(s), len));
@@ -78,6 +88,8 @@ function tarHeader(o: { name: string; type: string; size: number; linkname?: str
   put("ustar", 257, 6); // magic
   h[263] = 0x30; // version "00"
   h[264] = 0x30;
+  if (o.uname !== undefined) put(o.uname, 265, 32); // uname field (USTAR)
+  if (o.gname !== undefined) put(o.gname, 297, 32); // gname field
   const sum = h.reduce((s, b) => s + b, 0);
   put(sum.toString(8).padStart(6, "0"), 148, 6);
   h[154] = 0;
@@ -88,9 +100,9 @@ function makeTar(entries: TarEntry[]): Buffer {
   const parts: Buffer[] = [];
   for (const e of entries) {
     const content = Buffer.from(e.content ?? "", "utf8");
-    const bodyless = e.type === "2" || e.type === "5" || e.type === "1";
+    const bodyless = e.type === "2" || e.type === "5" || e.type === "1" || e.type === "6";
     const size = bodyless ? 0 : content.length;
-    parts.push(tarHeader({ name: e.name, type: e.type, size, linkname: e.linkname }));
+    parts.push(tarHeader({ name: e.name, type: e.type, size, linkname: e.linkname, uname: e.uname, gname: e.gname }));
     if (size > 0) {
       parts.push(content);
       const pad = (512 - (size % 512)) % 512;
@@ -390,21 +402,11 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     await expect(access(destDir)).rejects.toThrow();
   });
 
-  it("C1(d): rejects an absolute-target symlink member under the prefix (would land in destDir pointing outside)", async () => {
-    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
-      { name: "usr/local/evil-link", type: "2", linkname: "/etc/passwd" },
-    ]);
-    const victim = await plantVictim(workDir);
-    await expect(
-      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe layer entry/);
-    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
-    await expect(access(destDir)).rejects.toThrow(); // the out-pointing symlink never reached destDir
-  });
-
-  // --- Fix round 2: symlink policy refined from "reject all links" to TARGET-CONTAINMENT. Real
-  // compute-node images ship hundreds of legitimate in-tree relative symlinks under usr/local
-  // (`lib/libpq.so.5 -> libpq.so.5.17`); a blanket ban would fail every real pull. ---
+  // --- Fix round 3: link containment moved from a pre-extraction `tar -tvf` text parse to an
+  // extract-then-validate walk of the REAL filesystem (assertSafeExtractedTree), in destDir
+  // coordinates. C1(d) (absolute-target symlink) folded into the round-2 absolute-target test below,
+  // which now asserts the post-extraction rejection message. Legit in-tree relative symlinks still
+  // pass (real compute-node images ship hundreds, e.g. `lib/libpq.so.5 -> libpq.so.5.17`). ---
 
   it("passes a legit in-tree relative symlink (target stays inside usr/local/)", async () => {
     const { client, destDir, manifestDigest } = await hostileLayerClient([
@@ -419,16 +421,16 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     expect(await readlink(join(destDir, "lib", "libx.so.5"))).toBe("libx.so.5.17");
   });
 
-  it("rejects an absolute-target symlink (refined policy: still rejected)", async () => {
+  it("rejects an absolute-target symlink (caught post-extraction by the destDir walk)", async () => {
     const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
       { name: "usr/local/link", type: "2", linkname: "/etc/passwd" },
     ]);
     const victim = await plantVictim(workDir);
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe layer entry/);
+    ).rejects.toThrow(/unsafe extracted entry/);
     expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
-    await expect(access(destDir)).rejects.toThrow();
+    await expect(access(destDir)).rejects.toThrow(); // rolled back after the walk rejected the link
   });
 
   it("rejects an escaping relative-target symlink (resolves outside usr/local/ via ../..)", async () => {
@@ -438,18 +440,63 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     const victim = await plantVictim(workDir);
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe layer entry/);
+    ).rejects.toThrow(/unsafe extracted entry/);
     expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
     await expect(access(destDir)).rejects.toThrow();
   });
 
-  // --- Hardlink target semantics DIFFER from symlinks (verified empirically against both bsdtar
-  // 3.5.3 and GNU tar 1.34 / node:22-bookworm-slim, the container base image): a hardlink's
-  // `-tvf` line uses " link to " (not " -> "), and its target is an ARCHIVE-ROOT-RELATIVE path
-  // (same shape as any member name) — NOT resolved against the member's own directory the way a
-  // symlink's relative target is. These two tests exercise that path specifically; the raw USTAR
-  // `linkname` field is confirmed (by direct header inspection) to already hold the full
-  // archive-relative path, so `TarEntry.linkname` below is written the same way real tar does. ---
+  // THE coordinate-confusion case the rewrite exists to fix. `usr/local/link -> ../local/payload`
+  // looks in-prefix in ARCHIVE coordinates (`usr/local/../local/payload` == `usr/local/payload`), so
+  // the old pre-extraction `tar -tvf` check ACCEPTED it. But after `rename(extractRoot/usr/local,
+  // destDir)` the link sits at `destDir/link` and `../local/payload` resolves to a sibling of destDir
+  // — OUTSIDE the install tree. The post-rename walk evaluates it in destDir coordinates and rejects.
+  it("rejects a `../local/`-reenter symlink that only looks in-tree in archive coordinates", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/payload", type: "0", content: "p" },
+      { name: "usr/local/link", type: "2", linkname: "../local/payload" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe extracted entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow(); // whole pull rolled back, not just the one link
+  });
+
+  it("rejects a special-file (FIFO) member — no place in a pg install", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/bin/postgres", type: "0", content: "ok" }, // benign regular content alongside
+      { name: "usr/local/pipe", type: "6" }, // FIFO — tar materializes it; the walk must reject it
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe extracted entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  // Containment no longer depends on ANY tar header text, so an injected marker is inert. This layer's
+  // header owner/group carry a fake ` -> /evil` string (the exact shape that could confuse an ls-style
+  // `-tvf` parse), but the REAL symlink target is in-tree — so the pull must SUCCEED.
+  it("passes a symlink whose header metadata carries a fake ` -> /evil` marker (metadata is moot)", async () => {
+    const { client, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/liby.so.1", type: "0", content: "shared object bytes" },
+      { name: "usr/local/liby.so", type: "2", linkname: "liby.so.1", uname: "x -> /evil", gname: "y -> /evil" },
+    ]);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).resolves.toBeUndefined();
+    const st = await lstat(join(destDir, "liby.so"));
+    expect(st.isSymbolicLink()).toBe(true);
+    expect(await readlink(join(destDir, "liby.so"))).toBe("liby.so.1"); // the real, in-tree target
+  });
+
+  // --- Hardlinks need no post-extraction check: tar only ever materializes a hardlink whose target
+  // is an ALREADY-EXTRACTED member of the same `usr/local` subtree (a target that is absolute, carries
+  // `..`, or simply isn't extracted fails the extract outright — verified against both bsdtar 3.5.3 and
+  // GNU tar 1.34 / node:22-bookworm-slim). So a materialized hardlink lands as an ordinary regular file
+  // inside destDir, and an escaping one never lands at all. These two tests pin that tar boundary. ---
 
   it("passes a legit in-tree hardlink whose target is an archive-relative path under usr/local/", async () => {
     const { client, destDir, manifestDigest } = await hostileLayerClient([
@@ -462,14 +509,16 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     await expect(access(join(destDir, "bin", "hardlinked"))).resolves.toBeUndefined();
   });
 
-  it("rejects a hardlink whose archive-relative target escapes usr/local/ (not dirname-joined)", async () => {
+  it("rejects a hardlink whose target escapes usr/local/ (tar refuses: target not in the extracted subtree)", async () => {
     const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
       { name: "usr/local/bin/hardlinked", type: "1", linkname: "usr/other/evil.txt" },
     ]);
     const victim = await plantVictim(workDir);
+    // The out-of-subtree hardlink target is never extracted (we ask tar for `usr/local` only), so the
+    // extract itself fails; the pull throws and nothing is left behind. (Message is tar's, not ours.)
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe layer entry/);
+    ).rejects.toThrow();
     expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
     await expect(access(destDir)).rejects.toThrow();
   });
@@ -496,5 +545,34 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
       client.pullPrefix({ repository: REPO, digest: malformedDigest, destDir, prefix: "usr/local/" }),
     ).rejects.toThrow(/malformed manifest/);
     expect(fixture.blobFetches).toEqual([]);
+  });
+
+  // P2 residual: an arch descriptor selected from an index must itself be a sha256 content-address,
+  // or verifyManifestDigest on the fetched arch-manifest would be a silent no-op and we'd fetch-and-
+  // trust a mutable ref. The index body here is served verbatim under its OWN true sha256 (so the
+  // index passes verification), but its amd64 descriptor points at the tag `latest` — selectArch must
+  // fail closed BEFORE fetching that descriptor or any blob.
+  it("rejects a non-sha256 index descriptor before fetching the arch manifest or any blob", async () => {
+    const badIndex = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.index.v1+json",
+        manifests: [
+          { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: "latest", size: 100, platform: { os: "linux", architecture: "amd64" } },
+          { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: armDigest, size: armBytes.length, platform: { os: "linux", architecture: "arm64" } },
+        ],
+      }),
+    );
+    const badIndexDigest = sha256(badIndex);
+    const { fixture, client, destDir } = await startFixtureAndClient({
+      manifestOverrides: { [badIndexDigest]: badIndex },
+    });
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: badIndexDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/not a sha256 content-address/);
+    expect(fixture.manifestFetches).toEqual([badIndexDigest]); // only the index; the bad descriptor was never fetched
+    expect(fixture.manifestFetches).not.toContain("latest");
+    expect(fixture.blobFetches).toEqual([]);
+    await expect(access(destDir)).rejects.toThrow();
   });
 });
