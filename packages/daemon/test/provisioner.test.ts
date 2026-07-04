@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
 import { Provisioner } from "../src/compute/builds/provisioner.js";
+import { makeValidationRunner } from "../src/compute/builds/validate.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { DevdbError } from "../src/services/errors.js";
 import type { OciPuller } from "../src/compute/builds/oci.js";
+import type { ProjectsService } from "../src/services/projects.js";
+import type { EndpointsService } from "../src/services/endpoints.js";
+import type { BranchRow, ProjectRow } from "../src/state/repos.js";
 import type { DevdbEvent } from "@devdb/shared";
 import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
@@ -56,10 +60,11 @@ function blockingOci(digest = DIGEST_A): { oci: OciPuller; release: () => void }
 function makeProvisioner(a: {
   install: string; builds: string;
   oci: OciPuller;
-  validate?: (v: { major: number; buildPath: string }) => Promise<void>;
+  validate?: (v: { major: number; buildPath: string; signal?: AbortSignal }) => Promise<void>;
   detectVersion?: (pgbin: string) => Promise<{ major: number; minor: number }>;
   statfsFree?: (dir: string) => Promise<number>;
   du?: (dir: string) => Promise<number | null>;
+  gateTimeoutMs?: number;
 }) {
   const state = openState(":memory:");
   const detectVersion = a.detectVersion ?? (async () => ({ major: 17, minor: 5 }));
@@ -71,7 +76,7 @@ function makeProvisioner(a: {
   const recomposeDistrib = vi.fn(async () => {});
   const provisioner = new Provisioner({
     registry, oci: a.oci, state, logs, events,
-    cfg: { pgBuildsDir: a.builds, pgImageTemplate: "neondatabase/compute-node-v{major}" },
+    cfg: { pgBuildsDir: a.builds, pgImageTemplate: "neondatabase/compute-node-v{major}", gateTimeoutMs: a.gateTimeoutMs },
     validate: a.validate ?? (async () => {}),
     detectVersion,
     du: a.du ?? (async () => 1024 * 1024),
@@ -450,6 +455,71 @@ describe("Provisioner", () => {
     const bakedRow = state.pgBuilds.byId("baked-v17")!;
     expect(bakedRow.active).toBe(true);
     expect(registry.pgbinFor(17).buildId).toBe("baked-v17");
+  });
+
+  // Fix 3 (task-9 gate integration): when the gate's Promise.race timeout wins, the losing
+  // validate() used to keep running with nobody listening — its `finally` cleanup (project
+  // delete) unreachable until the hung step's OWN timeout (readyTimeout ~50s) let it settle, so
+  // the `_devdb_validate_` project/branch/compute stayed alive long past the pull's failure (the
+  // boot sweep being only an eventual backstop). The Provisioner now aborts an AbortSignal when
+  // the timeout fires; the REAL runner (makeValidationRunner, wired here over service fakes with
+  // a compute start that NEVER settles) must react by stopping the endpoint and deleting the gate
+  // project promptly. gateTimeoutMs (test-only override, prod default 90s) keeps this determin-
+  // istic without faking timers around the pipeline's real fs work.
+  it("gate timeout aborts the in-flight validate: the REAL runner's cleanup deletes the gate project — no leak until boot sweep", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+
+    const now = new Date().toISOString();
+    const project: ProjectRow = {
+      id: "gate-proj", name: "_devdb_validate_deadbeef", pgVersion: 17 as ProjectRow["pgVersion"],
+      createdAt: now, updatedAt: now,
+    };
+    const mainBranch: BranchRow = {
+      id: "gate-branch", projectId: project.id, parentBranchId: null, name: "main", slug: "main-abc123",
+      timelineId: "tl-1", password: "pw", stickyPort: null, endpointStatus: "stopped",
+      endpointError: null, importStatus: "none", importError: null, createdBy: "api",
+      context: null, createdAt: now, updatedAt: now,
+    };
+    const deleteSpy = vi.fn(async (_id: string) => {});
+    const stopSpy = vi.fn(async (_branchId: string) =>
+      ({} as Awaited<ReturnType<EndpointsService["stop"]>>));
+    const projects: Pick<ProjectsService, "create" | "delete" | "list"> = {
+      create: vi.fn(async (_a: { name: string; pgVersion?: number }) => ({ project, mainBranch })),
+      delete: deleteSpy,
+      list: vi.fn((): ProjectRow[] => []),
+    };
+    const endpoints: Pick<EndpointsService, "startWithPgbin" | "stop"> = {
+      // A compute start that never settles — the worst-case hung step the abort must cut through.
+      startWithPgbin: vi.fn((_branchId: string, _pgbinPath: string) =>
+        new Promise<Awaited<ReturnType<EndpointsService["startWithPgbin"]>>>(() => {})),
+      stop: stopSpy,
+    };
+    const validate = makeValidationRunner({
+      projects, endpoints,
+      sql: { run: vi.fn(async (_branchId: string, _query: string) => {
+        throw new Error("unreachable — the start step never resolved");
+      }) },
+      logger: noopLogger,
+    });
+    const { state, provisioner } = makeProvisioner({ install, builds, oci, validate, gateTimeoutMs: 80 });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    expect(row.error).toMatch(/gate timed out/);
+    await expect(access(row.path)).rejects.toThrow(); // extracted dir rm'd, as before
+
+    // THE fix: the runner's cleanup ran even though its current step never settled — the gate
+    // project was deleted (and its endpoint stopped) right at the timeout, not leaked.
+    await vi.waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1));
+    expect(deleteSpy).toHaveBeenCalledWith(project.id);
+    expect(stopSpy).toHaveBeenCalledWith(mainBranch.id);
   });
 
   it("check(): isNew digest reported; updateAvailableFor exposes short digest; known digest → isNew false", async () => {

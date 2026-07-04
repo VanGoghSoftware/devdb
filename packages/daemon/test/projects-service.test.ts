@@ -156,6 +156,55 @@ describe("ProjectsService", () => {
     });
   });
 
+  // Fix 1 (task-9 gate integration): the validation gate's OWN project must get past both public
+  // guards — its reserved `_devdb_validate_` prefix deliberately fails the name regex (users can
+  // never squat/collide with gate names), and the candidate major is still `validating`, not yet
+  // in installedMajors(). `internal: true` is the gate's private affordance for exactly those two
+  // checks; everything else (dup-name 409, engine calls, compensation) applies to internal creates
+  // unchanged, and NO public caller (REST POST /api/projects, MCP create_project) passes opts.
+  describe("create() internal option (Fix 1, task-9 gate integration)", () => {
+    it("internal create bypasses BOTH the name regex and the installed-major guard — real guards active", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      // 18 is NOT in installedMajors() (a mid-gate candidate is still `validating`), and the
+      // leading underscore fails the public regex — the PUBLIC form of this exact call is proven
+      // to reject in the two tests below.
+      const { project, mainBranch } = await svc.create(
+        { name: "_devdb_validate_x", pgVersion: 18 }, { internal: true },
+      );
+      expect(project.name).toBe("_devdb_validate_x");
+      expect(project.pgVersion).toBe(18);
+      expect(mainBranch.name).toBe("main");
+      expect(state.projects.byName("_devdb_validate_x")).not.toBeNull();
+    });
+
+    it("public create (no opts) still rejects the underscore-prefixed name with 400", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "_devdb_validate_x" })).rejects.toMatchObject({ statusCode: 400 });
+      await expect(svc.create({ name: "_devdb_validate_x" })).rejects.toThrow(/invalid project name/);
+    });
+
+    it("public create (no opts) still rejects an uninstalled major with 400", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "ok", pgVersion: 18 })).rejects.toMatchObject({ statusCode: 400 });
+      await expect(svc.create({ name: "ok2", pgVersion: 18 })).rejects.toThrow(/not installed/);
+    });
+
+    it("internal create keeps the duplicate-name 409 — only the two gate-blocking checks are skipped", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([17]) });
+      await svc.create({ name: "_devdb_validate_dup", pgVersion: 17 }, { internal: true });
+      await expect(svc.create({ name: "_devdb_validate_dup", pgVersion: 17 }, { internal: true }))
+        .rejects.toMatchObject({ statusCode: 409 });
+    });
+  });
+
   it("rejects duplicate project names with 409", async () => {
     const f = fakes();
     const state = openState(":memory:");

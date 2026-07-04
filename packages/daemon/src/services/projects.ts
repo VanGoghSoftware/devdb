@@ -67,14 +67,25 @@ export class ProjectsService {
   // something delete()'s correctness depends on).
   constructor(private deps: ProjectsDeps & { logs?: LogsService }) {}
 
-  async create(a: { name: string; pgVersion?: PgVersion }): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
+  // Fix 1 (task-9 gate integration): `opts.internal` is the validation gate's private affordance
+  // (compute/builds/validate.ts) — the gate's `_devdb_validate_<hex>` project must exist to
+  // smoke-test a CANDIDATE build, but (a) its reserved `_` prefix deliberately fails the public
+  // name regex (so users can never squat on/collide with gate names), and (b) the candidate's
+  // major is still `validating`, not `ready`, so installedMajors() doesn't list it yet. Neither
+  // check is meaningful for the gate; both stay MANDATORY for the public callers — REST
+  // POST /api/projects (http/api.ts) and MCP create_project (mcp/tools.ts) pass no opts at all.
+  // Everything else (dup-name 409, engine calls, compensation) applies to internal creates too.
+  async create(
+    a: { name: string; pgVersion?: PgVersion },
+    opts?: { internal?: boolean },
+  ): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
     const name = a.name.trim();
     // Fix 5 (task-9 fix wave): both DevdbError messages now NAME A REMEDIATION, not just the
     // failure reason — improved here at the service layer (not just in the MCP tool) so
     // REST (POST /api/projects) benefits identically, per this fix's stated preference. A bare
     // "invalid project name"/"already exists" tells a caller WHAT happened but not what to do
     // about it; an agent especially can't self-correct from the reason alone.
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,62}$/.test(name)) {
+    if (!opts?.internal && !/^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,62}$/.test(name)) {
       throw new DevdbError(400,
         `invalid project name: ${JSON.stringify(a.name)} — names must start with a letter or digit and contain only letters, digits, spaces, underscores, or hyphens (max 63 characters)`);
     }
@@ -89,7 +100,8 @@ export class ProjectsService {
     // (e.g. plenty of existing unit tests) keep the pre-Task-8 no-guard behavior unchanged.
     // PgVersionSchema (packages/shared) only floors at 14 — the registry, not the schema, is now
     // the source of truth for which majors actually exist on this daemon.
-    if (this.deps.builds) {
+    // Skipped for internal (gate) creates — see the doc comment above create().
+    if (!opts?.internal && this.deps.builds) {
       const installed = this.deps.builds.installedMajors();
       if (!installed.includes(pgVersion)) {
         throw new DevdbError(400,

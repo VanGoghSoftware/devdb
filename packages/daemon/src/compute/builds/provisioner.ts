@@ -63,8 +63,13 @@ export class Provisioner {
   constructor(private deps: {
     registry: BuildRegistry; oci: OciPuller; state: StateDb; logs: LogsService;
     events: EventsService | undefined;
-    cfg: { pgBuildsDir: string; pgImageTemplate: string };
-    validate: (a: { major: number; buildPath: string }) => Promise<void>;
+    // gateTimeoutMs: test-only override of the 90s validation-gate budget (production wiring in
+    // index.ts leaves it unset) — the timeout path is otherwise untestable without faking timers
+    // around the pipeline's real fs work.
+    cfg: { pgBuildsDir: string; pgImageTemplate: string; gateTimeoutMs?: number };
+    // Fix 3 (task-9 gate integration): validate receives an AbortSignal the Provisioner aborts
+    // when the gate budget expires — see the gate block in extractFixupAndGate below.
+    validate: (a: { major: number; buildPath: string; signal?: AbortSignal }) => Promise<void>;
     detectVersion: (pgbin: string) => Promise<{ major: number; minor: number }>;
     du: (dir: string) => Promise<number | null>;
     statfsFree: (dir: string) => Promise<number>;
@@ -271,12 +276,27 @@ export class Provisioner {
     this.log(id, `extracted postgres ${major}.${minor} — validating`);
     this.publish();
 
-    // --- Gate: injected validate(), 90s budget.
+    // --- Gate: injected validate(), 90s budget. Fix 3 (task-9 gate integration): the budget is
+    // enforced with an ABORT, not just a Promise.race — before this fix, when the timeout won the
+    // race the losing validate() kept running with nobody listening, and its own cleanup (the
+    // runner's finally: delete the `_devdb_validate_` project) only ran once the hung step's own
+    // timeout finally settled it (readyTimeout ~50s / query_timeout ~35s), leaving the gate
+    // project/branch/compute alive well past the pull's recorded failure (the boot sweep being
+    // only an eventual backstop). Aborting the signal makes the runner short-circuit its
+    // remaining steps, stop the endpoint, and delete the gate project promptly — abort() is
+    // called BEFORE reject() so cleanup is already in motion when the pipeline records failure.
+    const gateTimeoutMs = deps.cfg.gateTimeoutMs ?? GATE_TIMEOUT_MS;
+    const gateAbort = new AbortController();
+    let gateTimer: NodeJS.Timeout | undefined;
     try {
       await Promise.race([
-        deps.validate({ major, buildPath: finalDir }),
+        deps.validate({ major, buildPath: finalDir, signal: gateAbort.signal }),
         new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error(`gate timed out after ${GATE_TIMEOUT_MS / 1000}s`)), GATE_TIMEOUT_MS);
+          gateTimer = setTimeout(() => {
+            const err = new Error(`gate timed out after ${gateTimeoutMs / 1000}s`);
+            gateAbort.abort(err);
+            reject(err);
+          }, gateTimeoutMs);
         }),
       ]);
     } catch (err) {
@@ -286,6 +306,10 @@ export class Provisioner {
       this.log(id, `validation gate failed: ${msg}`);
       this.publish();
       return; // active pointer untouched
+    } finally {
+      // Runs whether validate won, threw, or timed out: never leave the (up to 90s) timer pending
+      // after the gate settled — it would otherwise keep firing a stale abort/rejection later.
+      clearTimeout(gateTimer);
     }
 
     state.pgBuilds.setStatus(id, "ready");
