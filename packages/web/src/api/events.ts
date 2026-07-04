@@ -58,9 +58,16 @@ export function startEvents(a: {
     };
     es.onerror = () => {
       es?.close();
-      if (stopped) return;
+      // A reconnect is already pending (or we're stopped) — don't schedule a second one.
+      // Without this guard, a second onerror before the first timer fires would overwrite
+      // `timer`'s handle, orphaning the first timer; it still fires connect() later, leaking
+      // a duplicate live EventSource and duplicate invalidations.
+      if (stopped || timer !== null) return;
       a.onStatus("reconnecting");
-      timer = setTimeout(connect, delay);
+      timer = setTimeout(() => {
+        timer = null; // clear BEFORE connect() so a later error can schedule the next reconnect
+        connect();
+      }, delay);
       delay = Math.min(delay * 2, 10_000);
     };
   };
@@ -68,7 +75,10 @@ export function startEvents(a: {
   connect();
   return () => {
     stopped = true;
-    if (timer) clearTimeout(timer);
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
     es?.close();
   };
 }

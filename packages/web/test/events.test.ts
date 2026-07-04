@@ -72,6 +72,69 @@ describe("startEvents", () => {
     vi.advanceTimersByTime(1);
     expect(FakeEventSource.instances).toHaveLength(3);
     expect(statuses.filter((s) => s === "reconnecting").length).toBeGreaterThanOrEqual(2);
+
+    // Continue doubling through the cap: 4s, 8s, then capped at 10s (16s would exceed it).
+    FakeEventSource.instances.at(-1)!.onerror?.();          // 4s
+    vi.advanceTimersByTime(3999);
+    expect(FakeEventSource.instances).toHaveLength(3);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(4);
+
+    FakeEventSource.instances.at(-1)!.onerror?.();          // 8s
+    vi.advanceTimersByTime(7999);
+    expect(FakeEventSource.instances).toHaveLength(4);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(5);
+
+    FakeEventSource.instances.at(-1)!.onerror?.();          // capped at 10s (not 16s)
+    vi.advanceTimersByTime(9999);
+    expect(FakeEventSource.instances).toHaveLength(5);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(6);
+
+    // A further error still reconnects at the 10s cap, not beyond it.
+    FakeEventSource.instances.at(-1)!.onerror?.();          // still capped at 10s
+    vi.advanceTimersByTime(9999);
+    expect(FakeEventSource.instances).toHaveLength(6);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(7);
+
+    // A successful connection resets the backoff: the NEXT error reconnects after 1s again.
+    FakeEventSource.instances.at(-1)!.onopen?.();
+    FakeEventSource.instances.at(-1)!.onerror?.();
+    vi.advanceTimersByTime(999);
+    expect(FakeEventSource.instances).toHaveLength(7);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(8);
+
+    vi.useRealTimers();
+  });
+
+  it("does not orphan a reconnect timer when onerror fires twice before it runs", () => {
+    vi.useFakeTimers();
+    const stop = startEvents({
+      onEvent: () => {}, onOpen: () => {}, onStatus: () => {},
+      makeSource: (url) => new FakeEventSource(url) as unknown as EventSource,
+    });
+    expect(FakeEventSource.instances).toHaveLength(1);
+    // Fire onerror TWICE on the same source before its reconnect timer runs. The buggy
+    // implementation schedules a timer on each call, overwriting `timer` the second time —
+    // both timers stay registered independently (they were both live setTimeout calls), so
+    // the orphaned one still fires connect() later. It doesn't fire at the same instant as
+    // the first (delay was doubled to 2s after the second onerror, so the orphan is due at
+    // t=2000 while the first reconnect fires at t=1000) — advance well past both boundaries
+    // to observe it. A correct implementation ignores the second onerror entirely: only one
+    // reconnect timer is ever pending, so only one replacement source is ever created no
+    // matter how far time advances.
+    FakeEventSource.instances.at(-1)!.onerror?.();
+    FakeEventSource.instances.at(-1)!.onerror?.();
+    vi.advanceTimersByTime(5000); // past both the legitimate 1s reconnect and the orphan's later fire
+    expect(FakeEventSource.instances).toHaveLength(2); // exactly one replacement source, not two
+
+    // After stop(), no further source is ever created, even if a timer were still pending.
+    stop();
+    vi.advanceTimersByTime(20_000);
+    expect(FakeEventSource.instances).toHaveLength(2);
     vi.useRealTimers();
   });
 });

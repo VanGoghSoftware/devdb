@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
@@ -13,6 +13,14 @@ vi.mock("../src/api/events.js", async (importOriginal) => {
 import { startEvents } from "../src/api/events.js";
 
 describe("useEvents", () => {
+  // `startEvents` is a module-level mock shared across every `it()` in this file — reset its
+  // call history (but keep the `() => () => {}` factory as the baseline) between tests so
+  // call-count assertions below start from a clean slate instead of accumulating across tests.
+  beforeEach(() => {
+    (startEvents as ReturnType<typeof vi.fn>).mockClear();
+    (startEvents as ReturnType<typeof vi.fn>).mockImplementation(() => () => {});
+  });
+
   it("starts the stream once, blanket-invalidates on open, and invalidates mapped keys per event", async () => {
     const client = makeQueryClient();
     const invalidate = vi.spyOn(client, "invalidateQueries");
@@ -29,5 +37,27 @@ describe("useEvents", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["branches", "p1"] });
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["branch", "b1"] });
     });
+  });
+
+  it("mounts the stream exactly once across rerenders and cleans up exactly once on unmount", () => {
+    const cleanup = vi.fn();
+    (startEvents as ReturnType<typeof vi.fn>).mockReturnValue(cleanup);
+    const client = makeQueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}><MantineProvider>{children}</MantineProvider></QueryClientProvider>
+    );
+    const { rerender, unmount } = renderHook(() => useEvents(), { wrapper });
+
+    expect(startEvents).toHaveBeenCalledTimes(1);
+    expect(cleanup).not.toHaveBeenCalled();
+
+    // Rerender under the SAME QueryClient wrapper — the effect's dependency (qc) is unchanged,
+    // so it must not re-subscribe (no new startEvents call) or tear down the existing stream.
+    rerender();
+    expect(startEvents).toHaveBeenCalledTimes(1);
+    expect(cleanup).not.toHaveBeenCalled();
+
+    unmount();
+    expect(cleanup).toHaveBeenCalledTimes(1);
   });
 });
