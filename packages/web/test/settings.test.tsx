@@ -10,7 +10,7 @@ vi.mock("../src/api/client.js", () => ({
   ApiError: class extends Error {},
   api: {
     status: vi.fn().mockResolvedValue({
-      version: "0.1.0", healthy: true, engine: {}, portRange: { min: 54300, max: 54339 }, storage: "none",
+      version: "0.1.0", healthy: true, engine: {}, portRange: { min: 54300, max: 54339 }, storage: "none", pgBuilds: {},
     }),
     projects: {}, branches: {},
   },
@@ -32,7 +32,7 @@ describe("SettingsPage", () => {
   // itself, not "local (s3)" (which asserts the daemon is BOTH local and remote at once).
   it("shows the storage mode name directly for a non-none storage mode, not 'local (mode)'", async () => {
     vi.mocked(api.status).mockResolvedValue({
-      version: "0.1.0", healthy: true, engine: {}, portRange: { min: 54300, max: 54339 }, storage: "s3",
+      version: "0.1.0", healthy: true, engine: {}, portRange: { min: 54300, max: 54339 }, storage: "s3", pgBuilds: {},
     });
     renderApp(<SettingsPage />);
     expect(await screen.findByText(/^s3$/i)).toBeInTheDocument();

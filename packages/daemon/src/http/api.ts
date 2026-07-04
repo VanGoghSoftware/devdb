@@ -91,6 +91,7 @@ export function buildServer(deps: Deps): FastifyInstance {
       version: PACKAGE_VERSION, healthy, engine,
       portRange: deps.cfg.portRange,
       storage: "none" as const, // phase 4 wires real modes (spec §Daemon additions)
+      pgBuilds: {}, // Task 10 wires the real registry-backed block
     };
   });
 

@@ -100,7 +100,7 @@ const SYNTHETIC_ROOT: BranchDto = {
   id: "__root__", projectId: "__root__", parentBranchId: null, name: "__root__", slug: "__root__",
   timelineId: "", endpointStatus: "stopped", endpointError: null, port: null, connectionString: null,
   lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui", context: null, ancestorLsn: null,
-  createdAt: "", updatedAt: "",
+  createdAt: "", updatedAt: "", runningPgVersion: null,
 };
 
 export function canvasLayout(roots: TreeNode[]): {

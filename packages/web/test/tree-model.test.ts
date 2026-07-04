@@ -7,7 +7,7 @@ function b(id: string, parent: string | null, createdAt: string): BranchDto {
     id, projectId: "p1", parentBranchId: parent, name: id, slug: `${id}-slug`, timelineId: "t".repeat(32),
     endpointStatus: "stopped", endpointError: null, port: null, connectionString: null,
     lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null,
-    ancestorLsn: null, createdAt, updatedAt: createdAt,
+    ancestorLsn: null, createdAt, updatedAt: createdAt, runningPgVersion: null,
   };
 }
 

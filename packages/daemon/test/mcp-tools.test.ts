@@ -135,6 +135,15 @@ describe("MCP read tools", () => {
     // Fix 5: table-driven pgVersion coverage — the SDK's own zod inputSchema validation (not
     // tools.ts's own code) is the reject path for out-of-range values, so this also proves the
     // zod raw shape (PgVersionSchema.optional()) is wired correctly into the registered tool.
+    //
+    // Dynamic-pg-builds Task 1 widened PgVersionSchema from a fixed 14–17 union to
+    // `z.number().int().gte(14)` (packages/shared/src/index.ts) — no upper bound, so a pulled
+    // v18 build validates. That means the schema layer can no longer reject 18; only the floor
+    // (13 and below, non-integers) is a schema-level reject. Runtime "is this major actually
+    // installed" validation for values like 18 moves to ProjectsService.create() in Task 8
+    // (DevdbError 400 "not installed — installed majors: …", gated on a `builds` dep that does
+    // not exist yet) — see docs/superpowers/plans/2026-07-04-devdb-dynamic-pg-builds.md Task 8.
+    // 18 accepting here is therefore CORRECT for Task 1's world, not a regression.
     describe("pgVersion coverage", () => {
       it.each([14, 15, 16, 17])("accepts pgVersion %d", async (pgVersion) => {
         h = await makeReadToolsHarness();
@@ -143,9 +152,18 @@ describe("MCP read tools", () => {
         expect(firstText(res)).toContain(`pg${pgVersion}`);
       });
 
-      it.each([13, 18])("rejects pgVersion %d with a caller-actionable message", async (pgVersion) => {
+      // Task 8 will add coverage asserting pgVersion 18 (and other registry-unknown majors) is
+      // rejected once ProjectsService.create() gains the installedMajors guard.
+      it("accepts pgVersion 18 (registry-availability guard lands in Task 8, not here)", async () => {
         h = await makeReadToolsHarness();
-        const res = await h.call("create_project", { name: "shop", pgVersion });
+        const res = await h.call("create_project", { name: "shop-18", pgVersion: 18 });
+        expect(res.isError).toBeFalsy();
+        expect(firstText(res)).toContain("pg18");
+      });
+
+      it("rejects pgVersion 13 with a caller-actionable message", async () => {
+        h = await makeReadToolsHarness();
+        const res = await h.call("create_project", { name: "shop", pgVersion: 13 });
         expect(res.isError).toBe(true);
         // The SDK's zod-validation error path — not tools.ts's own guard()/DevdbError path — so
         // this doesn't assert the exact wording, only that SOME actionable text about pgVersion

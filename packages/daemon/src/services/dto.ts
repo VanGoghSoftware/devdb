@@ -14,5 +14,6 @@ export function toBranchDto(b: BranchDetail): BranchDto {
     lastRecordLsn: b.lastRecordLsn, logicalSizeBytes: b.logicalSizeBytes, ancestorLsn: b.ancestorLsn,
     createdBy: b.createdBy, context: b.context, // BranchRow now carries the union
     createdAt: b.createdAt, updatedAt: b.updatedAt,
+    runningPgVersion: null, // Task 8 wires the real value
   };
 }

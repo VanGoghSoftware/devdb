@@ -20,6 +20,7 @@ const childBranch: BranchDto = {
   timelineId: "t".repeat(32), endpointStatus: "stopped", endpointError: null, port: null,
   connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
   context: null, ancestorLsn: null, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z",
+  runningPgVersion: null,
 };
 const runningChildBranch: BranchDto = {
   ...childBranch, id: "b-running", endpointStatus: "running", port: 54301,

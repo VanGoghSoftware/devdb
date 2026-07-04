@@ -23,6 +23,7 @@ const branch: BranchDto = {
   lastRecordLsn: "0/169AD58", logicalSizeBytes: 24117248, createdBy: "mcp",
   context: { agent: "claude", git_branch: "fix-1", purpose: "repro the bug" },
   ancestorLsn: "0/1690000", createdAt: "2026-07-03T10:00:00Z", updatedAt: "2026-07-03T10:00:00Z",
+  runningPgVersion: null,
 };
 
 // `shouldAdvanceTime: true` (used below) is required for userEvent's internal delays to resolve

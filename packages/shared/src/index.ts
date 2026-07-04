@@ -2,9 +2,13 @@ import { z } from "zod";
 
 export const DEVDB = "devdb";
 
-// Adjust to docker/BINARIES.md inventory (Task 2). Order low→high.
+// Baked fallback list (docker/BINARIES.md inventory). The RUNTIME source of truth for available
+// majors is the daemon's BuildRegistry (GET /api/status → pgBuilds; GET /api/pg-builds) — this
+// constant exists for UI fallback before status loads and for docs. Order low→high.
 export const SUPPORTED_PG_VERSIONS = [14, 15, 16, 17] as const;
-export const PgVersionSchema = z.union([z.literal(14), z.literal(15), z.literal(16), z.literal(17)]);
+// Dynamic-builds phase: majors are registry-validated at runtime (ProjectsService.create), not
+// encoded in the type. gte(14) is the floor neon ships; no upper literal so a pulled v18 works.
+export const PgVersionSchema = z.number().int().gte(14);
 export type PgVersion = z.infer<typeof PgVersionSchema>;
 export const DEFAULT_PG_VERSION: PgVersion = 17;
 
@@ -46,14 +50,46 @@ export interface BranchDto {
   ancestorLsn: string | null;
   createdAt: string;
   updatedAt: string;
+  // Version string ("16.9") of the build this branch's RUNNING compute was started from;
+  // null when stopped or when the daemon can't resolve the path (registry lookup miss).
+  runningPgVersion: string | null;
+}
+
+export const PgBuildStatusSchema = z.enum(["downloading", "validating", "ready", "failed"]);
+export type PgBuildStatus = z.infer<typeof PgBuildStatusSchema>;
+
+export interface PgBuildDto {
+  id: string;
+  major: number;
+  minor: number | null;          // null until fixup detects it (status "downloading")
+  version: string | null;        // "17.5" — render string, null until detected
+  source: "baked" | "downloaded";
+  releaseTag: string;            // "latest"-resolved tags store the RESOLVED tag when known, else the requested one
+  imageDigest: string;           // "sha256:…" — "" for baked rows (not content-addressed)
+  status: PgBuildStatus;
+  active: boolean;
+  inUse: boolean;                // some RUNNING endpoint started from this build's pgbin
+  sizeBytes: number | null;
+  error: string | null;          // last failure line for status "failed"
+  createdAt: string;
+}
+
+export interface PgMajorStatusDto {
+  activeVersion: string | null;   // "16.9" | null when major has no valid build
+  source: "baked" | "downloaded" | null;
+  degradedDowngrade: boolean;     // resolution landed below lastRunMinor — never silent (spec decision 10)
+  updateAvailable: string | null; // release tag from the LAST explicit check; null = none seen/checked
 }
 
 export interface StatusDto {
   version: string;
   healthy: boolean;
-  engine: Record<string, { state: "running" | "stopped" | "failed"; pid: number | null }>;
+  // "starting" added with this phase (deferred widening, handover §5): ManagedProcess reports it
+  // between spawn and readyNeedle; the old union silently miscovered that window.
+  engine: Record<string, { state: "starting" | "running" | "stopped" | "failed"; pid: number | null }>;
   portRange: { min: number; max: number };
   storage: "none" | "s3" | "azure"; // typed for phase 4; the daemon returns "none" until then
+  pgBuilds: Record<string, PgMajorStatusDto>; // keyed by major as string ("16")
 }
 
 // Phase 3: /api/events wire schema. Events are coarse INVALIDATION HINTS, never data — the UI
@@ -64,6 +100,7 @@ export const DevdbEventTypeSchema = z.enum([
   "project.created", "project.deleted",
   "branch.created", "branch.updated", "branch.deleted",
   "endpoint.status", "engine.health",
+  "pg_builds",
 ]);
 export type DevdbEventType = z.infer<typeof DevdbEventTypeSchema>;
 

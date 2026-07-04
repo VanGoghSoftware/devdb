@@ -21,7 +21,7 @@ import type { BranchDto, ProjectDto, StatusDto } from "@devdb/shared";
 const status: StatusDto = {
   version: "0.1.0", healthy: true,
   engine: { pageserver: { state: "running", pid: 1 }, safekeeper: { state: "running", pid: 2 } },
-  portRange: { min: 54300, max: 54339 }, storage: "none",
+  portRange: { min: 54300, max: 54339 }, storage: "none", pgBuilds: {},
 };
 const projects: ProjectDto[] = [
   { id: "p1", name: "shop-api", pgVersion: 17, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z" },
@@ -31,6 +31,7 @@ const mainBranch: BranchDto = {
   timelineId: "t".repeat(32), endpointStatus: "stopped", endpointError: null, port: null,
   connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
   context: null, ancestorLsn: null, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z",
+  runningPgVersion: null,
 };
 
 beforeEach(() => {

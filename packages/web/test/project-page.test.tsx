@@ -19,7 +19,7 @@ const main: BranchDto = {
   id: "b-main", projectId: "p1", parentBranchId: null, name: "main", slug: "main-s", timelineId: "t".repeat(32),
   endpointStatus: "running", endpointError: null, port: 54301, connectionString: "postgresql://postgres:pw@localhost:54301/postgres",
   lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null, ancestorLsn: null,
-  createdAt: "1", updatedAt: "1",
+  createdAt: "1", updatedAt: "1", runningPgVersion: null,
 };
 
 // Fix 1 fixture: a child branch off main, so "Branch from here" on the child has a non-main
