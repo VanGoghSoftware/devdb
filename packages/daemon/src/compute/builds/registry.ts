@@ -176,7 +176,12 @@ export class BuildRegistry {
   // (resolveActives only re-evaluates degradation at boot).
   activate(id: string, opts?: { consented?: boolean }): PgBuildRow {
     const row = this.deps.state.pgBuilds.byId(id);
-    if (!row || row.status !== "ready") {
+    // Fix round 1 (review of Task 10 commit 3bfc859, Fix #3, P4): a missing row is a distinct
+    // 404 "no such build", not folded into the 409 "not ready to activate" below — that 409 is
+    // reserved for a row that DOES exist but isn't in a ready state (still downloading/validating/
+    // failed). Contract: unknown :id → 404 everywhere in this REST surface.
+    if (!row) throw new DevdbError(404, `no such build: ${id}`);
+    if (row.status !== "ready") {
       throw new DevdbError(409, `pg_build ${id} is not ready to activate`);
     }
     const lastRun = this.deps.state.pgMajors.lastRunMinor(row.major);
@@ -213,7 +218,10 @@ export class BuildRegistry {
   // pgbin some running compute currently has open (deleting out from under a live process).
   assertRemovable(id: string, runningPgbins: string[]): PgBuildRow {
     const row = this.deps.state.pgBuilds.byId(id);
-    if (!row) throw new DevdbError(409, `pg_build ${id} not found`);
+    // Fix round 1 (review of Task 10 commit 3bfc859, Fix #3, P4): a missing row is a 404, distinct
+    // from every removability-CONFLICT case below (active/baked/in-flight/in-use), which all stay
+    // 409 — those are real rows that exist but can't be removed right now, not "doesn't exist".
+    if (!row) throw new DevdbError(404, `no such build: ${id}`);
     if (row.active) throw new DevdbError(409, `pg_build ${id} is the active build for major ${row.major}`);
     if (row.source === "baked") throw new DevdbError(409, `pg_build ${id} is a baked build and cannot be removed`);
     if (row.status === "downloading" || row.status === "validating") {

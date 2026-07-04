@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
+import { DevdbError } from "../src/services/errors.js";
 import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
 const dirs = trackedDirs();
@@ -219,6 +220,49 @@ describe("BuildRegistry", () => {
     });
     expect(() => registry.assertRemovable("dl-a", [])).toThrow(/in flight/);
     expect(() => registry.assertRemovable("dl-b", [])).toThrow(/in flight/);
+  });
+
+  // Fix round 1 (review of Task 10 commit 3bfc859, Fix #3, P4): the contract says an unknown :id
+  // returns 404 — activate()/assertRemovable() previously folded a missing row into their own
+  // 409 (respectively "not ready to activate" / "not found"), indistinguishable from the real
+  // removability/activation CONFLICT 409s (a row that exists but isn't ready/isn't removable
+  // right now). statusOf() below throws-and-captures once so every case can assert on the
+  // DevdbError's statusCode specifically, not just its message.
+  function statusOf(fn: () => unknown): number {
+    try {
+      fn();
+      expect.unreachable("must throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(DevdbError);
+      return (e as DevdbError).statusCode;
+    }
+  }
+
+  it("activate() on an unknown id throws 404, distinct from the 409 not-ready case", async () => {
+    const { install, builds } = await scaffold();
+    const { registry } = makeRegistry({ install, builds, versions: {} });
+
+    expect(statusOf(() => registry.activate("no-such-build"))).toBe(404);
+  });
+
+  it("activate() on an existing but not-ready row still throws 409 (unchanged)", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    state.pgBuilds.insert({
+      id: "still-downloading", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "downloading",
+    });
+
+    expect(statusOf(() => registry.activate("still-downloading"))).toBe(409);
+  });
+
+  // Fix round 1 (Fix #3, P4): same distinction for assertRemovable — a missing row must 404, not
+  // fold into the generic 409 "not found" it previously used for exactly this case.
+  it("assertRemovable() on an unknown id throws 404, distinct from the 409 removability-conflict cases", async () => {
+    const { install, builds } = await scaffold();
+    const { registry } = makeRegistry({ install, builds, versions: {} });
+
+    expect(statusOf(() => registry.assertRemovable("no-such-build", []))).toBe(404);
   });
 
   it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {

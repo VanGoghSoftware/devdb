@@ -60,6 +60,39 @@ export class Provisioner {
   private pulling = false;
   private lastCheck = new Map<number, CheckResult>();
 
+  // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): a simple promise-chain
+  // serializer for build state-MUTATIONS (activate/remove, and the pull pipeline's own
+  // auto-activate step) — distinct from `pulling` above, which only single-flights the
+  // download/extract/gate portion of a pull. Without this lane, `remove(id)` (assertRemovable
+  // synchronously, then `await rm(row.path)`) could race a concurrent `activate(id)` for the
+  // same row during that await: activate flips the row active + recomposes, then the in-flight
+  // remove deletes it anyway — the row vanishes from disk AND SQLite while having been "active"
+  // an instant earlier, stranding the major with no ready build until the next GC/reboot re-
+  // resolves one. Reachable in the agents-first design: two MCP clients, or an agent + the web
+  // UI, hitting activate/delete for the same build concurrently.
+  //
+  // Deliberately NOT used for the pull pipeline's download/extract/gate (only its final
+  // auto-activate step, see extractFixupAndGate below) — a long-running pull must not block an
+  // unrelated activate/delete for minutes; only the brief moment where the active pointer
+  // actually flips needs mutual exclusion with other such flips.
+  //
+  // `mutationTail` is deliberately never allowed to become a REJECTED promise — a rejected tail
+  // chained onto would skip every subsequent `.then(fn)` (its `fn` never runs on a rejected
+  // parent), permanently jamming the lane after the first failing mutation. Each call's `result`
+  // (the real value/rejection this call's OWN caller sees, via the returned promise) is tracked
+  // separately from what gets stored back into `mutationTail`: the stored continuation always
+  // resolves — via `.then(noop, noop)` — regardless of whether `fn()` succeeded or threw.
+  private mutationTail: Promise<unknown> = Promise.resolve();
+
+  private runMutation<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(fn);
+    this.mutationTail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
   constructor(private deps: {
     registry: BuildRegistry; oci: OciPuller; state: StateDb; logs: LogsService;
     events: EventsService | undefined;
@@ -321,36 +354,81 @@ export class Provisioner {
     // and left as a ready-but-inactive build (not a pipeline failure). Anything else (a genuine
     // activation malfunction) must propagate to the outer pipeline catch, which marks the row
     // and the job failed.
-    try {
-      this.deps.registry.activate(id);
-      activatedRef.current = true; // from here on, a throw reaching runPipeline's catch must resolveActives()
-      this.log(id, `activated ${major}.${minor}`);
-    } catch (err) {
-      if (err instanceof DevdbError && err.statusCode === 409) {
-        this.log(id, `${firstLine(err)} — call activate to make ${major}.${minor} the running build`);
-      } else {
-        throw err;
+    //
+    // Fix round 1 (Fix #2, P3 — mutation lane): this step (activate + recompose), NOT the
+    // download/extract/gate above it, runs inside runMutation — the same lane an explicit
+    // POST .../activate or DELETE serializes through. Without this, a concurrent explicit
+    // activate()/remove() for a DIFFERENT build of this row's major could interleave with this
+    // auto-activate flipping the just-finished pull's row active, corrupting whichever active
+    // pointer/on-disk state loses the race. The long-running work above (network pull, extract,
+    // 90s validation gate) is deliberately OUTSIDE the lane so it never blocks an unrelated
+    // activate/delete for its full duration — only this brief active-pointer flip needs mutual
+    // exclusion with other such flips.
+    await this.runMutation(async () => {
+      try {
+        this.deps.registry.activate(id);
+        activatedRef.current = true; // from here on, a throw reaching runPipeline's catch must resolveActives()
+        this.log(id, `activated ${major}.${minor}`);
+      } catch (err) {
+        if (err instanceof DevdbError && err.statusCode === 409) {
+          this.log(id, `${firstLine(err)} — call activate to make ${major}.${minor} the running build`);
+        } else {
+          throw err;
+        }
       }
-    }
-
-    await deps.recomposeDistrib(); // covers the new-major case (no baked slot existed before)
+      await deps.recomposeDistrib(); // covers the new-major case (no baked slot existed before)
+    });
     this.publish();
   }
 
-  // Deletes a build (registry.assertRemovable guards active/baked/in-use rows).
+  // Explicit activation (e.g. picking an older build from the UI, or clearing a degraded-
+  // downgrade flag with consent). Task 10's REST route originally called registry.activate() +
+  // recomposeDistrib() + events.publish() directly, un-serialized with remove() below — Fix
+  // round 1 (Fix #2, P3) moves that whole sequence here, inside runMutation, so the two can
+  // never interleave for the same (or a related) row. registry.activate() itself stays pure
+  // registry/SQLite bookkeeping (no opinion on pg_distrib) — recomposeDistrib() still runs right
+  // after, same as it always has.
+  //
+  // Fix round 1 (Fix #1, documentation only — no behavior change): a recomposeDistrib() failure
+  // here leaves the active pointer committed (registry.activate() already returned) but the
+  // pg_distrib symlink farm stale. This is DELIBERATELY accepted as recoverable/self-healing, not
+  // an unexamined gap: composePgDistrib fully re-derives the farm from registry.list() on every
+  // call, and index.ts recomposes it at every boot before engine.start() — so the only exposure
+  // is a downloaded-only NEW major's walredo until the next successful recompose (a pull's own
+  // auto-activate above, another activate/remove, or the next boot). A rollback here would be
+  // wrong for the common case (a minor refresh where the new build is immediately usable) — this
+  // is a conscious tradeoff, not a missed one.
+  async activate(id: string, opts?: { consented?: boolean }): Promise<PgBuildRow> {
+    return this.runMutation(async () => {
+      const row = this.deps.registry.activate(id, opts);
+      await this.deps.recomposeDistrib();
+      this.publish();
+      return row;
+    });
+  }
+
+  // Deletes a build (registry.assertRemovable guards active/baked/in-use rows). Fix round 1
+  // (Fix #2, P3): the whole body now runs inside runMutation — assertRemovable's synchronous
+  // "is this row safe to remove right now" check and the `await rm(row.path)` that follows it
+  // must not have a concurrent activate() for the same row observe/flip the row in between (see
+  // this class's own runMutation doc comment for the exact race this closes).
   async remove(id: string, runningPgbins: string[]): Promise<void> {
-    const row: PgBuildRow = this.deps.registry.assertRemovable(id, runningPgbins);
-    await rm(row.path, { recursive: true, force: true });
-    this.deps.state.pgBuilds.delete(id);
-    await this.deps.recomposeDistrib();
-    this.publish();
+    await this.runMutation(async () => {
+      const row: PgBuildRow = this.deps.registry.assertRemovable(id, runningPgbins);
+      await rm(row.path, { recursive: true, force: true });
+      this.deps.state.pgBuilds.delete(id);
+      await this.deps.recomposeDistrib();
+      this.publish();
+    });
   }
 
-  // Task 10 (REST): thin public passthrough to the injected recomposeDistrib, so the POST
-  // /api/pg-builds/:id/activate route (which calls registry.activate() directly — activate has
-  // no reason to live on Provisioner, it's pure registry/SQLite bookkeeping) can still trigger the
-  // SAME pg_distrib recomposition every other activation path (pull's auto-activate, remove())
-  // already goes through, without api.ts reaching into a private ctor dep.
+  // Task 10 (REST): thin public passthrough to the injected recomposeDistrib, originally added so
+  // the POST /api/pg-builds/:id/activate route (which back then called registry.activate()
+  // directly) could still trigger a recompose without api.ts reaching into a private ctor dep.
+  // Fix round 1 (Fix #2, P3 — mutation lane): that route now calls the public activate() above
+  // instead, which reaches deps.recomposeDistrib() directly — this passthrough is no longer
+  // called by any production route, but is left in place as harmless public surface (removing it
+  // is unrelated cleanup, not part of this fix).
   async recomposeDistrib(): Promise<void> {
     await this.deps.recomposeDistrib();
   }

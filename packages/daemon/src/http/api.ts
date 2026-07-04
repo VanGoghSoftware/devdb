@@ -471,16 +471,19 @@ export function buildServer(deps: Deps): FastifyInstance {
   });
 
   // Explicit activation (e.g. picking an older build from the UI, or clearing a degraded-downgrade
-  // flag with consent). registry.activate() is pure registry/SQLite bookkeeping — it has no
-  // opinion on pg_distrib, so recomposeDistrib() runs right after (same as pull's auto-activate
-  // and remove() below), followed by a pg_builds invalidation hint for SSE subscribers.
+  // flag with consent). Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3 — mutation
+  // lane): this route used to call registry.activate() + provisioner.recomposeDistrib() +
+  // events.publish() directly, un-serialized with DELETE's provisioner.remove() below — a
+  // concurrent activate/delete for the same row could interleave (activate flips the row active
+  // + recomposes while remove() is mid-`rm`, which then deletes the just-activated build anyway,
+  // stranding the major). Provisioner.activate() now runs that same sequence inside its private
+  // mutation lane (see Provisioner's own doc comments on runMutation/activate for the race this
+  // closes and Fix #1's accepted-tradeoff note on a recompose failure after the pointer commits).
   const ActivateBody = z.object({ consented: z.boolean().optional() });
   app.post("/api/pg-builds/:id/activate", async (req) => {
     const { id } = req.params as { id: string };
     const body = ActivateBody.parse(req.body ?? {});
-    const row = deps.registry.activate(id, { consented: body.consented });
-    await deps.provisioner.recomposeDistrib();
-    deps.events.publish({ type: "pg_builds" });
+    const row = await deps.provisioner.activate(id, { consented: body.consented });
     return toPgBuildDto(row, deps.computes.runningPgbins());
   });
 

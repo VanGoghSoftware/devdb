@@ -1,6 +1,6 @@
 import { access, mkdir, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
 import { Provisioner } from "../src/compute/builds/provisioner.js";
@@ -15,7 +15,24 @@ import type { BranchRow, ProjectRow } from "../src/state/repos.js";
 import type { DevdbEvent } from "@devdb/shared";
 import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
+// Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3 — mutation lane): rm is the only
+// fs call the new remove()-vs-activate() race test needs to defer (Provisioner.remove awaits
+// `rm(row.path, ...)` before touching SQLite) — same rationale/pattern as manager.test.ts's own
+// rmMock (only rm is mocked; everything else, including this file's own extract/fixup/gate-
+// cleanup rm calls in every OTHER test, passes through to the real implementation via the
+// beforeEach reset below).
+const rmMock = vi.hoisted(() => vi.fn());
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rm: rmMock };
+});
+const realFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+
 const dirs = trackedDirs();
+beforeEach(() => {
+  rmMock.mockReset();
+  rmMock.mockImplementation(realFs.rm);
+});
 afterEach(async () => { await cleanupDirs(dirs); });
 
 const DIGEST_A = "sha256:" + "a".repeat(64);
@@ -566,5 +583,110 @@ describe("Provisioner", () => {
 
     expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: true });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+  });
+
+  // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
+  // (activate/remove) were not serialized — only pulls were, via the private `pulling` flag.
+  // remove(id) calls assertRemovable synchronously then `await rm(row.path)`; during that await,
+  // a concurrent activate(id) for the SAME row could flip it active + recompose, and the delete
+  // then removes the just-activated build out from under it, stranding the major (the row is
+  // gone from both disk AND SQLite, but was "active" the instant before deletion — no ready
+  // build left for its major until GC/reboot picks another). The fix adds a mutation-lane
+  // serializer (runMutation) so activate/remove never interleave.
+  describe("mutation lane (activate/remove serialization)", () => {
+    it("remove(id) held on a slow rm, concurrent activate(id) on the SAME row — the lane serializes them: never a deleted-but-active row", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      const { oci } = fakeOci();
+      const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+
+      // Seed a single ready, non-active downloaded v17 build — removable (not baked, not active,
+      // not in-flight, not in-use) at the moment remove() starts.
+      const dir = await fakeVolumeBuild(builds, 17, "t1",
+        { digest: DIGEST_A, tag: "t1", major: 17, minor: 5, extractedAt: "x" });
+      state.pgBuilds.insert({
+        id: "b1", major: 17, minor: 5, source: "downloaded", releaseTag: "t1",
+        imageDigest: DIGEST_A, path: dir, status: "ready",
+      });
+
+      // Hold remove()'s rm() open until released — this is the window a pre-fix concurrent
+      // activate() could interleave into.
+      let releaseRm!: () => void;
+      const rmGate = new Promise<void>((res) => { releaseRm = res; });
+      rmMock.mockImplementationOnce(async (...args: Parameters<typeof realFs.rm>) => {
+        await rmGate;
+        return realFs.rm(...args);
+      });
+
+      const removePromise = provisioner.remove("b1", []);
+      // Give remove() a tick to reach (and block inside) rm().
+      await vi.waitFor(() => expect(rmMock).toHaveBeenCalled());
+
+      // Concurrent activate() on the SAME row, issued while remove() is still mid-flight.
+      const activatePromise = provisioner.activate("b1");
+
+      releaseRm();
+      const [removeResult, activateResult] = await Promise.allSettled([removePromise, activatePromise]);
+
+      // Whichever ordering the lane picked, the end state must be single and consistent: either
+      // the row was fully removed (activate then correctly sees "no such build", 404) and NOTHING
+      // is left active/on-disk claiming to be b1, OR activate ran to completion first and remove
+      // then genuinely 409s on "is the active build" (never silently deleting an active row).
+      // What must NEVER happen: both "succeed" with b1 ending up deleted from SQLite while some
+      // active pointer/on-disk state still references it.
+      const stillThere = state.pgBuilds.byId("b1");
+      if (removeResult.status === "fulfilled") {
+        // remove() won the lane: b1 is gone. activate() must have failed with 404 (ran after
+        // deletion) — never "succeeded" against a row that no longer exists.
+        expect(stillThere).toBeNull();
+        expect(activateResult.status).toBe("rejected");
+        if (activateResult.status === "rejected") {
+          expect(activateResult.reason).toBeInstanceOf(DevdbError);
+          expect((activateResult.reason as DevdbError).statusCode).toBe(404);
+        }
+      } else {
+        // activate() won the lane: b1 is active and ready. remove() must have then failed with
+        // the registry's real "is the active build" 409 — never proceeding to delete it.
+        expect(activateResult.status).toBe("fulfilled");
+        expect(stillThere).toMatchObject({ id: "b1", active: true, status: "ready" });
+        expect(removeResult.status).toBe("rejected");
+        if (removeResult.status === "rejected") {
+          expect(removeResult.reason).toBeInstanceOf(DevdbError);
+          expect((removeResult.reason as DevdbError).message).toMatch(/active build/);
+        }
+        // The dir must still be on disk too — remove() must not have touched it.
+        await access(dir);
+      }
+    });
+
+    it("Provisioner.activate() runs registry.activate + recomposeDistrib + publish, and returns the activated row", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      await fakeInstallDir(install, "v17"); // baked v17
+      const { oci } = fakeOci();
+      const { registry, provisioner, events, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      await registry.seedBaked();
+      registry.resolveActives();
+      const bakedId = registry.list().find((r) => r.source === "baked")!.id;
+
+      const collected: DevdbEvent[] = [];
+      events.subscribe((e) => collected.push(e));
+
+      const row = await provisioner.activate(bakedId);
+
+      expect(row.id).toBe(bakedId);
+      expect(row.active).toBe(true);
+      expect(recomposeDistrib).toHaveBeenCalledTimes(1);
+      expect(collected.some((e) => e.type === "pg_builds")).toBe(true);
+    });
+
+    it("Provisioner.activate() on an unknown id rejects with the registry's 404, not silently", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      const { oci } = fakeOci();
+      const { provisioner } = makeProvisioner({ install, builds, oci });
+
+      await expect(provisioner.activate("no-such-build")).rejects.toThrow(DevdbError);
+    });
   });
 });

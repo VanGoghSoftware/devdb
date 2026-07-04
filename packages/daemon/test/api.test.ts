@@ -125,9 +125,20 @@ function fakeRegistry(): BuildRegistry {
 // Only the methods api.ts's pg-builds routes actually call need to exist — same rationale as
 // fakeProjects()/fakeBranches() etc. above. Deps.provisioner is typed against the concrete
 // Provisioner class, so a plain fake needs the same narrowly-scoped cast.
+//
+// Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3 — mutation lane): the activate
+// ROUTE now calls provisioner.activate(id, opts) instead of registry.activate() +
+// provisioner.recomposeDistrib() + events.publish() directly (see api.ts's own comment on that
+// route) — Provisioner.activate()'s OWN behavior (that it really does call registry.activate,
+// recomposeDistrib, and publish, in that order, inside its mutation lane) is covered directly in
+// provisioner.test.ts; the tests in THIS file only need to prove the route calls
+// provisioner.activate with the right args and maps its result/rejection correctly, so the
+// default fake here is a bare vi.fn() like every other method — individual tests below wire it
+// to either delegate into a REAL registry (via makePgBuildsRegistry()) or reject with a specific
+// DevdbError, whichever the test is proving.
 function fakeProvisioner(): Provisioner {
   return {
-    check: vi.fn(), pull: vi.fn(), remove: vi.fn(),
+    check: vi.fn(), pull: vi.fn(), remove: vi.fn(), activate: vi.fn(),
     updateAvailableFor: vi.fn(() => null), recomposeDistrib: vi.fn(),
   } as unknown as Provisioner;
 }
@@ -1126,16 +1137,26 @@ describe("buildServer pg-builds routes", () => {
     expect(provisioner.pull).not.toHaveBeenCalled();
   });
 
-  it("POST /api/pg-builds/:id/activate returns the activated dto; DELETE returns 204", async () => {
+  // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3 — mutation lane): the activate
+  // route now calls provisioner.activate(id, opts) rather than registry.activate() +
+  // provisioner.recomposeDistrib() + events.publish() directly (see api.ts's route comment) —
+  // that internal sequencing is Provisioner's OWN behavior now, covered directly in
+  // provisioner.test.ts's "Provisioner.activate() runs registry.activate + recomposeDistrib +
+  // publish" test. This route test's job is narrower: prove the route forwards to
+  // provisioner.activate with the right (id, opts) and maps ITS result to the response DTO —
+  // the fake here delegates into the SAME real registry the test seeded, so the response can
+  // still be cross-checked against toPgBuildDto without re-asserting Provisioner's internals.
+  it("POST /api/pg-builds/:id/activate returns the activated dto (via provisioner.activate); DELETE returns 204", async () => {
     const cfg = testCfg();
     const state = openState(":memory:");
     const { registry } = await makePgBuildsRegistry();
     const bakedId = registry.list().find((r) => r.source === "baked")!.id;
-    const events = fakeEvents();
-    const publishSpy = vi.spyOn(events, "publish");
     const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.activate).mockImplementation(
+      async (id: string, opts?: { consented?: boolean }) => registry.activate(id, opts),
+    );
     const app = buildServer({
-      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events,
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
       registry, provisioner, computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
@@ -1146,8 +1167,7 @@ describe("buildServer pg-builds routes", () => {
     expect(activateRes.statusCode).toBe(200);
     const activated = registry.list().find((r) => r.id === bakedId)!;
     expect(activateRes.json()).toEqual(toPgBuildDto(activated, []));
-    expect(provisioner.recomposeDistrib).toHaveBeenCalledTimes(1);
-    expect(publishSpy).toHaveBeenCalledWith({ type: "pg_builds" });
+    expect(provisioner.activate).toHaveBeenCalledWith(bakedId, { consented: undefined });
 
     // DELETE targets the (now-inactive) downloaded v17 row — the active baked-v16 row above would
     // 409 via assertRemovable's "is the active build" guard, which isn't what this test proves.
@@ -1170,9 +1190,13 @@ describe("buildServer pg-builds routes", () => {
     const state = openState(":memory:");
     const { registry } = await makePgBuildsRegistry();
     const bakedId = registry.list().find((r) => r.source === "baked")!.id;
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.activate).mockImplementation(
+      async (id: string, opts?: { consented?: boolean }) => registry.activate(id, opts),
+    );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
-      registry, provisioner: fakeProvisioner(), computes: fakeComputes(),
+      registry, provisioner, computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -1180,6 +1204,7 @@ describe("buildServer pg-builds routes", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ id: bakedId, active: true });
+    expect(provisioner.activate).toHaveBeenCalledWith(bakedId, { consented: undefined });
   });
 
   it("POST /api/pg-builds/:id/activate — 409 surfaces the registry's downgrade-consent DevdbError", async () => {
@@ -1203,9 +1228,13 @@ describe("buildServer pg-builds routes", () => {
       id: "dl-17-older", major: 17, minor: 4, source: "downloaded",
       releaseTag: "old", imageDigest: "sha256:" + "b".repeat(64), path: "/fake/older", status: "ready",
     });
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.activate).mockImplementation(
+      async (id: string, opts?: { consented?: boolean }) => registry.activate(id, opts),
+    );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
-      registry, provisioner: fakeProvisioner(), computes: fakeComputes(),
+      registry, provisioner, computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -1266,6 +1295,54 @@ describe("buildServer pg-builds routes", () => {
     const explicitRes = await app.inject({ method: "POST", url: "/api/pg-builds/check", payload: { majors: [18] } });
     expect(explicitRes.statusCode).toBe(200);
     expect(provisioner.check).toHaveBeenCalledWith([18]);
+  });
+
+  // Fix round 1 (review of Task 10 commit 3bfc859, Fix #3, P4): an unknown :id must 404, not 409
+  // — these two routes use a REAL BuildRegistry (not the generic fakeRegistry() vi.fn() stand-in)
+  // specifically so registry.activate()/assertRemovable()'s real byId(id)===null branch is what
+  // produces the response, not a mocked provisioner method standing in for it. The activate
+  // route now calls provisioner.activate(id, opts) (Fix #2's mutation lane) — the fake here
+  // delegates straight through to the real registry.activate(), same as Provisioner.activate()
+  // itself does before its recompose/publish side effects.
+  it("POST /api/pg-builds/<unknown>/activate — 404, not 409", async () => {
+    const cfg = testCfg();
+    const { registry, state } = await makePgBuildsRegistry();
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.activate).mockImplementation(
+      async (id: string, opts?: { consented?: boolean }) => registry.activate(id, opts),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({
+      method: "POST", url: "/api/pg-builds/no-such-build/activate", payload: {},
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("DELETE /api/pg-builds/<unknown> — 404, not 409", async () => {
+    const cfg = testCfg();
+    const { registry, state } = await makePgBuildsRegistry();
+    const provisioner = fakeProvisioner();
+    // provisioner.remove(id, ...) must actually reach registry.assertRemovable's real 404 branch
+    // (not a mocked resolution) — delegate the fake straight through to the real registry, same
+    // as Provisioner.remove itself does before its rm()/delete() side effects.
+    vi.mocked(provisioner.remove).mockImplementation(async (id: string, running: string[]) => {
+      registry.assertRemovable(id, running);
+    });
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "DELETE", url: "/api/pg-builds/no-such-build" });
+
+    expect(res.statusCode).toBe(404);
   });
 
   it("GET /api/status carries pgBuilds with activeVersion/degradedDowngrade/updateAvailable", async () => {
