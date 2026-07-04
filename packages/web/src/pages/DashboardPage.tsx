@@ -14,7 +14,8 @@ function EngineStrip() {
       {!data.healthy && (
         <Alert color="red" title="Engine degraded">
           One or more engine components are not running — see the component chips below. Branch
-          operations may fail until the engine recovers (it restarts automatically with backoff).
+          operations may fail until the engine is healthy again; restart the container
+          (<Text span ff="monospace">docker compose restart devdb</Text>) to recover.
         </Alert>
       )}
       <Group gap="xs">
