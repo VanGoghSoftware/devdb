@@ -1,16 +1,44 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { MantineProvider } from "@mantine/core";
 import { makeQueryClient } from "./render.js";
-import { useEvents } from "../src/api/hooks.js";
+import { useEvents, usePgBuilds } from "../src/api/hooks.js";
 
 vi.mock("../src/api/events.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../src/api/events.js")>();
   return { ...mod, startEvents: vi.fn(() => () => {}) };
 });
 import { startEvents } from "../src/api/events.js";
+
+describe("usePgBuilds", () => {
+  let fetchMock: Mock<typeof fetch>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders list data fetched through the query client", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify([{ id: "build1", major: 16 }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = makeQueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}><MantineProvider>{children}</MantineProvider></QueryClientProvider>
+    );
+    const { result } = renderHook(() => usePgBuilds(), { wrapper });
+    await waitFor(() => expect(result.current.data).toEqual([{ id: "build1", major: 16 }]));
+    expect(fetchMock).toHaveBeenCalledWith("/api/pg-builds", { headers: undefined });
+  });
+});
 
 describe("useEvents", () => {
   // `startEvents` is a module-level mock shared across every `it()` in this file — reset its

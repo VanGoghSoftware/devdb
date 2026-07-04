@@ -21,6 +21,9 @@ export function useBranch(id: string | null) {
     enabled: id !== null,
   });
 }
+export function usePgBuilds() {
+  return useQuery({ queryKey: keys.pgBuilds, queryFn: api.pgBuilds.list });
+}
 
 function onError(e: unknown): void {
   notifications.show({ color: "red", title: "Request failed", message: e instanceof Error ? e.message : String(e) });
@@ -53,6 +56,12 @@ export function useRestoreBranch() {
   return useApiMutation((a: { id: string; body: RestoreBody }) => api.branches.restore(a.id, a.body));
 }
 export function useResetBranch() { return useApiMutation(api.branches.reset); }
+export function useCheckPgUpdates() { return useApiMutation(api.pgBuilds.check); }
+export function usePullPgBuild() { return useApiMutation(api.pgBuilds.pull); }
+export function useActivatePgBuild() {
+  return useApiMutation((a: { id: string; consented?: boolean }) => api.pgBuilds.activate(a.id, a.consented));
+}
+export function useDeletePgBuild() { return useApiMutation(api.pgBuilds.remove); }
 
 // Mounted ONCE in App. Blanket invalidate on every (re)connect; per-event mapped invalidation.
 export function useEvents(): EventsStatus {

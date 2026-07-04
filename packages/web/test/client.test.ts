@@ -167,6 +167,79 @@ describe("api client", () => {
     });
   });
 
+  describe("pgBuilds", () => {
+    it("list: GET /api/pg-builds", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, [{ id: "build1" }]));
+      const result = await api.pgBuilds.list();
+      expect(result).toEqual([{ id: "build1" }]);
+      const { url, init } = lastCall();
+      expect(url).toBe("/api/pg-builds");
+      expect(init?.method).toBeUndefined();
+    });
+
+    it("check: POST /api/pg-builds/check with {majors} body", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(200, { "16": { tag: "latest", digest: "sha256:abc", isNew: true } }),
+      );
+      const result = await api.pgBuilds.check([16]);
+      expect(result).toEqual({ "16": { tag: "latest", digest: "sha256:abc", isNew: true } });
+      const { url, init } = lastCall();
+      expect(url).toBe("/api/pg-builds/check");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ majors: [16] }));
+    });
+
+    it("check: majors defaults to undefined when omitted", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+      await api.pgBuilds.check();
+      const { init } = lastCall();
+      expect(init?.body).toBe(JSON.stringify({ majors: undefined }));
+    });
+
+    it("pull: POST /api/pg-builds/pull with {major} body", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(202, { buildId: "build1" }));
+      const result = await api.pgBuilds.pull({ major: 16 });
+      expect(result).toEqual({ buildId: "build1" });
+      const { url, init } = lastCall();
+      expect(url).toBe("/api/pg-builds/pull");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ major: 16 }));
+    });
+
+    it("pull: forwards an explicit tag", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(202, { buildId: "build2" }));
+      await api.pgBuilds.pull({ major: 17, tag: "17.5" });
+      const { init } = lastCall();
+      expect(init?.body).toBe(JSON.stringify({ major: 17, tag: "17.5" }));
+    });
+
+    it("activate: POST /api/pg-builds/:id/activate with {consented} body", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, { id: "build1", active: true }));
+      const result = await api.pgBuilds.activate("build1", true);
+      expect(result).toEqual({ id: "build1", active: true });
+      const { url, init } = lastCall();
+      expect(url).toBe("/api/pg-builds/build1/activate");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ consented: true }));
+    });
+
+    it("activate: consented defaults to undefined when omitted", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, { id: "build1" }));
+      await api.pgBuilds.activate("build1");
+      const { init } = lastCall();
+      expect(init?.body).toBe(JSON.stringify({ consented: undefined }));
+    });
+
+    it("remove: DELETE /api/pg-builds/:id, 204 resolves to undefined without parsing JSON", async () => {
+      fetchMock.mockResolvedValueOnce(emptyResponse(204));
+      const result = await api.pgBuilds.remove("build1");
+      expect(result).toBeUndefined();
+      const { url, init } = lastCall();
+      expect(url).toBe("/api/pg-builds/build1");
+      expect(init?.method).toBe("DELETE");
+    });
+  });
+
   describe("error handling", () => {
     it("rejects with ApiError carrying the daemon's status and remediation message verbatim", async () => {
       fetchMock.mockResolvedValueOnce(jsonResponse(409, { error: "branch has a running endpoint; stop it first" }));

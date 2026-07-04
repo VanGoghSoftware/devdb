@@ -4,4 +4,5 @@ export const keys = {
   branches: (projectId: string) => ["branches", projectId] as const,
   allBranches: ["branches"] as const,
   branch: (id: string) => ["branch", id] as const,
+  pgBuilds: ["pg-builds"] as const,
 };
