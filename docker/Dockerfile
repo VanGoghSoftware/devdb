@@ -20,6 +20,12 @@ COPY --chown=node:node package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ts
 COPY --chown=node:node packages ./packages
 COPY --chown=node:node tests/integration/package.json ./tests/integration/package.json
 USER node
+# Single-stage `devdb:dev` build: installs all workspace deps (incl. the web build tooling —
+# vite/tsc) and builds shared → web (vite → packages/web/dist) → daemon by topology. This ships
+# build tooling + workspace sources in the runtime image (web deps add ~150MB; the image is
+# ~2.6GB, dominated by the neon binaries). A multi-stage builder that copies only dist + the
+# daemon's prod deps into a slim runtime is the phase-5 (CI/image) optimization — deferred while
+# the size delta stays modest (see handover §7).
 RUN pnpm install --frozen-lockfile && pnpm -r build
 COPY --chown=node:node docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
 RUN bash /usr/local/bin/verify-binaries.sh
