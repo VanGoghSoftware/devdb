@@ -7,6 +7,11 @@ export class PortExhaustedError extends Error {
   }
 }
 
+// A bind probe: resolves true iff `port` is grantable. The production probe (tryBind) actually
+// binds 127.0.0.1:<port>; unit tests inject a fake so allocation never touches the OS. Exported so
+// ComputeManager can type its own injected-probe seam against the same shape (see manager.ts).
+export type PortProbe = (port: number) => Promise<boolean>;
+
 function tryBind(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const srv = net.createServer();
@@ -26,7 +31,7 @@ function tryBind(port: number): Promise<boolean> {
 async function tryClaim(
   port: number,
   reserved: Set<number> | undefined,
-  probe: (port: number) => Promise<boolean>,
+  probe: PortProbe,
 ): Promise<boolean> {
   if (reserved?.has(port)) return false;
   reserved?.add(port); // claim before the await — atomic against interleaved calls
@@ -57,7 +62,7 @@ export async function allocatePort(
   range: { min: number; max: number },
   preferred?: number | null,
   reserved?: Set<number>,
-  probe: (port: number) => Promise<boolean> = tryBind,
+  probe: PortProbe = tryBind,
 ): Promise<number> {
   if (preferred && preferred >= range.min && preferred <= range.max) {
     if (await tryClaim(preferred, reserved, probe)) return preferred;

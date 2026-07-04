@@ -108,4 +108,28 @@ describe("allocatePort", () => {
     // either path — the throw propagates unchanged, but nothing is left reserved.
     expect(reserved.size).toBe(0);
   });
+
+  // Real-probe coverage (the tryBind default, no probe arg) against an OS-assigned ephemeral port
+  // rather than a fixed number. The other tests here either inject a probe or target fixed 56xxx
+  // ports; this one exercises the real net.createServer().listen path end to end. Binding :0 lets
+  // the OS hand us a port it knows is free *right now*, sidestepping the exact hazard that sank the
+  // compute-manager tests — a hardcoded range (the default 54300-54339) sitting wholly under
+  // docker-proxy while the compose container is up. tryBind must reject the port while it is held,
+  // then grant it once released.
+  it("with the default bind probe, rejects a held ephemeral port and grants it once released", async () => {
+    const holder = net.createServer();
+    holder.listen(0, "127.0.0.1");
+    await once(holder, "listening");
+    const addr = holder.address();
+    if (addr === null || typeof addr === "string") throw new Error("expected an AddressInfo from listen(0)");
+    const port = addr.port;
+
+    // Held by `holder`: the real tryBind fails to bind it, so a single-port range exhausts.
+    await expect(allocatePort({ min: port, max: port })).rejects.toBeInstanceOf(PortExhaustedError);
+
+    // Released: the same real probe must now bind and hand back exactly that port.
+    holder.close();
+    await once(holder, "close");
+    expect(await allocatePort({ min: port, max: port })).toBe(port);
+  });
 });

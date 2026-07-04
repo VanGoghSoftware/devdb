@@ -8,7 +8,7 @@ import { engineDirs } from "../engine/configs.js";
 import { ManagedProcess } from "../engine/process.js";
 import { computeConfigJson } from "./spec.js";
 import { PG_HBA } from "./pgconf.js";
-import { allocatePort } from "./ports.js";
+import { allocatePort, type PortProbe } from "./ports.js";
 import { waitComputeReady } from "./readiness.js";
 
 interface RunningCompute {
@@ -40,6 +40,15 @@ export class ComputeManager {
     // positional (like waitReady above) so every existing construction in this file's tests, which
     // predate this arg, stays valid untouched.
     private onStatusChange?: (branchId: string) => void,
+    // Injectable bind probe, forwarded verbatim to every allocatePort() call below. Undefined in
+    // production (index.ts constructs without it) so allocatePort falls back to its real tryBind
+    // default; unit tests pass a fake so port allocation never binds a real socket. The real probe
+    // binds 127.0.0.1:<candidate>, and docker-proxy holds every port across the published
+    // DEVDB_PORT_RANGE (54300-54339, the default) whenever the compose container is up — so a
+    // real-probe start() in a unit test exhausts the range and throws PortExhaustedError with the
+    // product running. Positional and optional, matching waitReady/onStatusChange above rather than
+    // introducing a deps bag. Real tryBind behaviour stays covered in ports.test.ts.
+    private probe?: PortProbe,
   ) {}
 
   private notifyStatus(branchId: string): void {
@@ -112,7 +121,7 @@ export class ComputeManager {
       // its bind probe (reserve-then-probe — see ports.ts), so parallel starts on other branches
       // can never be handed the same candidate. Recording the port on `entry` in the same tick is
       // what start()'s catch and stop() use to release the claim.
-      const port = await allocatePort(this.cfg.portRange, a.branch.stickyPort, this.reservedPorts);
+      const port = await allocatePort(this.cfg.portRange, a.branch.stickyPort, this.reservedPorts, this.probe);
       entry.port = port;
 
       const computesDir = engineDirs(this.cfg).computesDir;
@@ -129,14 +138,14 @@ export class ComputeManager {
         port, hbaPath,
         password: a.branch.password,
       }));
-      const metricsPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts);
+      const metricsPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts, this.probe);
       entry.metricsPort = metricsPort;
       // Without an explicit --internal-http-port, compute_ctl binds its internal HTTP server
       // (remote-extension downloads for the neon extension, local_proxy config) to the default
       // 3081 on every compute: the first compute wins the bind and later concurrent computes
       // collide — nonfatal, but that server is silently missing/misrouted for every compute
       // after the first (verified via /proc/net/tcp in a live devdb:dev container).
-      const internalHttpPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts);
+      const internalHttpPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts, this.probe);
       entry.internalHttpPort = internalHttpPort;
 
       // oracle args: src/mgmt/compute/mod.rs:189-208; readiness: :245-252 ("listening on IPv4 address", 50s)
