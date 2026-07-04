@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
-    "test": "tsc --noEmit -p tsconfig.json && vitest run"
+    "test": "tsc --noEmit -p tsconfig.json && NODE_OPTIONS=--no-experimental-webstorage vitest run"
   },
   "dependencies": {
     "@devdb/shared": "workspace:*",

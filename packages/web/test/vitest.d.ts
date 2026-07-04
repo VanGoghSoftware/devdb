@@ -4,8 +4,10 @@
 // augmentation here with a package-specifier import so it merges. Empirically the merge only lands
 // when targeting the `vitest` module (the use-site specifier `app.test.tsx` imports `expect` from) —
 // augmenting `@vitest/expect` directly does NOT take, because the assertion symbol at the call site
-// is resolved through `vitest`'s namespace. (Runtime matchers still come from setup.ts's
-// `import "@testing-library/jest-dom/vitest"`.)
+// is resolved through `vitest`'s namespace. (Runtime matchers are registered in setup.ts via
+// explicit `expect.extend(matchers)` against this package's vitest-4 `expect` — not via
+// jest-dom's `/vitest` side-effect entry, which setup.ts's own comment explains would bind the
+// wrong `expect`.)
 import type { TestingLibraryMatchers } from "@testing-library/jest-dom/matchers";
 
 declare module "vitest" {

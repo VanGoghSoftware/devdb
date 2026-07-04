@@ -7,6 +7,11 @@ import { expect } from "vitest";
 import * as matchers from "@testing-library/jest-dom/matchers";
 expect.extend(matchers);
 
+// Node >=24's own experimental global `localStorage` (on by default on some builds, e.g. observed
+// on 25.2.1) shadows jsdom's window.localStorage as a plain non-Storage object, silently breaking
+// getItem/setItem/clear. package.json's test script sets NODE_OPTIONS=--no-experimental-webstorage
+// so jsdom's real Storage implementation is what prefs.ts and this suite's localStorage.clear() see.
+
 // jsdom implements neither of these; Mantine (useMantineColorScheme, ScrollArea) and React Flow
 // (later tasks) require them. matchMedia mock is Mantine's own prescribed test setup.
 Object.defineProperty(window, "matchMedia", {
