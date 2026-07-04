@@ -44,6 +44,81 @@ describe("EmbeddedPostgres", () => {
     await expect(pg.start()).rejects.toThrow(/already running/);
   });
 
+  // An unclean container stop (docker kill / OOM / host reboot — anything skipping the SIGTERM
+  // path that lets postgres exit cleanly and delete its own pid file) leaves a stale postmaster.pid
+  // on the persistent data dir. On the next boot, container PID reuse can make the dead postmaster's
+  // recorded PID look alive to postgres's stale-lock heuristic, so postgres refuses to start
+  // ("lock file already exists" → FATAL → boot fails). start() must clear it first — safe because
+  // the daemon holds the exclusive /data/.lock by this point, so nothing else can own the data dir.
+  it("start() removes a stale postmaster.pid before launching postgres", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17")); // resolves as pgDir; its bin/postgres won't exist → spawn ENOENT
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    const pidFile = join(dataDir, "postmaster.pid");
+    // A realistic postmaster.pid: line 1 is the (now-dead) postmaster PID postgres's check reads.
+    writeFileSync(pidFile, "18\n/data/daemon_data/storage_controller_pg_data\n1783166623\n");
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+    });
+
+    // The bogus postgres binary makes ManagedProcess.start() reject (ENOENT) — but the stale-pid
+    // removal runs before the spawn, so the file is gone regardless of the launch failing.
+    await expect(pg.start()).rejects.toThrow();
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it("start() tolerates a data dir with no postmaster.pid (force unlink is a no-op)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    expect(existsSync(join(dataDir, "postmaster.pid"))).toBe(false);
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+    });
+
+    // The removal must be a no-op when absent (rm force), so the only failure is the bogus-binary
+    // spawn — whose error carries the process name; an ENOENT thrown by the unlink itself would not.
+    await expect(pg.start()).rejects.toThrow(/storcon_db/);
+  });
+
+  it("start() does not touch postmaster.pid when already running (guard precedes removal)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    const pidFile = join(dataDir, "postmaster.pid");
+    writeFileSync(pidFile, "4321\n");
+    const pg = new EmbeddedPostgres({
+      name: "guarded", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+    });
+    // A live child this instance already started: the already-running guard must fire BEFORE the
+    // stale-pid removal, so we never yank the pid file out from under our own live postmaster.
+    (pg as unknown as { proc: { state: string } }).proc = { state: "running" };
+
+    await expect(pg.start()).rejects.toThrow(/already running/);
+    expect(existsSync(pidFile)).toBe(true); // preserved — removal was never reached
+  });
+
+  it("start() rejects a concurrent second call even with a stale pid present (guard→claim stays atomic)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    // A stale pid IS present — its removal must stay synchronous so it can't insert an await between
+    // the running-guard and the this.proc claim, which would let both concurrent starts through.
+    writeFileSync(join(dataDir, "postmaster.pid"), "18\n");
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+    });
+
+    // first claims this.proc synchronously (proc.start() sets "starting") before it suspends; the
+    // second call must therefore see "starting" and reject, so only ONE ManagedProcess is claimed.
+    const first = pg.start();
+    const second = pg.start();
+    await Promise.all([
+      expect(second).rejects.toThrow(/already (starting|running)/),
+      expect(first).rejects.toThrow(), // bogus postgres binary — the first still fails to launch
+    ]);
+  });
+
   it("init() skips when PG_VERSION exists", async () => {
     const root = mkdtempSync(join(tmpdir(), "pgi-"));
     mkdirSync(join(root, "v17"));

@@ -1,5 +1,5 @@
 import { execa } from "execa";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -82,16 +82,67 @@ export class EmbeddedPostgres {
     if (this.proc && (this.proc.state === "running" || this.proc.state === "starting")) {
       throw new Error(`${this.opts.name} already ${this.proc.state}`);
     }
+    this.removeStalePidFile(); // synchronous by design — see the method's comment (atomic guard→claim)
     this.proc = new ManagedProcess({
       name: this.opts.name,
       bin: join(this.pgDir, "bin", "postgres"),
-      args: ["-D", this.opts.dataDir, "-p", String(this.opts.port)],
+      // Deviation from oracle (postgres/mod.rs launches `-D <dir> -p <port>`, leaving the compiled
+      // default socket dir /tmp): disable the unix socket entirely. storcon_db is reached ONLY over
+      // TCP 127.0.0.1 (connectionUri() + the storage_controller's --database-url), so the socket is
+      // dead weight — and it is a boot hazard. postgres writes `/tmp/.s.PGSQL.<port>.lock` recording
+      // the SAME postmaster PID as postmaster.pid, and its stale-lock check FATALs on that file with
+      // the identical live-PID heuristic. /tmp is the container writable layer (no tmpfs), so it
+      // PERSISTS across every same-container restart (docker kill+start, OOM, host reboot, compose up
+      // reusing the stopped container) — exactly the scenarios this fix targets. Removing only
+      // postmaster.pid (below) would just relocate the boot FATAL onto this socket lock; disabling
+      // the socket removes the whole file class permanently. (Compute sockets have the same exposure
+      // — tracked separately; they are compute_ctl/ComputeSpec-configured, not launched here.)
+      args: ["-D", this.opts.dataDir, "-p", String(this.opts.port), "-c", "unix_socket_directories="],
       env: { LD_LIBRARY_PATH: join(this.pgDir, "lib") },
       // oracle: readiness needle "connections" ("ready to accept connections")
       readyNeedle: "connections",
       onLine: (l) => this.opts.onLine?.(l),
     });
     await this.proc.start();
+  }
+
+  // An unclean container stop (docker kill / OOM / host reboot — anything that skips the SIGTERM
+  // shutdown path, under which stop() below lets postgres exit cleanly and delete its own pid file)
+  // leaves a stale postmaster.pid in the persistent data dir. On the next boot, container PID reuse
+  // can make the dead postmaster's recorded PID look alive to postgres's stale-lock heuristic, so
+  // postgres refuses to start at all ("lock file \"postmaster.pid\" already exists" → FATAL → the
+  // daemon's boot fails). Left unfixed this is intermittent — a fresh data dir's initdb burns many
+  // PIDs so the recorded PID often outlives the next (initdb-free) boot's range and postgres self-
+  // heals, but once two consecutive boots both skip initdb the low recorded PID gets reused and the
+  // FATAL bites (observed live 2026-07-04, after the sibling stale-/data/.lock guard was cleared).
+  //
+  // Remove it before launching: by this point the daemon has claimed the data dir via the
+  // exclusive-create /data/.lock marker (index.ts creates it `wx` before EngineRuntime is even
+  // constructed — a marker file, not a held fd), and the running-guard in start() rules out a live
+  // child of THIS instance, so nothing can legitimately be using the data dir — a guarded unlink is
+  // safe. Mirrors the crash-recovery cleanups DevDB already runs on boot for the .lock marker
+  // (index.ts) and orphaned compute dirs (state/reconcile.ts sweepComputesDir). No oracle citation:
+  // neon_local/the oracle never touches postmaster.pid anywhere, so there is no payload to port — a
+  // plain unlink is the sanctioned fallback (AGENTS.md).
+  //
+  // This safety argument leans on start() being BOOT-ONLY: it is called once, from EngineRuntime
+  // .start(), and a failed boot exits the process (there is no in-process restart path today). A
+  // future crash-restart feature would have to re-derive safety — a crash-orphaned backend can still
+  // hold shared memory, and postmaster.pid is postgres's OWN interlock for detecting that, so blindly
+  // deleting it there could let a second postmaster corrupt shared state.
+  //
+  // SYNCHRONOUS on purpose: start()'s running-guard and its `this.proc = new ManagedProcess()` claim
+  // must stay atomic. An `await` between them would let two concurrent start() calls both pass the
+  // guard while `this.proc` is still null and then race two postmasters onto one data dir/port. A
+  // sync unlink keeps the first real suspension point inside proc.start() (which has already set
+  // "starting"), exactly as before this cleanup was added.
+  private removeStalePidFile(): void {
+    const pidFile = join(this.opts.dataDir, "postmaster.pid");
+    if (!existsSync(pidFile)) return; // clean shutdowns delete it themselves — nothing to do
+    rmSync(pidFile, { force: true });
+    // Surface WHY a lock file just vanished — routed through the same onLine sink every storcon_db
+    // line uses (→ docker logs via `[storcon_db] …` and LogsService's `daemon:storcon_db` channel).
+    this.opts.onLine?.("devdb: removed a stale postmaster.pid from an unclean prior shutdown before start");
   }
 
   async stop(): Promise<void> {
