@@ -9,7 +9,18 @@ import { StatusChip, ContextChip } from "./chips.js";
 export function BranchNode(a: { data: { branch: BranchDto; onSelect: (id: string) => void } }) {
   const b = a.data.branch;
   return (
-    <Card withBorder padding="xs" w={230} onClick={() => a.data.onSelect(b.id)} style={{ cursor: "pointer" }}>
+    <Card
+      withBorder
+      padding="xs"
+      w={230}
+      onClick={() => a.data.onSelect(b.id)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); a.data.onSelect(b.id); }
+      }}
+      style={{ cursor: "pointer" }}
+    >
       <Handle type="target" position={Position.Top} style={{ visibility: "hidden" }} />
       <Text ff="monospace" fw={600} size="sm" truncate>{b.name}</Text>
       <Group gap={4} mt={4}>

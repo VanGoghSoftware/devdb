@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { renderApp } from "./render.js";
 import { CanvasView } from "../src/tree/CanvasView.js";
 import type { BranchDto } from "@devdb/shared";
@@ -28,6 +29,27 @@ describe("CanvasView", () => {
     renderApp(<CanvasView branches={[b("main", null), b("dev", "main")]} onSelect={onSelect} />);
     screen.getByText("dev").click();
     expect(onSelect).toHaveBeenCalledWith("dev");
+  });
+
+  // Fix 4 (P4): BranchNode's Card is click-to-select but was mouse-only — a11y parity with the
+  // RailsView row fix (role="button" + tabIndex + Enter/Space onKeyDown). Focus the node and
+  // activate it via keyboard only, no .click().
+  it("activating a node via Enter on the keyboard selects the branch", async () => {
+    const onSelect = vi.fn();
+    renderApp(<CanvasView branches={[b("main", null), b("dev", "main")]} onSelect={onSelect} />);
+    const node = screen.getByText("dev").closest('[role="button"]') as HTMLElement;
+    node.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(onSelect).toHaveBeenCalledWith("dev");
+  });
+
+  it("activating a node via Space on the keyboard selects the branch", async () => {
+    const onSelect = vi.fn();
+    renderApp(<CanvasView branches={[b("main", null), b("dev", "main")]} onSelect={onSelect} />);
+    const node = screen.getByText("main").closest('[role="button"]') as HTMLElement;
+    node.focus();
+    await userEvent.keyboard(" ");
+    expect(onSelect).toHaveBeenCalledWith("main");
   });
 
   it("renders status and context chips on nodes", () => {

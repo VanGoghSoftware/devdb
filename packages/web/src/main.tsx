@@ -9,16 +9,18 @@ import "@mantine/notifications/styles.css";
 import "@xyflow/react/dist/style.css";
 import { router } from "./routes.js";
 import { theme } from "./theme.js";
+import { THEME_STORAGE_KEY } from "./prefs.js";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true } },
 });
 
 // Single source of truth for the color scheme: Mantine's own manager reads/writes the SAME
-// `devdb.theme` key that prefs.ts's getThemePref/setThemePref use, so the shell's toggle (which
-// calls Mantine's setColorScheme) and prefs.ts never diverge. defaultColorScheme="auto" is only
-// the fallback used when the key is absent from storage.
-const colorSchemeManager = localStorageColorSchemeManager({ key: "devdb.theme" });
+// key prefs.ts's getThemePref/setThemePref use (imported from prefs.ts as THEME_STORAGE_KEY, so
+// the literal exists in exactly one place), so the shell's toggle (which calls Mantine's
+// setColorScheme) and prefs.ts never diverge. defaultColorScheme="auto" is only the fallback used
+// when the key is absent from storage.
+const colorSchemeManager = localStorageColorSchemeManager({ key: THEME_STORAGE_KEY });
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

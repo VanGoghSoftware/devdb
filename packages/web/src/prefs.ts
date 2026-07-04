@@ -3,7 +3,14 @@
 export type TreeView = "rails" | "canvas";
 export type ThemePref = "auto" | "light" | "dark";
 
-const KEYS = { defaultTreeView: "devdb.defaultTreeView", theme: "devdb.theme" } as const;
+// Single source of truth for the theme localStorage key literal — main.tsx's colorSchemeManager
+// imports this constant instead of duplicating the string. Previously the same literal was
+// hardcoded in both places (here and in main.tsx's colorSchemeManager({ key: "devdb.theme" })),
+// which meant an edit to one without the other would silently split the "live scheme" key from the
+// "persisted pref" key. Centralizing removes that drift risk entirely.
+export const THEME_STORAGE_KEY = "devdb.theme";
+
+const KEYS = { defaultTreeView: "devdb.defaultTreeView", theme: THEME_STORAGE_KEY } as const;
 
 // localStorage can throw (SecurityError) when storage is disabled, e.g. private/incognito modes
 // in some browsers. These getters run during render (e.g. Settings, and future startup reads),

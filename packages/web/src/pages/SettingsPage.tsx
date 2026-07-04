@@ -1,19 +1,20 @@
 import { Card, Divider, Group, SegmentedControl, Skeleton, Stack, Text, Title, useMantineColorScheme } from "@mantine/core";
 import { useState } from "react";
 import { useStatus } from "../api/hooks.js";
-import { getDefaultTreeView, getThemePref, setDefaultTreeView, setThemePref, type ThemePref, type TreeView } from "../prefs.js";
+import { getDefaultTreeView, setDefaultTreeView, type ThemePref, type TreeView } from "../prefs.js";
 
 export function SettingsPage() {
   const { data: status } = useStatus();
   const [view, setView] = useState<TreeView>(getDefaultTreeView());
-  const [themePref, setTheme] = useState<ThemePref>(getThemePref());
-  // Mantine's own colorSchemeManager (main.tsx, keyed to "devdb.theme") is the single source of
-  // truth for the LIVE color scheme — so the theme control below writes through setColorScheme,
-  // which both persists AND updates the running app immediately. setThemePref alone would only
-  // persist to prefs.ts's copy of the same key; Mantine's context wouldn't observe that write
-  // until the next full reload, leaving the live scheme stale. getThemePref() is used only to
-  // seed this control's initial display value.
-  const { setColorScheme } = useMantineColorScheme();
+  // Mantine's own colorSchemeManager (main.tsx, keyed to prefs.ts's THEME_STORAGE_KEY) is the
+  // single source of truth for the LIVE color scheme — so the theme control is driven DIRECTLY off
+  // useMantineColorScheme()'s live `colorScheme`, not a local useState seeded once from
+  // getThemePref(). A seeded-once local copy would go stale the moment any other consumer (e.g.
+  // the shell's top-bar toggle) changes the scheme while Settings stays mounted. onChange writes
+  // through setColorScheme only — it both persists (Mantine's manager writes localStorage itself)
+  // AND updates every live consumer immediately; calling prefs.ts's setThemePref alongside it would
+  // be a redundant second write to the same key.
+  const { colorScheme, setColorScheme } = useMantineColorScheme();
   return (
     <Stack maw={640}>
       <Title order={2}>Settings</Title>
@@ -24,7 +25,7 @@ export function SettingsPage() {
           <Stack gap={4} mt="xs">
             <Group justify="space-between"><Text c="dimmed">Version</Text><Text ff="monospace">{status.version}</Text></Group>
             <Group justify="space-between"><Text c="dimmed">Endpoint port range</Text><Text ff="monospace">{status.portRange.min} – {status.portRange.max}</Text></Group>
-            <Group justify="space-between"><Text c="dimmed">Durability</Text><Text>local ({status.storage})</Text></Group>
+            <Group justify="space-between"><Text c="dimmed">Durability</Text><Text>{status.storage === "none" ? "local" : status.storage}</Text></Group>
           </Stack>
         )}
       </Card>
@@ -43,8 +44,8 @@ export function SettingsPage() {
           <Group justify="space-between">
             <Text>Theme</Text>
             <SegmentedControl
-              value={themePref}
-              onChange={(v) => { setTheme(v as ThemePref); setThemePref(v as ThemePref); setColorScheme(v as ThemePref); }}
+              value={colorScheme}
+              onChange={(v) => setColorScheme(v as ThemePref)}
               data={[{ value: "auto", label: "auto" }, { value: "light", label: "light" }, { value: "dark", label: "dark" }]}
             />
           </Group>
