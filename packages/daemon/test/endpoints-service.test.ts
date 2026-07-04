@@ -392,6 +392,35 @@ describe("EndpointsService", () => {
     expect(f.builds.recordRun).toHaveBeenCalledWith(17, 10);
   });
 
+  // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): recordRun is a raise-only
+  // high-water write with the same SQLite-fault fallibility as any other persist. Before this fix
+  // it ran OUTSIDE the inner try/catch that guards the "running" persist — so a throwing recordRun
+  // skipped straight to the OUTER catch, which records "failed" but never calls computes.stop(),
+  // stranding the just-started (genuinely live) compute while the row claims failure. The start
+  // truly succeeded and the high-water is advisory, so a recordRun failure must be logged and
+  // swallowed — never allowed to flip a successful start to "failed" or trigger a teardown of a
+  // healthy compute.
+  it("a throwing builds.recordRun does not strand or fail the start — endpoint still ends up running, compute not stopped, error logged", async () => {
+    const { f, state, mainBranch, endpoints } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    vi.mocked(f.builds.recordRun).mockImplementation(() => {
+      throw new Error("sqlite busy — recordRun failed");
+    });
+
+    const detail = await endpoints.start(mainBranch.id);
+
+    expect(detail.endpointStatus).toBe("running");
+    expect(state.branches.byId(mainBranch.id)!.endpointStatus).toBe("running");
+    // The compute that computes.start() brought up must NOT be torn down — recordRun failing is
+    // advisory-only and must never trigger the running-persist-failure compensation path.
+    expect(f.computes.stop).not.toHaveBeenCalled();
+    expect(f.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining(`recordRun failed (non-fatal) for branch ${mainBranch.id}`),
+      expect.any(Error),
+    );
+  });
+
   // The validation gate (builds/validate.ts, a later task) calls startWithPgbin() to launch a
   // CANDIDATE build that isn't active yet — it must NOT touch the run high-water: recording it
   // would arm the downgrade guard against a build that may still fail its own gate. The override

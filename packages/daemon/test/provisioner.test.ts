@@ -413,6 +413,45 @@ describe("Provisioner", () => {
     expect(state.pgBuilds.byId(buildId)).toMatchObject({ status: "ready", active: false, error: null });
   });
 
+  // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): a failure AFTER activate()
+  // has already succeeded (here, recomposeDistrib throwing) must not strand the major with NO
+  // active build. Before this fix, the outer catch only marked the new row failed and rm'd its
+  // dir — the previously-active baked build stayed cleared (activate() unconditionally clears the
+  // major's old active before setting the new one), so pgbinFor(major) would 409 until the next
+  // boot's resolveActives(). The fix calls registry.resolveActives() in this failure path, which
+  // re-picks the newest ready build per major — excluding the now-failed new row — so the older
+  // ready (baked) build becomes active again.
+  it("post-activate failure (recomposeDistrib throws) restores the previously-active baked build — major not stranded", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked v17, will be seeded + active
+    const { oci } = fakeOci();
+    const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives(); // baked-v17 active
+    expect(registry.pgbinFor(17).buildId).toBe("baked-v17");
+
+    // activate() succeeds (no downgrade — baked has no minor probe conflict here); the failure
+    // happens strictly AFTER activation, in recomposeDistrib.
+    recomposeDistrib.mockRejectedValueOnce(new Error("recomposeDistrib: symlink farm rebuild failed"));
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    expect(row.error).toMatch(/symlink farm rebuild failed/);
+    expect(row.active).toBe(false);
+
+    // The major must not be stranded: the previously-active baked build is active again, and
+    // pgbinFor resolves it — not a 409.
+    const bakedRow = state.pgBuilds.byId("baked-v17")!;
+    expect(bakedRow.active).toBe(true);
+    expect(registry.pgbinFor(17).buildId).toBe("baked-v17");
+  });
+
   it("check(): isNew digest reported; updateAvailableFor exposes short digest; known digest → isNew false", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);

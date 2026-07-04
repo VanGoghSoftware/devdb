@@ -100,12 +100,6 @@ export class EndpointsService {
         branch, pgVersion: project.pgVersion, pgbinPath,
         onLine: (line) => this.deps.logs.ingest(`branch:${branch.id}:compute`, line),
       });
-      if (resolved) {
-        // Only for a non-override (real, ACTIVE-build) start — the gate's override start must
-        // never raise the high-water; see the override's own comment above.
-        const minor = Number(resolved.version.split(".")[1]);
-        this.deps.builds.recordRun(project.pgVersion, minor);
-      }
       try {
         this.setEndpointStatus(branch, { status: "running", port });
       } catch (persistErr) {
@@ -121,6 +115,23 @@ export class EndpointsService {
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           this.deps.logger.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure`, stopErr));
         throw persistErr;
+      }
+      // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): recordRun MUST run only
+      // AFTER the "running" persist has SUCCEEDED, and MUST be best-effort — swallowed here so its
+      // failure can never reach the outer catch (which would record "failed" for a start that
+      // genuinely succeeded, all while leaving the now-live compute stranded with no compensating
+      // computes.stop() call, since the outer catch doesn't do that). recordRun is a raise-only
+      // high-water write, advisory to the downgrade guard — losing one write is far cheaper than
+      // tearing down (or mis-reporting) a healthy compute over it.
+      if (resolved) {
+        // Only for a non-override (real, ACTIVE-build) start — the gate's override start must
+        // never raise the high-water; see the override's own comment above.
+        try {
+          const minor = Number(resolved.version.split(".")[1]);
+          this.deps.builds.recordRun(project.pgVersion, minor);
+        } catch (recordErr) {
+          this.deps.logger.error(`recordRun failed (non-fatal) for branch ${branch.id}`, recordErr);
+        }
       }
     } catch (e) {
       // Single "failed" recording point for startLocked: reached either directly (computes.start

@@ -148,6 +148,13 @@ export class Provisioner {
     // (preflight/resolveDigest/extract/detectVersion-mismatch), so the outer catch below never
     // tries to rm a ""/undefined path.
     const finalDirRef: { current: string | undefined } = { current: undefined };
+    // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): flipped true the instant
+    // registry.activate(id) succeeds (extractFixupAndGate below). activate() unconditionally
+    // clears the major's previously-active row before setting the new one — so a failure AFTER
+    // that point (recomposeDistrib throwing, currently the only step left) must re-resolve the
+    // major's active pointer in the outer catch, or the major is left with NO active ready build
+    // (the old one cleared, the new one about to be marked failed) until the next boot.
+    const activatedRef: { current: boolean } = { current: false };
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
       // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
@@ -185,7 +192,7 @@ export class Provisioner {
       const jobId = crypto.randomUUID();
       state.raw.prepare("INSERT INTO jobs (id, kind, status) VALUES (?, 'pg_build_pull', 'running')").run(jobId);
       try {
-        await this.extractFixupAndGate(id, major, tag, digest, tmpDir, finalDirRef);
+        await this.extractFixupAndGate(id, major, tag, digest, tmpDir, finalDirRef, activatedRef);
         jobStatus = state.pgBuilds.byId(id)?.status === "ready" ? "done" : "failed";
       } finally {
         state.raw.prepare("UPDATE jobs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
@@ -207,6 +214,17 @@ export class Provisioner {
       if (finalDirRef.current !== undefined) {
         await rm(finalDirRef.current, { recursive: true, force: true }).catch(() => {});
       }
+      // Fix round 1 (compensation gaps): a failure reaching here AFTER activate(id) already
+      // succeeded means the major's previously-active row was cleared (by activate()) but the new
+      // row — now marked failed above — never gets to serve as the replacement. Without this, the
+      // major has NO active ready build until the next boot's resolveActives() call. Re-resolving
+      // here re-picks the newest ready build per major (excluding the row just marked failed),
+      // restoring whatever was active before (e.g. the older/baked build) immediately, not just at
+      // next boot. Harmless to call when activation never happened (nothing to restore, but a
+      // resolve is a correct no-op re-affirmation of the untouched active pointer).
+      if (activatedRef.current) {
+        this.deps.registry.resolveActives();
+      }
     }
   }
 
@@ -215,7 +233,7 @@ export class Provisioner {
   // stuck in "downloading"/"validating" on an unexpected throw.
   private async extractFixupAndGate(
     id: string, major: number, tag: string, digest: string, tmpDir: string,
-    finalDirRef: { current: string | undefined },
+    finalDirRef: { current: string | undefined }, activatedRef: { current: boolean },
   ): Promise<void> {
     const { deps } = this;
     const { state } = deps;
@@ -281,6 +299,7 @@ export class Provisioner {
     // and the job failed.
     try {
       this.deps.registry.activate(id);
+      activatedRef.current = true; // from here on, a throw reaching runPipeline's catch must resolveActives()
       this.log(id, `activated ${major}.${minor}`);
     } catch (err) {
       if (err instanceof DevdbError && err.statusCode === 409) {
