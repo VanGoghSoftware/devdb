@@ -29,7 +29,7 @@ const projects: ProjectDto[] = [
 const mainBranch: BranchDto = {
   id: "b-main", projectId: "p1", parentBranchId: null, name: "main", slug: "main-s",
   timelineId: "t".repeat(32), endpointStatus: "stopped", endpointError: null, port: null,
-  connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
+  connectionString: null, jdbcUrl: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
   context: null, ancestorLsn: null, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z",
 };
 

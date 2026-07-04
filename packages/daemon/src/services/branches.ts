@@ -14,6 +14,7 @@ export type BranchDetail = BranchRow & {
   endpointError: string | null;
   port: number | null;
   connectionString: string | null;
+  jdbcUrl: string | null;
   lastRecordLsn: string | null;
   logicalSizeBytes: number | null;
   ancestorLsn: string | null;
@@ -51,6 +52,16 @@ export class BranchesService {
   // oracle: src/mgmt/model/branch.rs get_connection_string; no sslmode (no TLS in devdb)
   connectionString(branch: BranchRow, port: number): string {
     return `postgresql://postgres:${encodeURIComponent(branch.password)}@localhost:${port}/postgres`;
+  }
+
+  // JDBC URL for GUI clients (DataGrip/DBeaver). Differs from connectionString() deliberately:
+  // host 127.0.0.1 (docker/compose publishes endpoint ports on IPv4 loopback only, and `localhost`
+  // can resolve to the unpublished IPv6 ::1 → connection refused); creds as query params (JDBC URLs
+  // have no `user:pass@` userinfo — the libpq form mis-parses there, taking the username as the
+  // host); sslmode=disable (engine runs trust-mode plaintext, no TLS). Password percent-encoded as
+  // in connectionString().
+  jdbcUrl(branch: BranchRow, port: number): string {
+    return `jdbc:postgresql://127.0.0.1:${port}/postgres?user=postgres&password=${encodeURIComponent(branch.password)}&sslmode=disable`;
   }
 
   // oracle: src/mgmt/service/branch.rs:66-208 create()
@@ -150,6 +161,7 @@ export class BranchesService {
       endpointError: branch.endpointError,
       port,
       connectionString: status === "running" && port ? this.connectionString(branch, port) : null,
+      jdbcUrl: status === "running" && port ? this.jdbcUrl(branch, port) : null,
       lastRecordLsn,
       logicalSizeBytes,
       ancestorLsn,

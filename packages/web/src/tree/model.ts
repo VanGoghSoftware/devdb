@@ -98,7 +98,7 @@ const NODE_H = 96;
 // per the repo's no-`as any`/`as never` rule (filtered out of the output before anything reads it).
 const SYNTHETIC_ROOT: BranchDto = {
   id: "__root__", projectId: "__root__", parentBranchId: null, name: "__root__", slug: "__root__",
-  timelineId: "", endpointStatus: "stopped", endpointError: null, port: null, connectionString: null,
+  timelineId: "", endpointStatus: "stopped", endpointError: null, port: null, connectionString: null, jdbcUrl: null,
   lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui", context: null, ancestorLsn: null,
   createdAt: "", updatedAt: "",
 };

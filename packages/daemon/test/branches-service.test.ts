@@ -202,6 +202,26 @@ describe("BranchesService", () => {
       .toBe(`postgresql://postgres:${encodeURIComponent(mainBranch.password)}@localhost:54301/postgres`);
   });
 
+  it("jdbcUrl shape (127.0.0.1, creds as query params, sslmode=disable)", async () => {
+    const { branches, mainBranch } = await seeded();
+    // JDBC URLs have NO user:pass@ userinfo — creds are query params (the libpq form mis-parses in
+    // JDBC tools, taking the username as the host). Host is 127.0.0.1: Docker publishes the endpoint
+    // ports on IPv4 loopback only, and `localhost` can resolve to IPv6 ::1 (unpublished). sslmode=
+    // disable matches the engine's trust-mode plaintext. Password percent-encoded, same as connstring.
+    expect(branches.jdbcUrl(mainBranch, 54301))
+      .toBe(`jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=${encodeURIComponent(mainBranch.password)}&sslmode=disable`);
+  });
+
+  it("jdbcUrl percent-encodes a URL-hostile password (encoding is not a no-op) — broker P5", async () => {
+    const { branches, mainBranch } = await seeded();
+    // Fixture passwords are alphanumeric today, so a plain-password test would pass even without
+    // encodeURIComponent. Force the contract with query-special characters.
+    const hostile = { ...mainBranch, password: "p@ss&word=100%+x" };
+    expect(branches.jdbcUrl(hostile, 54301))
+      .toBe("jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=p%40ss%26word%3D100%25%2Bx&sslmode=disable");
+    expect(branches.jdbcUrl(hostile, 54301)).not.toContain("p@ss&word"); // raw specials never appear literally
+  });
+
   it("detail enriches with lsn/size from pageserver timeline_info and a connectionString when running", async () => {
     const { f, mainBranch, branches } = await seeded();
     vi.mocked(f.computes.statusOf).mockReturnValue("running");
@@ -213,6 +233,7 @@ describe("BranchesService", () => {
     expect(d.logicalSizeBytes).toBe(1234);
     expect(d.ancestorLsn).toBe("0/1");
     expect(d.connectionString).toBe(branches.connectionString(mainBranch, 54301));
+    expect(d.jdbcUrl).toBe(branches.jdbcUrl(mainBranch, 54301));
   });
 
   it("detail tolerates a pageserver blip on timeline_info instead of throwing", async () => {
@@ -231,6 +252,7 @@ describe("BranchesService", () => {
     // endpoint is stopped in this fixture, so connectionString is null regardless — the point of
     // this test is solely that the timeline_info rejection above did not propagate.
     expect(d.connectionString).toBeNull();
+    expect(d.jdbcUrl).toBeNull();
   });
 
   it("detail omits connectionString when running but the port isn't known yet", async () => {
@@ -239,6 +261,7 @@ describe("BranchesService", () => {
     vi.mocked(f.computes.portOf).mockReturnValue(null);
     const d = await branches.detail(mainBranch);
     expect(d.connectionString).toBeNull();
+    expect(d.jdbcUrl).toBeNull();
   });
 
   it("list returns detail-enriched rows for every branch in the project", async () => {

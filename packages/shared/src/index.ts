@@ -39,6 +39,9 @@ export interface BranchDto {
   endpointError: string | null;
   port: number | null;
   connectionString: string | null;
+  // JDBC URL for GUI clients (DataGrip/DBeaver): 127.0.0.1, creds as query params, sslmode=disable.
+  // null when the endpoint is stopped (same as connectionString).
+  jdbcUrl: string | null;
   lastRecordLsn: string | null;
   logicalSizeBytes: number | null;
   createdBy: "ui" | "api" | "mcp";

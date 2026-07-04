@@ -18,6 +18,7 @@ import type { BranchDto } from "@devdb/shared";
 const main: BranchDto = {
   id: "b-main", projectId: "p1", parentBranchId: null, name: "main", slug: "main-s", timelineId: "t".repeat(32),
   endpointStatus: "running", endpointError: null, port: 54301, connectionString: "postgresql://postgres:pw@localhost:54301/postgres",
+  jdbcUrl: "jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=pw&sslmode=disable",
   lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null, ancestorLsn: null,
   createdAt: "1", updatedAt: "1",
 };
@@ -26,7 +27,7 @@ const main: BranchDto = {
 // parent to prove the modal submits (rather than the stale first-render default).
 const child: BranchDto = {
   ...main, id: "b-child", parentBranchId: "b-main", name: "child", slug: "child-s",
-  endpointStatus: "stopped", port: null, connectionString: null,
+  endpointStatus: "stopped", port: null, connectionString: null, jdbcUrl: null,
 };
 
 function renderPage(route = "/projects/p1") {

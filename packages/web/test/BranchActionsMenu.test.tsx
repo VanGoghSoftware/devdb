@@ -18,12 +18,13 @@ import type { BranchDto } from "@devdb/shared";
 const childBranch: BranchDto = {
   id: "b-child", projectId: "p1", parentBranchId: "b-main", name: "feature", slug: "feature-s",
   timelineId: "t".repeat(32), endpointStatus: "stopped", endpointError: null, port: null,
-  connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
+  connectionString: null, jdbcUrl: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
   context: null, ancestorLsn: null, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z",
 };
 const runningChildBranch: BranchDto = {
   ...childBranch, id: "b-running", endpointStatus: "running", port: 54301,
   connectionString: "postgres://user@localhost:54301/main",
+  jdbcUrl: "jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=x&sslmode=disable",
 };
 const rootBranch: BranchDto = {
   ...childBranch, id: "b-root", parentBranchId: null, name: "main",

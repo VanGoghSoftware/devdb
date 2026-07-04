@@ -11,7 +11,7 @@ import type { BranchDto } from "@devdb/shared";
 function b(id: string, parent: string | null, over: Partial<BranchDto> = {}): BranchDto {
   return {
     id, projectId: "p1", parentBranchId: parent, name: id, slug: `${id}-s`, timelineId: "t".repeat(32),
-    endpointStatus: "stopped", endpointError: null, port: null, connectionString: null,
+    endpointStatus: "stopped", endpointError: null, port: null, connectionString: null, jdbcUrl: null,
     lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null, ancestorLsn: null,
     createdAt: id, updatedAt: id, ...over,
   };

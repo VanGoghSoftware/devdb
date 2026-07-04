@@ -9,6 +9,7 @@ const detail: BranchDetail = {
   createdAt: "2026-07-03T00:00:00.000Z", updatedAt: "2026-07-03T00:00:00.000Z",
   context: { agent: "claude", purpose: "x" },
   port: 54301, connectionString: "postgresql://postgres:SECRET@localhost:54301/postgres",
+  jdbcUrl: "jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=SECRET&sslmode=disable",
   lastRecordLsn: "0/1", logicalSizeBytes: 10, ancestorLsn: null,
 };
 
@@ -17,6 +18,7 @@ describe("toBranchDto", () => {
     const dto = toBranchDto(detail);
     expect("password" in dto).toBe(false);
     expect(dto.connectionString).toContain("SECRET"); // connstring is how the agent gets creds
+    expect(dto.jdbcUrl).toBe("jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=SECRET&sslmode=disable");
     expect(dto.context).toEqual({ agent: "claude", purpose: "x" });
     expect(dto.ancestorLsn).toBeNull();
   });

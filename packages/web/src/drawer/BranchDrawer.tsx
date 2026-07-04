@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActionIcon, Alert, Button, Card, Drawer, Group, Skeleton, Stack, Tabs, Text, TextInput, Title,
 } from "@mantine/core";
@@ -10,9 +10,18 @@ import { LogsTab } from "./LogsTab.js";
 import { RestoreTab } from "./RestoreTab.js";
 
 export function maskConnstring(conn: string): string {
-  // Mask the password segment of a URL's `//user:PASSWORD@` userinfo for ANY scheme, so a format
-  // shift (e.g. `postgres://` vs `postgresql://`) can never fail open and leak the password.
-  return conn.replace(/(:\/\/[^:@/]+:)[^@]*@/, "$1•••@");
+  // Mask the password for display in whichever form the string carries it, so neither can fail
+  // open and leak the password:
+  //  - libpq userinfo `://user:PASSWORD@` for ANY scheme (a `postgres://` vs `postgresql://` shift
+  //    must not matter), AND
+  //  - JDBC query param `?…&password=PASSWORD…` (JDBC URLs carry creds as params, not userinfo).
+  // Order matters (broker P4): mask the JDBC `?…&password=…` query param FIRST. A query password
+  // can legally contain `@`, and the userinfo pattern below is not bounded to the authority, so
+  // masking userinfo first could match THROUGH that `@` and leave a suffix visible. After the query
+  // pass no `@` remains in any query password, so the userinfo pass only masks a real `://user:pass@`.
+  return conn
+    .replace(/([?&]password=)[^&]*/gi, "$1•••")
+    .replace(/(:\/\/[^:@/]+:)[^@]*@/, "$1•••@");
 }
 
 export function BranchDrawer(a: { branchId: string | null; onClose: () => void }) {
@@ -22,13 +31,17 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
   const start = useStartEndpoint(); const stop = useStopEndpoint();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<null | "conn" | "jdbc">(null);
+  const copyTimer = useRef<number | undefined>(undefined);
 
   // Edit state (editing/draft) is component-local, not keyed by branch — without this reset, an
   // in-progress rename on one branch (e.g. a child) survives a drawer re-target to another branch
   // (e.g. the root), which would render the TextInput and let Enter fire `rename.mutate(rootId)`,
   // a forbidden path the daemon 400s. Reset whenever the observed branch identity changes.
-  useEffect(() => { setEditing(false); }, [a.branchId]);
+  // Reset both the rename edit state AND the copy feedback when the drawer re-targets a different
+  // branch — otherwise a lingering "copied" from the previous branch (or a still-pending timeout)
+  // could flash on the next one (broker P5).
+  useEffect(() => { setEditing(false); setCopied(null); }, [a.branchId]);
 
   // Manual copy (not Mantine's CopyButton/useClipboard): useClipboard's `copy` calls
   // `navigator.clipboard.writeText(value).then(...)` unconditionally — it requires writeText to
@@ -36,13 +49,16 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
   // component's own test) returns `undefined`, so `.then` throws synchronously. `await`ing the
   // call instead (mirrors BranchActionsMenu.tsx's existing copyConnstring pattern) tolerates both
   // a real Promise and a bare mock return, since `await undefined` is a no-op.
-  const copyConnstring = async (conn: string) => {
+  const copyValue = async (value: string, which: "conn" | "jdbc") => {
     try {
-      await navigator.clipboard.writeText(conn);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1000);
+      await navigator.clipboard.writeText(value);
+      setCopied(which);
+      // One managed timer: clear any pending reset so a fast conn→jdbc copy doesn't let the first
+      // timeout wipe the second's "copied" early (broker P5).
+      if (copyTimer.current !== undefined) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(null), 1000);
     } catch {
-      notifications.show({ color: "red", message: "Failed to copy connection string" });
+      notifications.show({ color: "red", message: "Failed to copy" });
     }
   };
 
@@ -55,6 +71,7 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
   }
 
   const conn = b.connectionString; // plain local binding: narrows `string | null` cleanly through the closures below
+  const jdbc = b.jdbcUrl; // paired with conn (both non-null iff the endpoint is running with a known port)
 
   return (
     <Drawer opened={a.branchId !== null} onClose={a.onClose} position="right" size="lg">
@@ -93,13 +110,24 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
           </Group>
         )}
 
-        {conn !== null ? (
-          <Group gap="xs" wrap="nowrap">
-            <Text ff="monospace" size="sm" truncate>{maskConnstring(conn)}</Text>
-            <Button size="compact-xs" variant="light" onClick={() => void copyConnstring(conn)}>
-              {copied ? "copied" : "copy"}
-            </Button>
-          </Group>
+        {conn !== null && jdbc !== null ? (
+          <Stack gap={4}>
+            <Group gap="xs" wrap="nowrap">
+              <Text ff="monospace" size="sm" truncate>{maskConnstring(conn)}</Text>
+              <Button size="compact-xs" variant="light" aria-label="copy connection string"
+                onClick={() => void copyValue(conn, "conn")}>
+                {copied === "conn" ? "copied" : "copy"}
+              </Button>
+            </Group>
+            <Group gap="xs" wrap="nowrap">
+              <Text c="dimmed" size="xs">JDBC</Text>
+              <Text ff="monospace" size="sm" truncate>{maskConnstring(jdbc)}</Text>
+              <Button size="compact-xs" variant="light" aria-label="copy JDBC URL"
+                onClick={() => void copyValue(jdbc, "jdbc")}>
+                {copied === "jdbc" ? "copied" : "copy"}
+              </Button>
+            </Group>
+          </Stack>
         ) : (
           <Group gap="xs">
             <Text size="sm" c="dimmed">Endpoint not running — no connection string.</Text>

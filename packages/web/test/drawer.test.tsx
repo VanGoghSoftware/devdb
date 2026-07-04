@@ -42,6 +42,7 @@ const branch: BranchDto = {
   id: "b1", projectId: "p1", parentBranchId: "b-main", name: "agent-fix", slug: "agent-fix-s",
   timelineId: "t".repeat(32), endpointStatus: "running", endpointError: null, port: 54303,
   connectionString: "postgresql://postgres:S3CRET@localhost:54303/postgres",
+  jdbcUrl: "jdbc:postgresql://127.0.0.1:54303/postgres?user=postgres&password=S3CRET&sslmode=disable",
   lastRecordLsn: "0/169AD58", logicalSizeBytes: 24117248, createdBy: "mcp",
   context: { agent: "claude", git_branch: "fix-1", purpose: "repro the bug" },
   ancestorLsn: "0/1690000", createdAt: "2026-07-03T10:00:00Z", updatedAt: "2026-07-03T10:00:00Z",
@@ -51,7 +52,7 @@ const branch: BranchDto = {
 // no parent and no connection secret to leak here, so it's kept minimal — only the fields the
 // root-guard tests touch matter.
 const rootBranch: BranchDto = {
-  ...branch, id: "b-root", parentBranchId: null, name: "main", connectionString: null,
+  ...branch, id: "b-root", parentBranchId: null, name: "main", connectionString: null, jdbcUrl: null,
 };
 
 // A second, distinct non-root branch (sibling of `branch`) for the stale-tab-state re-target test
@@ -75,6 +76,7 @@ describe("maskConnstring", () => {
     { name: "postgresql:// (standard scheme)", input: "postgresql://postgres:S3CRET@localhost:54303/postgres", password: "S3CRET" },
     { name: "postgres:// (short scheme — RED pre-fix: the old regex was anchored to `postgresql://` and left this unmasked)", input: "postgres://postgres:S3CRET@host:5432/db", password: "S3CRET" },
     { name: "password containing a colon", input: "postgresql://u:pa:ss@h:1/d", password: "pa:ss" },
+    { name: "JDBC query-param password (no userinfo)", input: "jdbc:postgresql://127.0.0.1:54303/postgres?user=postgres&password=S3CRET&sslmode=disable", password: "S3CRET" },
   ];
 
   it.each(cases)("masks the password for $name", ({ input, password }) => {
@@ -85,6 +87,13 @@ describe("maskConnstring", () => {
   it("leaves a no-password connstring unchanged (no userinfo secret to mask)", () => {
     expect(maskConnstring("postgresql://u@h:1/d")).toBe("postgresql://u@h:1/d");
   });
+
+  // broker P4: a JDBC query password containing '@' must not let the (authority-unbounded) userinfo
+  // regex leave a suffix visible. Assert the EXACT masked output, not just full-password absence.
+  it("masks a JDBC query password containing '@' with no leaked suffix (exact output)", () => {
+    expect(maskConnstring("jdbc:postgresql://127.0.0.1:54303/postgres?user=postgres&password=ab@cd&sslmode=disable"))
+      .toBe("jdbc:postgresql://127.0.0.1:54303/postgres?user=postgres&password=•••&sslmode=disable");
+  });
 });
 
 describe("BranchDrawer", () => {
@@ -94,8 +103,19 @@ describe("BranchDrawer", () => {
     renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />);
     expect(await screen.findByText(/postgresql:\/\/postgres:•••@localhost:54303/)).toBeInTheDocument();
     expect(screen.queryByText(/S3CRET/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: /copy/i }));
+    await userEvent.click(screen.getByRole("button", { name: /copy connection string/i }));
     expect(write).toHaveBeenCalledWith(branch.connectionString);
+  });
+
+  it("shows the masked JDBC url (127.0.0.1); copy writes the real one", async () => {
+    const write = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText: write } });
+    renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />);
+    // JDBC row: 127.0.0.1 host, password masked in the query param (never rendered in the clear).
+    expect(await screen.findByText(/jdbc:postgresql:\/\/127\.0\.0\.1:54303/)).toBeInTheDocument();
+    expect(screen.queryByText(/password=S3CRET/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /copy JDBC URL/i }));
+    expect(write).toHaveBeenCalledWith(branch.jdbcUrl);
   });
 
   it("renames inline through the pencil", async () => {

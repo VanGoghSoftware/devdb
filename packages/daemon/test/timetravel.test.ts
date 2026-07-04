@@ -26,7 +26,7 @@ function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetai
     stickyPort: null, endpointStatus: "running", endpointError: null,
     importStatus: "none", importError: null, createdBy: "api", context: null,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
-    port: 54300, connectionString: null, lastRecordLsn: null,
+    port: 54300, connectionString: null, jdbcUrl: null, lastRecordLsn: null,
     logicalSizeBytes: null, ancestorLsn: null,
     ...overrides,
   };

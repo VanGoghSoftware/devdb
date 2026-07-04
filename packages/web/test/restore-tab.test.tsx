@@ -20,6 +20,7 @@ const branch: BranchDto = {
   id: "b1", projectId: "p1", parentBranchId: "b-main", name: "agent-fix", slug: "agent-fix-s",
   timelineId: "t".repeat(32), endpointStatus: "running", endpointError: null, port: 54303,
   connectionString: "postgresql://postgres:S3CRET@localhost:54303/postgres",
+  jdbcUrl: "jdbc:postgresql://127.0.0.1:54303/postgres?user=postgres&password=S3CRET&sslmode=disable",
   lastRecordLsn: "0/169AD58", logicalSizeBytes: 24117248, createdBy: "mcp",
   context: { agent: "claude", git_branch: "fix-1", purpose: "repro the bug" },
   ancestorLsn: "0/1690000", createdAt: "2026-07-03T10:00:00Z", updatedAt: "2026-07-03T10:00:00Z",

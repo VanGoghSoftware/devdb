@@ -5,7 +5,7 @@ import { buildTree, railsLayout, canvasLayout, type TreeNode } from "../src/tree
 function b(id: string, parent: string | null, createdAt: string): BranchDto {
   return {
     id, projectId: "p1", parentBranchId: parent, name: id, slug: `${id}-slug`, timelineId: "t".repeat(32),
-    endpointStatus: "stopped", endpointError: null, port: null, connectionString: null,
+    endpointStatus: "stopped", endpointError: null, port: null, connectionString: null, jdbcUrl: null,
     lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null,
     ancestorLsn: null, createdAt, updatedAt: createdAt,
   };
