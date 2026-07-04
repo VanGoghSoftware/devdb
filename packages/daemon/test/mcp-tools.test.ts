@@ -1050,6 +1050,45 @@ describe("MCP read tools", () => {
         expect(firstLine(body)).not.toMatch(/project "/);
       });
 
+      // Fix round 1 (review of Task 11 commit cfec31c, P3): the pre-fix rendering derived its
+      // per-major set from `registry.installedMajors()` — which only returns majors with a READY
+      // row (BuildRegistry.installedMajors(), registry.ts) — while `pull_pg_build`'s own progress
+      // text tells agents to "poll list_pg_builds" for status. A pull of a brand-new major (no
+      // prior ready row for it at all) is invisible in that poll loop the entire time it's
+      // downloading/validating, and stays invisible forever if it ends failed — the self-service
+      // "add a major" flow silently looks like it never started. Fixture: PG 18 has ONLY a
+      // `downloading` row and a `failed` row — deliberately NOT in `installedMajors()` (mocked to
+      // `[16]` only, mirroring the real registry's contract of ready-only majors) but present in
+      // `registry.list()` (the DISTINCT-majors-across-ALL-rows source `list_pg_builds` must derive
+      // its set from instead). Both in-flight statuses must render, proving the tool no longer
+      // filters by installedMajors() before deciding which majors to even look at.
+      it("shows a major that has NO ready build yet (only downloading/failed rows) — not just majors in installedMajors()", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
+          fakeRow({ id: "dl-18-pulling", major: 18, minor: null, source: "downloaded", releaseTag: "latest", active: false, status: "downloading" }),
+          fakeRow({ id: "dl-18-bad", major: 18, minor: null, source: "downloaded", releaseTag: "9050", active: false, status: "failed", error: "gate: extension smoke test failed" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        // PG 18 appears at all (the RED-failing assertion pre-fix: absent entirely).
+        expect(body).toMatch(/PG 18/);
+        // No ready/active row for 18 — a clear "no active build yet" line, not a false "active ..."
+        // claim and not silently omitted.
+        expect(body).toMatch(/PG 18.*no active build/i);
+        // BOTH in-flight rows render as sublines — downloading and failed, not just ready ones.
+        expect(body).toMatch(/\[downloading\]/);
+        expect(body).toMatch(/\[failed\] release 9050/);
+        expect(body).toMatch(/gate: extension smoke test failed/);
+        // PG 16 (the installedMajors()-covered major) still renders normally alongside it.
+        expect(body).toMatch(/PG 16.*active 16\.9/);
+      });
+
       it("renders a failed build's subline with its error", async () => {
         h = await makeReadToolsHarness();
         vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
@@ -1181,6 +1220,24 @@ describe("MCP read tools", () => {
         expect(body).toMatch(/pull started/i);
         expect(body).toMatch(/list_pg_builds/);
         expect(body).toMatch(/downloading.*validating.*ready|status/i);
+      });
+
+      // Enhancement (Sonnet Minor, review of Task 11 commit cfec31c, fold): the progress line
+      // previously named ONLY the poll instruction (list_pg_builds) — this pins the added mention
+      // of GET /api/events as the non-polling alternative (Provisioner.publish() emits a
+      // `pg_builds` SSE event on every pipeline transition, provisioner.ts), alongside the
+      // pre-existing poll instruction (which must still be present, not replaced by this addition).
+      it("mentions GET /api/events as a non-polling alternative to list_pg_builds, alongside the poll instruction", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.provisioner.pull).mockResolvedValue({ buildId: "build-abc" });
+
+        const res = await h.call("pull_pg_build", { major: 16 });
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/list_pg_builds/); // poll instruction still present
+        expect(body).toMatch(/api\/events/);
+        expect(body).toMatch(/pg_builds/); // names the actual event type, not just the route
       });
 
       it("surfaces the provisioner's concurrent-pull 409 as an actionable error", async () => {

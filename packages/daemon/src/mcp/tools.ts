@@ -171,9 +171,28 @@ function renderBuildSubline(row: PgBuildRow): string {
   return `  [${row.status}] ${versionString(row)} ${originLabel}`;
 }
 
-// Renders one major's block: the active line (or a "no active build" line if none resolved),
-// then a subline per OTHER row for that major (active row is already named on the header line,
-// so it's excluded from the sublines to avoid saying the same build twice).
+// Fix round 1 (review of Task 11 commit cfec31c, P3): `others` is no longer guaranteed non-empty
+// when there's no active row — list_pg_builds now visits every major registry.list() knows about
+// (see its own call site below), including one whose ONLY rows are in-flight/failed, so the
+// no-active branch must say something more useful than a bare "no active build" (which reads as
+// "nothing is happening" even mid-pull). Prefers "pulling" when a downloading/validating row is
+// actually in flight (the common case right after pull_pg_build fires); falls back to "last pull
+// failed" when every other row for this major is failed (no pull in flight at all); "no active
+// build" alone remains the fallback for the (believed-impossible today, since seedBaked/adopt/pull
+// are the only writers and registry.list() only returns majors with >=1 row) case of a major with
+// literally no other rows to describe either.
+function noActiveSuffix(others: PgBuildRow[]): string {
+  if (others.some((r) => r.status === "downloading" || r.status === "validating")) return " yet (pulling)";
+  if (others.length > 0 && others.every((r) => r.status === "failed")) return " (last pull failed)";
+  return "";
+}
+
+// Renders one major's block: the active line (or a "no active build" line if none resolved — see
+// noActiveSuffix() above for how that line adapts to in-flight/failed-only majors), then a subline
+// per OTHER row for that major (active row is already named on the header line, so it's excluded
+// from the sublines to avoid saying the same build twice). `rows` may include EVERY status
+// (ready/downloading/validating/failed) for this major — not just ready ones — so every row still
+// gets a subline via renderBuildSubline() regardless of status.
 function renderMajorBlock(major: number, rows: PgBuildRow[], degraded: boolean, updateAvailable: string | null): string {
   const active = rows.find((r) => r.active && r.status === "ready") ?? null;
   const others = rows.filter((r) => r !== active);
@@ -184,7 +203,7 @@ function renderMajorBlock(major: number, rows: PgBuildRow[], degraded: boolean, 
   lines.push(
     active
       ? `PG ${major} — active ${versionString(active)} (${active.source}, release ${active.releaseTag})`
-      : `PG ${major} — no active build`,
+      : `PG ${major} — no active build${noActiveSuffix(others)}`,
   );
   for (const row of others) lines.push(renderBuildSubline(row));
   if (updateAvailable) lines.push(`updates: PG ${major} → ${updateAvailable}`);
@@ -460,14 +479,24 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
   // get_status above — they open with an ad hoc "[devdb] ..." header, not contextLine() (which
   // requires naming a project).
   server.registerTool("list_pg_builds", {
-    description: "List every installed Postgres build, grouped by major version: which one is active, every other ready/failed build, degraded-downgrade warnings, and any update news from a prior check_pg_updates call.",
+    description: "List every Postgres build, grouped by major version: which one is active, every other ready/downloading/validating/failed build, degraded-downgrade warnings, and any update news from a prior check_pg_updates call.",
     inputSchema: {},
   }, guard("list_pg_builds", deps, async () => {
-    const majors = deps.registry.installedMajors();
-    if (majors.length === 0) {
+    // Fix round 1 (review of Task 11 commit cfec31c, P3): the major set MUST come from
+    // `registry.list()` (every row of every status) — NOT `registry.installedMajors()`, which only
+    // returns majors that have at least one READY row (BuildRegistry.installedMajors(), registry.ts
+    // — filters on `row.status === "ready"` before collecting the major). `pull_pg_build`'s own
+    // response text tells agents to "poll list_pg_builds" for progress; deriving the set from
+    // installedMajors() meant a pull of a brand-new major (no ready row for it yet) was invisible
+    // for the ENTIRE downloading/validating window, and stayed invisible forever if the pull ended
+    // failed — the self-service "add a major" flow looked like it silently never started. The REST
+    // route (GET /api/pg-builds, http/api.ts) and the web UI already read `registry.list()`
+    // directly for exactly this reason; this brings the MCP tool's rendering in line with them.
+    const rows = deps.registry.list();
+    if (rows.length === 0) {
       return text(`[devdb] no Postgres builds installed\nNext: pull_pg_build to install one.`);
     }
-    const rows = deps.registry.list();
+    const majors = [...new Set(rows.map((r) => r.major))].sort((a, b) => a - b);
     const degraded = new Set(deps.registry.degradedMajors());
     const blocks = majors.map((major) =>
       renderMajorBlock(
@@ -477,8 +506,11 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
         deps.provisioner.updateAvailableFor(major),
       ),
     );
+    // "tracked", not "installed": with the fix above, a major can appear here on the strength of a
+    // downloading/failed row alone, with nothing actually installed yet — "installed" would be a
+    // false claim for exactly the majors this fix makes visible.
     return text(
-      `[devdb] ${majors.length} Postgres major(s) installed as of ${nowIso()}\n${blocks.join("\n")}\n` +
+      `[devdb] ${majors.length} Postgres major(s) tracked as of ${nowIso()}\n${blocks.join("\n")}\n` +
       `Next: check_pg_updates to look for news, or activate_pg_build to switch a major's active build.`,
     );
   }));
@@ -517,9 +549,16 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     // branch id, not build id). Naming a REST path here that 404s would be a broken hint, so this
     // names the channel (useful today via list_pg_builds' polling loop, and for whichever future
     // route/UI surfaces it) without asserting a currently-working URL.
+    //
+    // Enhancement (Sonnet Minor, review of Task 11 commit cfec31c, fold): names GET /api/events as
+    // the non-polling alternative — Provisioner.publish() (provisioner.ts, its own doc comment at
+    // the top of the class names this same route as the intended alternative to polling) emits a
+    // `pg_builds` invalidation event on EVERY pipeline transition (downloading -> validating ->
+    // ready/failed, and activate), so a caller that would rather watch an SSE stream than poll
+    // list_pg_builds on a timer has a real route to do that with, not just the poll instruction.
     return text(
       `pull started (build ${buildId}). Poll list_pg_builds — status downloading → validating → ready (auto-activates).\n` +
-      `Progress: daemon logs channel pgbuild:${buildId}.`,
+      `Progress: daemon logs channel pgbuild:${buildId}. Or watch GET /api/events for a "pg_builds" event instead of polling.`,
     );
   }));
 
