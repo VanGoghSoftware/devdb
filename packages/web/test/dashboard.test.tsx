@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, waitForElementToBeRemoved } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "./render.js";
 import { DashboardPage } from "../src/pages/DashboardPage.js";
@@ -47,6 +47,19 @@ describe("DashboardPage", () => {
     expect(screen.getByText(/PG 17/)).toBeInTheDocument();
   });
 
+  it("derives the storage chip from data.storage instead of hardcoding it", async () => {
+    vi.mocked(api.status).mockResolvedValue({ ...status, storage: "s3" });
+    renderApp(<DashboardPage />);
+    expect(await screen.findByText(/s3 storage/i)).toBeInTheDocument();
+    expect(screen.queryByText(/local storage/i)).not.toBeInTheDocument();
+  });
+
+  it("links each project card to its detail route", async () => {
+    renderApp(<DashboardPage />);
+    const link = await screen.findByRole("link", { name: /shop-api/i });
+    expect(link.getAttribute("href")).toBe("/projects/p1");
+  });
+
   it("shows a degraded banner when unhealthy", async () => {
     vi.mocked(api.status).mockResolvedValue({ ...status, healthy: false, engine: { pageserver: { state: "failed", pid: null } } });
     renderApp(<DashboardPage />);
@@ -62,7 +75,58 @@ describe("DashboardPage", () => {
     // TanStack Query v5's mutation executor always calls mutationFn(variables, mutationFnContext) —
     // the 2nd arg ({ client, meta, mutationKey }) is Query's own resumable-mutations context, not
     // something useApiMutation adds (verified in @tanstack/query-core@5.101.2's mutation.ts#execute).
-    // Assert on the first call argument only; toHaveBeenCalledWith would require matching both.
-    await waitFor(() => expect(vi.mocked(api.projects.create).mock.calls[0]?.[0]).toEqual({ name: "billing", pgVersion: 17 }));
+    // Assert on the call's first argument only; toHaveBeenCalledWith would require matching both.
+    // Use the LAST call, not calls[0]: vite.config.ts sets no clearMocks/restoreMocks, so this
+    // mock's call history accumulates across every it() in the file that touches api.projects.create.
+    await waitFor(() => expect(vi.mocked(api.projects.create).mock.calls.at(-1)?.[0]).toEqual({ name: "billing", pgVersion: 17 }));
+  });
+
+  it("drives pgVersion from a non-default Select option and closes the modal on success", async () => {
+    vi.mocked(api.projects.create).mockResolvedValue({ project: projects[0]!, mainBranch });
+    renderApp(<DashboardPage />);
+    await userEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    await userEvent.type(await screen.findByLabelText(/name/i), "reporting");
+
+    // Mantine Select renders a read-only combobox <input>; findByLabelText is ambiguous here
+    // because the (closed, portalled) options listbox shares the same aria-labelledby as the
+    // input, so target the input specifically via its accessible role instead.
+    await userEvent.click(await screen.findByRole("combobox", { name: /postgresql version/i }));
+    // Mantine's Select dropdown (a Popover) is positioned via Floating UI, which needs real
+    // getBoundingClientRect/ResizeObserver measurements to flip its wrapper off `display: none` —
+    // jsdom has no layout engine, so that measurement pass never resolves and the wrapper stays
+    // `display: none` even though aria-expanded is true and the options are fully in the DOM
+    // (verified by waiting 2s of real time in isolation: it never flips). `{ hidden: true }` tells
+    // testing-library to include display:none-hidden elements in its accessible-role search; the
+    // resulting element is a real, clickable node and clicking it does update the Select's value.
+    await userEvent.click(await screen.findByRole("option", { name: "PG 14", hidden: true }));
+
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    // Last call, not calls[0] — see the no-clearMocks note on the sibling create test above.
+    await waitFor(() =>
+      expect(vi.mocked(api.projects.create).mock.calls.at(-1)?.[0]).toEqual({ name: "reporting", pgVersion: 14 }),
+    );
+
+    // Modal closed on success — the Name field (only present while the modal is mounted/open) is gone.
+    await waitForElementToBeRemoved(() => screen.queryByLabelText(/name/i));
+  });
+
+  it("guards project deletion behind window.confirm", async () => {
+    vi.mocked(api.projects.delete).mockResolvedValue(undefined);
+    renderApp(<DashboardPage />);
+    const confirmSpy = vi.spyOn(window, "confirm");
+
+    await userEvent.click(await screen.findByLabelText(/actions for shop-api/i));
+    const deleteItem = await screen.findByRole("menuitem", { name: /delete project/i });
+
+    confirmSpy.mockReturnValueOnce(false);
+    await userEvent.click(deleteItem);
+    expect(api.projects.delete).not.toHaveBeenCalled();
+
+    confirmSpy.mockReturnValueOnce(true);
+    await userEvent.click(deleteItem);
+    // Same TanStack Query v5 mutationFn(variables, context) 2-arg shape as the create mutation
+    // above — assert on the call's first argument only, not toHaveBeenCalledWith("p1"). Use the
+    // last call (not calls[0]) for the same no-clearMocks reason noted on the create tests.
+    await waitFor(() => expect(vi.mocked(api.projects.delete).mock.calls.at(-1)?.[0]).toEqual("p1"));
   });
 });

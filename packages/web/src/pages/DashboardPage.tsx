@@ -23,7 +23,7 @@ function EngineStrip() {
             {name}: {p.state}
           </Badge>
         ))}
-        <Badge variant="outline" color="gray">local storage</Badge>
+        <Badge variant="outline" color="gray">{data.storage === "none" ? "local" : data.storage} storage</Badge>
         <Badge variant="outline" color="gray">v{data.version}</Badge>
       </Group>
     </Stack>

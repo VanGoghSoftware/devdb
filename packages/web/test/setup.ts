@@ -41,3 +41,10 @@ globalThis.ResizeObserver = class {
   unobserve(): void {}
   disconnect(): void {}
 };
+
+// jsdom has no scrollIntoView (Element.prototype lacks it entirely — not a jsdom option,
+// unlike matchMedia/ResizeObserver above). Mantine's Combobox (which Select is built on) calls
+// it on the active/selected option every time the option list opens or the selection moves, so
+// any test that opens a Mantine Select/Autocomplete/etc. throws `scrollIntoView is not a
+// function` without this stub.
+Element.prototype.scrollIntoView = function scrollIntoView(): void {};
