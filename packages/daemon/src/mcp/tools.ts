@@ -5,6 +5,7 @@ import { PACKAGE_VERSION } from "../http/api.js";
 import type { ToolCtx } from "./server.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
+import type { PgBuildRow } from "../state/repos.js";
 import { text, errorResult, contextLine, nowIso, type ToolResult } from "./format.js";
 
 type BranchDto = ReturnType<typeof toBranchDto>;
@@ -147,6 +148,47 @@ async function startNewBranchOrPartialSuccess(
       ),
     };
   }
+}
+
+// Task 11 (dynamic-pg-builds): "16.9" when a minor is known, "16.x" while still downloading/
+// unknown — same fallback dto.ts's toPgBuildDto uses for the wire DTO's `version` field, kept
+// consistent here so an agent sees the identical string whether it reads the REST DTO or this
+// tool's text.
+function versionString(row: PgBuildRow): string {
+  return row.minor === null ? `${row.major}.x` : `${row.major}.${row.minor}`;
+}
+
+// One subline per non-active build row: "[ready] 16.9 baked" / "[ready] 16.10 release 9124" /
+// "[failed] release 9101: gate: …". Baked rows render "baked" (there's no meaningful release tag
+// to show — registry.ts seeds them with releaseTag: "baked"); downloaded rows render
+// "release <tag>" so an agent can tell which OCI tag a given build came from (the same releaseTag
+// field the REST DTO exposes, see dto.ts's toPgBuildDto doc comment).
+function renderBuildSubline(row: PgBuildRow): string {
+  const originLabel = row.source === "baked" ? "baked" : `release ${row.releaseTag}`;
+  if (row.status === "failed") {
+    return `  [failed] ${originLabel}: ${row.error ?? "unknown error"}`;
+  }
+  return `  [${row.status}] ${versionString(row)} ${originLabel}`;
+}
+
+// Renders one major's block: the active line (or a "no active build" line if none resolved),
+// then a subline per OTHER row for that major (active row is already named on the header line,
+// so it's excluded from the sublines to avoid saying the same build twice).
+function renderMajorBlock(major: number, rows: PgBuildRow[], degraded: boolean, updateAvailable: string | null): string {
+  const active = rows.find((r) => r.active && r.status === "ready") ?? null;
+  const others = rows.filter((r) => r !== active);
+  const lines: string[] = [];
+  if (degraded) {
+    lines.push(`⚠ PG ${major} is running BELOW its last-run minor — re-pull to clear`);
+  }
+  lines.push(
+    active
+      ? `PG ${major} — active ${versionString(active)} (${active.source}, release ${active.releaseTag})`
+      : `PG ${major} — no active build`,
+  );
+  for (const row of others) lines.push(renderBuildSubline(row));
+  if (updateAvailable) lines.push(`updates: PG ${major} → ${updateAvailable}`);
+  return lines.join("\n");
 }
 
 export function registerTools(server: McpServer, ctx: ToolCtx): void {
@@ -407,6 +449,116 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     return text(
       `${contextLine({ project: p.name, branch: dto.name })}\n${body}\n` +
       `Next: verify the restored data.`,
+    );
+  }));
+
+  // Task 11 (dynamic-pg-builds): the four pg-builds tools — agents self-serve a missing major or
+  // a newer minor without a human touching the REST API/UI. Deliberately NO MCP delete tool: the
+  // spec keeps infra-destructive operations (removing a build from disk) human-only; an agent
+  // that wants a build gone has no MCP path to force it, only DELETE /api/pg-builds/:id via a
+  // human or the web UI. None of these four tools has a project/branch scope, so — like
+  // get_status above — they open with an ad hoc "[devdb] ..." header, not contextLine() (which
+  // requires naming a project).
+  server.registerTool("list_pg_builds", {
+    description: "List every installed Postgres build, grouped by major version: which one is active, every other ready/failed build, degraded-downgrade warnings, and any update news from a prior check_pg_updates call.",
+    inputSchema: {},
+  }, guard("list_pg_builds", deps, async () => {
+    const majors = deps.registry.installedMajors();
+    if (majors.length === 0) {
+      return text(`[devdb] no Postgres builds installed\nNext: pull_pg_build to install one.`);
+    }
+    const rows = deps.registry.list();
+    const degraded = new Set(deps.registry.degradedMajors());
+    const blocks = majors.map((major) =>
+      renderMajorBlock(
+        major,
+        rows.filter((r) => r.major === major),
+        degraded.has(major),
+        deps.provisioner.updateAvailableFor(major),
+      ),
+    );
+    return text(
+      `[devdb] ${majors.length} Postgres major(s) installed as of ${nowIso()}\n${blocks.join("\n")}\n` +
+      `Next: check_pg_updates to look for news, or activate_pg_build to switch a major's active build.`,
+    );
+  }));
+
+  const CheckPgUpdatesShape = { majors: z.array(PgVersionSchema).optional() };
+  server.registerTool("check_pg_updates", {
+    description: "Check the OCI registry for a newer 'latest' build per major (egress — hits the network). Populates list_pg_builds' trailing 'updates:' lines.",
+    inputSchema: CheckPgUpdatesShape,
+  }, guard("check_pg_updates", deps, async ({ majors }: z.infer<z.ZodObject<typeof CheckPgUpdatesShape>>) => {
+    const targets = majors ?? deps.registry.installedMajors();
+    const result = await deps.provisioner.check(targets);
+    const lines = Object.entries(result).map(
+      ([major, r]) => `  PG ${major}: ${r.isNew ? "new build available" : "up to date"} (${r.tag}@${r.digest.replace(/^sha256:/, "").slice(0, 12)})`,
+    );
+    return text(
+      `[devdb] checked ${targets.length} major(s) as of ${nowIso()}\n${lines.join("\n")}\n` +
+      `Next: pull_pg_build for any major reporting a new build.`,
+    );
+  }));
+
+  const PullPgBuildShape = { major: PgVersionSchema, tag: z.string().min(1).optional() };
+  server.registerTool("pull_pg_build", {
+    description: "Start pulling a Postgres build for a major (defaults to the 'latest' OCI tag). Async: returns immediately with the buildId — poll list_pg_builds for status.",
+    inputSchema: PullPgBuildShape,
+  }, guard("pull_pg_build", deps, async ({ major, tag }: z.infer<z.ZodObject<typeof PullPgBuildShape>>) => {
+    // Fire-and-return: the pipeline (extract/fixup/validate/auto-activate) runs after
+    // provisioner.pull() resolves its own synchronous "downloading row inserted" step — awaiting
+    // anything past that here would block this tool call for the full pull (up to the 90s
+    // validation-gate budget alone), the opposite of the documented immediate-return contract.
+    const { buildId } = await deps.provisioner.pull({ major, tag });
+    // "Progress: ... logs channel pgbuild:<id>" (not a REST path): provisioner.ts ingests pull
+    // progress to LogsService channel `pgbuild:${buildId}` (see its private log() helper), but no
+    // SSE route in http/api.ts currently serves that channel family — GET /api/daemon/logs/:component
+    // only allowlists the fixed engine-process component set (daemonLogChannel), and
+    // GET /api/branches/:id/logs serves a DIFFERENT channel (`branch:<id>:compute`, keyed by
+    // branch id, not build id). Naming a REST path here that 404s would be a broken hint, so this
+    // names the channel (useful today via list_pg_builds' polling loop, and for whichever future
+    // route/UI surfaces it) without asserting a currently-working URL.
+    return text(
+      `pull started (build ${buildId}). Poll list_pg_builds — status downloading → validating → ready (auto-activates).\n` +
+      `Progress: daemon logs channel pgbuild:${buildId}.`,
+    );
+  }));
+
+  const ActivatePgBuildShape = { major: PgVersionSchema, version: z.string().regex(/^\d+\.\d+$/) };
+  server.registerTool("activate_pg_build", {
+    description: "Make a specific ready build the active one for its major (e.g. rolling back to an older minor). MCP activation is explicit agent intent, so a downgrade below the last-run minor is consented automatically — the response warns when that happens.",
+    inputSchema: ActivatePgBuildShape,
+  }, guard("activate_pg_build", deps, async ({ major, version }: z.infer<z.ZodObject<typeof ActivatePgBuildShape>>) => {
+    const candidates = deps.registry.list().filter((r) => r.major === major);
+    const target = candidates.find((r) => r.status === "ready" && versionString(r) === version);
+    if (!target) {
+      const available = candidates.filter((r) => r.status === "ready").map(versionString);
+      return errorResult(
+        `no ready build ${version} for PG ${major}` +
+        (available.length > 0 ? ` — available: ${available.join(", ")}` : ` — none ready; pull_pg_build first`),
+      );
+    }
+
+    // Determine downgrade-ness BEFORE calling activate: the SAME predicate BuildRegistry.activate
+    // uses internally (registry.ts) against the pg_majors high-water mark — reached directly via
+    // deps.state (Deps.state is the same StateDb instance the registry itself holds), since
+    // BuildRegistry has no public lastRunMinor passthrough. Checked pre-activation because a
+    // successful downgrade-with-consent clears the degraded flag as a side effect, so the
+    // pre-activation state is the only point at which "was this actually a downgrade" is still
+    // observable.
+    const lastRun = deps.state.pgMajors.lastRunMinor(major);
+    const isDowngrade = target.minor !== null && lastRun !== null && target.minor < lastRun;
+
+    // MCP activation is explicit agent intent (the agent named an exact major+version to switch
+    // to) — consent is implied by making the call at all, unlike the REST route (which requires
+    // an explicit `consented` body flag from its caller). See registry.ts's activate() for the
+    // 409-without-consent guard this bypasses.
+    const row = await deps.provisioner.activate(target.id, { consented: true });
+    const warning = isDowngrade
+      ? ` — WARNING: rollback below last-run ${major}.${lastRun} — extension-catalog downgrades are forward-only; see README §Postgres builds`
+      : "";
+    return text(
+      `[devdb] activated ${versionString(row)} for PG ${major}${warning}\n` +
+      `Next: list_pg_builds to confirm, or restart any running endpoint on this major to pick it up.`,
     );
   }));
 }

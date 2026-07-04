@@ -94,6 +94,29 @@ export function fakes(): {
   return { storcon, pageserver, safekeeper, computes, builds, logger };
 }
 
+// Task 11 (dynamic-pg-builds): typed vi.fn() fakes for BuildRegistry/Provisioner — same narrowly-
+// scoped-cast rationale as api.test.ts's own fakeRegistry()/fakeProvisioner() (Deps.registry/
+// Deps.provisioner are typed against the CONCRETE classes, which carry private fields; only the
+// methods the MCP pg-builds tools actually call need to exist as real vi.fn()s). Exposed on the
+// harness (as `pgBuildFakes`) so a test can configure `list()`/`installedMajors()`/
+// `degradedMajors()` (list_pg_builds), `check()` (check_pg_updates), `pull()` (pull_pg_build), or
+// `activate()` (activate_pg_build) per-test, and assert calls were made with the right args —
+// mirroring engineFakes' own role for the branch-mutation tools above.
+function fakeRegistry(): BuildRegistry {
+  return {
+    list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []),
+    activate: vi.fn(), pgbinFor: vi.fn(), versionForPgbin: vi.fn(() => null),
+    assertRemovable: vi.fn(), gcCandidates: vi.fn(() => []),
+  } as unknown as BuildRegistry;
+}
+
+function fakeProvisioner(): Provisioner {
+  return {
+    check: vi.fn(async () => ({})), pull: vi.fn(async () => ({ buildId: "fake-build-id" })),
+    remove: vi.fn(), activate: vi.fn(), updateAvailableFor: vi.fn(() => null), recomposeDistrib: vi.fn(),
+  } as unknown as Provisioner;
+}
+
 export interface McpToolsHarness {
   deps: Deps;
   /**
@@ -104,6 +127,12 @@ export interface McpToolsHarness {
    * (`engineFakes.computes.start`), without needing a second, divergent set of fakes.
    */
   engineFakes: ReturnType<typeof fakes>;
+  /**
+   * Task 11: the SAME typed registry/provisioner fakes wired into `deps` — exposed so
+   * list_pg_builds/check_pg_updates/pull_pg_build/activate_pg_build tests can configure return
+   * values or assert calls, the same role engineFakes plays for the branch-mutation tools.
+   */
+  pgBuildFakes: { registry: BuildRegistry; provisioner: Provisioner };
   /**
    * Calls a registered tool by name through the REAL SDK dispatch path — a real `McpServer` with
    * `registerTools()` applied, connected to a real `Client` over `InMemoryTransport.
@@ -138,6 +167,9 @@ export async function makeReadToolsHarness(opts?: {
   const endpoints = new EndpointsService({ state, queue, branches, logs, ...f });
   const timetravel = new TimeTravelService({ state, queue, branches, endpoints, ...f });
   const sql = new SqlService({ branches, endpoints });
+  // Task 11: full typed registry/provisioner fakes (not the Task-10 bare stand-ins) — the four
+  // new pg-builds MCP tools call these directly, so tests need to configure their return values.
+  const pgBuildFakes = { registry: fakeRegistry(), provisioner: fakeProvisioner() };
 
   // Deps shape matches http/api.ts's Deps interface — the same object the real /mcp session
   // wiring (mcp/http.ts -> buildMcpServer) constructs a ToolCtx from, so registerTools sees an
@@ -152,13 +184,12 @@ export async function makeReadToolsHarness(opts?: {
     // assert guard() actually logged a non-DevdbError failure through THIS instance, not just that
     // some logger somewhere was called.
     logger: f.logger,
-    // Task 10 (dynamic-pg-builds): registry/provisioner/computes are now required on Deps — no
-    // MCP read tool this harness drives touches a pg-builds route (those are REST-only per this
-    // task's brief; MCP pg-builds tool coverage, if any, is Task 11's job), so bare stand-ins are
-    // enough here. `computes` reuses the SAME typed ComputesApi fake (`f.computes`) already wired
-    // into every service above, rather than a second divergent one.
-    registry: { list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []) } as unknown as BuildRegistry,
-    provisioner: { updateAvailableFor: vi.fn(() => null) } as unknown as Provisioner,
+    // Task 11: full typed fakes (see fakeRegistry()/fakeProvisioner() above) — list_pg_builds/
+    // check_pg_updates/pull_pg_build/activate_pg_build call these directly. `computes` reuses the
+    // SAME typed ComputesApi fake (`f.computes`) already wired into every service above, rather
+    // than a second divergent one.
+    registry: pgBuildFakes.registry,
+    provisioner: pgBuildFakes.provisioner,
     computes: f.computes,
     services: { projects, branches, endpoints, timetravel, sql },
   };
@@ -175,6 +206,7 @@ export async function makeReadToolsHarness(opts?: {
   return {
     deps,
     engineFakes: f,
+    pgBuildFakes,
     async call(name, args) {
       // callTool()'s declared return type is a union of CallToolResult (content: [...]) and the
       // experimental task-based {toolResult: ...} shape (only reachable by passing a `task` param

@@ -1008,4 +1008,258 @@ describe("MCP read tools", () => {
       expect(body).not.toMatch(/FAKE/); // never the caller-spoofed one
     });
   });
+
+  // Task 11: the four pg-builds MCP tools — list_pg_builds/check_pg_updates/pull_pg_build/
+  // activate_pg_build — so an agent can self-serve a missing major or a newer minor without a
+  // human touching the REST API. NO MCP delete tool exists (spec: infra-destructive stays human).
+  describe("pg-builds tools", () => {
+    // Minimal PgBuildRow fixture builder — mirrors the real interface (state/repos.ts) so
+    // list_pg_builds' rendering logic is exercised against realistic row shapes, not a
+    // hand-wavy partial.
+    function fakeRow(a: Partial<import("../src/state/repos.js").PgBuildRow> & { id: string; major: number }): import("../src/state/repos.js").PgBuildRow {
+      return {
+        minor: null, source: "downloaded", releaseTag: "latest", imageDigest: "", path: `/data/pg/v${a.major}/x`,
+        status: "ready", active: false, sizeBytes: null, error: null, createdAt: "2026-07-01T00:00:00.000Z",
+        ...a,
+      };
+    }
+
+    describe("list_pg_builds", () => {
+      it("renders an active line, per-build sublines, and does not open with a project context line (no project scope)", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: false, status: "ready" }),
+          fakeRow({ id: "dl-16-abc", major: 16, minor: 10, source: "downloaded", releaseTag: "9124", active: true, status: "ready" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        // active line names the major, active version, source, and release tag
+        expect(body).toMatch(/PG 16.*active 16\.10/);
+        expect(body).toMatch(/downloaded/);
+        expect(body).toMatch(/9124/);
+        // the non-active baked row renders as a subline
+        expect(body).toMatch(/\[ready\] 16\.9/);
+        expect(body).toMatch(/baked/);
+        // no project/branch scope — this tool has none, so it must not open with contextLine()'s
+        // project-naming shape the way every project-scoped tool does.
+        expect(firstLine(body)).not.toMatch(/project "/);
+      });
+
+      it("renders a failed build's subline with its error", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
+          fakeRow({ id: "dl-16-bad", major: 16, minor: null, source: "downloaded", releaseTag: "9101", active: false, status: "failed", error: "gate: extension smoke test failed" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/\[failed\] release 9101/);
+        expect(body).toMatch(/gate: extension smoke test failed/);
+      });
+
+      it("prefixes a degraded major with a warning line", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([16]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/⚠.*PG 16.*BELOW.*last-run/i);
+        expect(body).toMatch(/re-pull/i);
+      });
+
+      it("trails with an updates line when a prior check found news", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+        vi.mocked(h.pgBuildFakes.provisioner.updateAvailableFor).mockImplementation(
+          (major: number) => (major === 16 ? "latest@ab12cd34ef56" : null),
+        );
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/updates: PG 16 → latest@ab12cd34ef56/);
+      });
+
+      it("with no installed majors, says so and hints at pull_pg_build", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        expect(firstText(res).toLowerCase()).toMatch(/pull_pg_build/);
+      });
+    });
+
+    describe("check_pg_updates", () => {
+      it("runs the provisioner check over the given majors and renders the isNew map", async () => {
+        h = await makeReadToolsHarness();
+        const checkSpy = vi.mocked(h.pgBuildFakes.provisioner.check).mockResolvedValue({
+          "16": { tag: "latest", digest: "sha256:" + "a".repeat(64), isNew: true, at: "2026-07-04T00:00:00.000Z" },
+          "17": { tag: "latest", digest: "sha256:" + "b".repeat(64), isNew: false, at: "2026-07-04T00:00:00.000Z" },
+        } as Awaited<ReturnType<typeof h.pgBuildFakes.provisioner.check>>);
+
+        const res = await h.call("check_pg_updates", { majors: [16, 17] });
+
+        expect(res.isError).toBeFalsy();
+        expect(checkSpy).toHaveBeenCalledWith([16, 17]);
+        const body = firstText(res);
+        expect(body).toMatch(/16/);
+        expect(body).toMatch(/17/);
+        expect(body.toLowerCase()).toMatch(/new|update/);
+      });
+
+      it("defaults majors to the currently-installed set when omitted", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([14, 15]);
+        const checkSpy = vi.mocked(h.pgBuildFakes.provisioner.check).mockResolvedValue({});
+
+        const res = await h.call("check_pg_updates", {});
+
+        expect(res.isError).toBeFalsy();
+        expect(checkSpy).toHaveBeenCalledWith([14, 15]);
+      });
+    });
+
+    describe("pull_pg_build", () => {
+      // provisioner.pull()'s OWN contract (provisioner.ts) is to resolve fast — it synchronously
+      // inserts the `downloading` row, then fires the real extract/fixup/validate/auto-activate
+      // pipeline WITHOUT awaiting it (`void this.runPipeline(...)`) before returning `{buildId}`.
+      // The tool's job is simply to await that already-fast promise and return its text — NOT to
+      // additionally poll registry.list() for a "ready" status before replying. Modeling
+      // "never awaits the pipeline" at the MCP-tool layer means: the tool call resolves as soon
+      // as the (fast) pull() promise resolves, without the tool itself reaching for
+      // registry.list()/registry.byId() to check whether the row has advanced past
+      // "downloading" — asserted here by never priming registry.list() at all and confirming the
+      // tool doesn't need it.
+      it("starts the pull and returns immediately with the poll instruction (does not consult registry.list for the row's progress)", async () => {
+        h = await makeReadToolsHarness();
+        const pullSpy = vi.mocked(h.pgBuildFakes.provisioner.pull).mockResolvedValue({ buildId: "build-abc" });
+        const listSpy = vi.mocked(h.pgBuildFakes.registry.list);
+
+        const res = await h.call("pull_pg_build", { major: 16 });
+
+        expect(res.isError).toBeFalsy();
+        expect(pullSpy).toHaveBeenCalledWith(expect.objectContaining({ major: 16 }));
+        expect(listSpy).not.toHaveBeenCalled(); // never consults progress — pull() itself is the whole call
+        expect(firstText(res)).toMatch(/build-abc/);
+      });
+
+      it("passes an optional tag through to the provisioner", async () => {
+        h = await makeReadToolsHarness();
+        const pullSpy = vi.mocked(h.pgBuildFakes.provisioner.pull).mockResolvedValue({ buildId: "build-123" });
+
+        const res = await h.call("pull_pg_build", { major: 16, tag: "9124" });
+
+        expect(res.isError).toBeFalsy();
+        expect(pullSpy).toHaveBeenCalledWith({ major: 16, tag: "9124" });
+        const body = firstText(res);
+        expect(body).toMatch(/build-123/);
+        expect(body).toMatch(/pull started/i);
+        expect(body).toMatch(/list_pg_builds/);
+        expect(body).toMatch(/downloading.*validating.*ready|status/i);
+      });
+
+      it("surfaces the provisioner's concurrent-pull 409 as an actionable error", async () => {
+        h = await makeReadToolsHarness();
+        const { DevdbError } = await import("../src/services/errors.js");
+        vi.mocked(h.pgBuildFakes.provisioner.pull).mockRejectedValue(
+          new DevdbError(409, "a build pull is already in progress"),
+        );
+
+        const res = await h.call("pull_pg_build", { major: 16 });
+
+        expect(res.isError).toBe(true);
+        expect(firstText(res)).toMatch(/already in progress/);
+      });
+    });
+
+    describe("activate_pg_build", () => {
+      it("activates the resolved ready row by major+version, calling provisioner.activate with consented:true", async () => {
+        h = await makeReadToolsHarness();
+        const row = fakeRow({ id: "dl-16-old", major: 16, minor: 9, source: "downloaded", releaseTag: "8464", status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
+
+        const res = await h.call("activate_pg_build", { major: 16, version: "16.9" });
+
+        expect(res.isError).toBeFalsy();
+        expect(activateSpy).toHaveBeenCalledWith("dl-16-old", { consented: true });
+        expect(firstText(res)).toMatch(/activated 16\.9/);
+      });
+
+      it("warns when the activation lowered the high-water (a rollback)", async () => {
+        h = await makeReadToolsHarness();
+        const row = fakeRow({ id: "dl-16-old", major: 16, minor: 9, source: "downloaded", releaseTag: "8464", status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
+        // Simulates registry's own last-run high-water via state.pgMajors — 16.10 has already run,
+        // so activating 16.9 is a downgrade.
+        h.deps.state.pgMajors.recordRun(16, 10);
+        vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
+
+        const res = await h.call("activate_pg_build", { major: 16, version: "16.9" });
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/rollback/i);
+        expect(body).toMatch(/16\.10/); // names the last-run version it fell below
+        expect(body.toLowerCase()).toMatch(/forward-only|downgrade/);
+      });
+
+      it("does not warn when activating at or above the high-water mark", async () => {
+        h = await makeReadToolsHarness();
+        const row = fakeRow({ id: "dl-16-new", major: 16, minor: 10, source: "downloaded", releaseTag: "9124", status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
+        h.deps.state.pgMajors.recordRun(16, 9);
+        vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
+
+        const res = await h.call("activate_pg_build", { major: 16, version: "16.10" });
+
+        expect(res.isError).toBeFalsy();
+        expect(firstText(res).toLowerCase()).not.toMatch(/rollback/);
+      });
+
+      it("unknown version -> errorResult listing available ready versions for that major", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", status: "ready", active: true }),
+          fakeRow({ id: "dl-16-new", major: 16, minor: 10, source: "downloaded", releaseTag: "9124", status: "ready", active: false }),
+          fakeRow({ id: "dl-16-bad", major: 16, minor: null, source: "downloaded", releaseTag: "9101", status: "failed", active: false }),
+        ]);
+
+        const res = await h.call("activate_pg_build", { major: 16, version: "16.99" });
+
+        expect(res.isError).toBe(true);
+        const body = firstText(res);
+        expect(body).toMatch(/16\.99/);
+        // lists the available READY versions (9/10), never the failed row (no minor/not ready).
+        expect(body).toMatch(/16\.9/);
+        expect(body).toMatch(/16\.10/);
+        expect(h.pgBuildFakes.provisioner.activate).not.toHaveBeenCalled();
+      });
+    });
+  });
 });
