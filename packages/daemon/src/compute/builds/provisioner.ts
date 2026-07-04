@@ -254,14 +254,41 @@ export class Provisioner {
       }
       // Fix round 1 (compensation gaps): a failure reaching here AFTER activate(id) already
       // succeeded means the major's previously-active row was cleared (by activate()) but the new
-      // row — now marked failed above — never gets to serve as the replacement. Without this, the
-      // major has NO active ready build until the next boot's resolveActives() call. Re-resolving
-      // here re-picks the newest ready build per major (excluding the row just marked failed),
-      // restoring whatever was active before (e.g. the older/baked build) immediately, not just at
-      // next boot. Harmless to call when activation never happened (nothing to restore, but a
-      // resolve is a correct no-op re-affirmation of the untouched active pointer).
+      // row — now marked failed above — never gets to serve as the replacement. Without recovery the
+      // major has NO active ready build until the next boot's resolveActives(); re-resolving here
+      // restores the older/baked build immediately, not just at next boot.
+      //
+      // Fix round 2 (review of the above): the recovery runs INSIDE the mutation lane and is a
+      // GUARDED, MAJOR-SCOPED gap-filler — no longer the un-laned global resolveActives() it was:
+      //  - laned: it queues behind any activate()/remove() that chained on during the failed auto-
+      //    activate, so it can't interleave with one mid-body. An un-laned resolveActives() could
+      //    elect a build a concurrent remove() then deletes out from under the pointer (re-
+      //    stranding the major), or clobber a concurrent explicit activate() — the exact races
+      //    runMutation exists to serialize away.
+      //  - guarded: if a concurrent laned mutation already left this major with an active ready
+      //    build, that IS a sane state — leave it. An unconditional re-pick would silently override
+      //    a deliberate non-newest activation that won the lane.
+      //  - scoped: resolveActiveFor(major) re-resolves ONLY the major this pipeline broke. The
+      //    global resolveActives() also re-picked every OTHER major, silently re-upgrading an
+      //    explicitly-pinned one on this wholly unrelated pull's failure.
+      // Errors are logged, never rethrown: this pipeline's promise is void'd in pull() (fire-and-
+      // forget), so a throw escaping here would be an unhandled rejection, breaking pull()'s
+      // contract that a failure only ever lands on the row.
+      //
+      // Deliberately does NOT re-run recomposeDistrib() (as the pre-fix global resolveActives()
+      // also didn't): the recompose we're compensating for just threw, so retrying it here would
+      // most likely throw again. The pg_distrib farm self-heals per activate()'s doc below —
+      // composePgDistrib re-derives from the registry on every call and boot recomposes before
+      // engine.start(); baked-backed majors are unaffected regardless (baked always wins its slot).
       if (activatedRef.current) {
-        this.deps.registry.resolveActives();
+        await this.runMutation(async () => {
+          const hasActiveReady = state.pgBuilds.listByMajor(major)
+            .some((r) => r.active && r.status === "ready");
+          if (!hasActiveReady) {
+            this.deps.registry.resolveActiveFor(major);
+            this.publish();
+          }
+        }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure active-pointer recovery failed`, e));
       }
     }
   }
@@ -420,16 +447,5 @@ export class Provisioner {
       await this.deps.recomposeDistrib();
       this.publish();
     });
-  }
-
-  // Task 10 (REST): thin public passthrough to the injected recomposeDistrib, originally added so
-  // the POST /api/pg-builds/:id/activate route (which back then called registry.activate()
-  // directly) could still trigger a recompose without api.ts reaching into a private ctor dep.
-  // Fix round 1 (Fix #2, P3 — mutation lane): that route now calls the public activate() above
-  // instead, which reaches deps.recomposeDistrib() directly — this passthrough is no longer
-  // called by any production route, but is left in place as harmless public surface (removing it
-  // is unrelated cleanup, not part of this fix).
-  async recomposeDistrib(): Promise<void> {
-    await this.deps.recomposeDistrib();
   }
 }

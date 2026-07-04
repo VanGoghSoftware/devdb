@@ -689,4 +689,162 @@ describe("Provisioner", () => {
       await expect(provisioner.activate("no-such-build")).rejects.toThrow(DevdbError);
     });
   });
+
+  // Fix round 2 (review of Fix round 1's post-activate compensation): runPipeline's outer catch
+  // restores a stranded major's active pointer after a post-activate failure (recomposeDistrib
+  // throwing). Originally it called registry.resolveActives() directly — un-serialized against the
+  // mutation lane AND global (every major re-picked). These tests pin the three ways that bit:
+  // over-reach across majors, a strand racing a concurrent remove, and clobbering a concurrent
+  // explicit activate. The fix lanes the recovery, guards it on "this major currently lacks an
+  // active ready build", and scopes it to the failed major via registry.resolveActiveFor().
+  describe("post-activate failure recovery (laned, guarded, major-scoped)", () => {
+    it("recovery must NOT re-pick an unrelated, explicitly-pinned major (scoped, not global)", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      await fakeInstallDir(install, "v17"); // baked v17 (minor 5) — major 17's recovery target
+      const { oci } = fakeOci(); // the v17 pull resolves DIGEST_A
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      await registry.seedBaked();
+      registry.resolveActives(); // baked-v17 active
+
+      // Major 16: two ready downloaded builds; the operator has deliberately PINNED the older one
+      // (p16-old, a known-good version) while a newer p16-new sits installed but unused.
+      const DIGEST_C = "sha256:" + "c".repeat(64);
+      const DIGEST_D = "sha256:" + "d".repeat(64);
+      state.pgBuilds.insert({ id: "p16-old", major: 16, minor: 3, source: "downloaded", releaseTag: "old",
+        imageDigest: DIGEST_C, path: join(builds, "v16", "old"), status: "ready" });
+      state.pgBuilds.insert({ id: "p16-new", major: 16, minor: 9, source: "downloaded", releaseTag: "new",
+        imageDigest: DIGEST_D, path: join(builds, "v16", "new"), status: "ready" });
+      state.pgBuilds.setActiveExclusive("p16-old");
+      expect(registry.pgbinFor(16).buildId).toBe("p16-old");
+
+      // A v17 pull that activates, then fails in recomposeDistrib — the post-activate recovery path.
+      recomposeDistrib.mockRejectedValueOnce(new Error("recomposeDistrib: symlink farm rebuild failed"));
+      const { buildId } = await provisioner.pull({ major: 17 });
+      await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("failed"));
+      // 17 itself recovers to baked in BOTH old and new code — wait on that so the recovery has run.
+      await vi.waitFor(() => expect(registry.pgbinFor(17).buildId).toBe("baked-v17"));
+
+      // The point: major 16 was untouched. A global resolveActives() re-picks EVERY major and would
+      // have flipped 16 to the newest (p16-new), silently discarding the operator's pin because an
+      // ENTIRELY UNRELATED major's pull failed. The scoped recovery only re-resolves major 17.
+      expect(registry.pgbinFor(16).buildId).toBe("p16-old");
+      expect(state.pgBuilds.byId("p16-new")?.active).toBe(false);
+    });
+
+    it("recovery racing a laned remove of the newest ready build — deferred behind the remove, major not stranded", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      await fakeInstallDir(install, "v17"); // baked v17 (minor 5)
+      const { oci } = fakeOci(); // the pull resolves DIGEST_A → finalDir v17/SHORT_A
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      await registry.seedBaked();
+      registry.resolveActives(); // baked-v17 active
+
+      // d1: the NEWEST ready build for 17 (minor 6 > baked 5) but not active. Once the pull row is
+      // marked failed, d1 is momentarily the newest-ready AND non-active — both removable AND what
+      // an unconditional resolveActives() would elect as 17's active pointer.
+      const d1Dir = await fakeVolumeBuild(builds, 17, "d1",
+        { digest: DIGEST_B, tag: "d1", major: 17, minor: 6, extractedAt: "x" });
+      state.pgBuilds.insert({ id: "d1", major: 17, minor: 6, source: "downloaded", releaseTag: "d1",
+        imageDigest: DIGEST_B, path: d1Dir, status: "ready" });
+
+      // Hold the pull's auto-activate open inside recomposeDistrib so a concurrent remove can chain
+      // behind the in-flight mutation before the failure fires.
+      let rejectRecompose!: (e: Error) => void;
+      recomposeDistrib.mockImplementationOnce(() => new Promise((_res, rej) => { rejectRecompose = rej; }));
+
+      // Path-routed rm: independently hold d1's removal (the window remove() suspends in) and the
+      // catch's finalDir removal; no-op both (the SQLite delete still runs) and pass everything else
+      // through so afterEach cleanup works.
+      const finalDir = join(builds, "v17", SHORT_A);
+      let releaseD1!: () => void;
+      const d1Gate = new Promise<void>((res) => { releaseD1 = res; });
+      let releaseFinalDirRm!: () => void;
+      const finalDirRmGate = new Promise<void>((res) => { releaseFinalDirRm = res; });
+      rmMock.mockImplementation(async (...args: Parameters<typeof realFs.rm>) => {
+        const p = args[0];
+        if (p === d1Dir) { await d1Gate; return; }
+        if (p === finalDir) { await finalDirRmGate; return; }
+        return realFs.rm(...args);
+      });
+
+      const { buildId } = await provisioner.pull({ major: 17 });
+      await vi.waitFor(() => expect(recomposeDistrib).toHaveBeenCalled()); // auto-activate suspended, activatedRef true
+
+      const removePromise = provisioner.remove("d1", []); // chains behind the in-flight mutation
+      rejectRecompose(new Error("recomposeDistrib: symlink farm rebuild failed"));
+      // remove() is now blocked inside rm(d1) and the pull row is failed → the catch is suspended at
+      // its own gated finalDir rm, just before the recovery point.
+      await vi.waitFor(() => {
+        expect(rmMock).toHaveBeenCalledWith(d1Dir, expect.anything());
+        expect(state.pgBuilds.byId(buildId)?.status).toBe("failed");
+      });
+
+      releaseFinalDirRm();
+      await new Promise((r) => setImmediate(r)); // drain: pre-fix, the un-laned resolveActives() elects d1 here
+
+      releaseD1();
+      await removePromise; // remove() deletes d1
+
+      // Invariant: 17 must still have an active READY build. Pre-fix the un-laned recovery elected
+      // d1, then remove deleted it out from under the pointer → no active ready row → pgbinFor 409s
+      // (stranded). Fixed: recovery ran AFTER remove on the lane, saw 17 stranded, re-picked baked.
+      await vi.waitFor(() => expect(registry.pgbinFor(17).buildId).toBe("baked-v17"));
+      expect(state.pgBuilds.byId("d1")).toBeNull();
+      expect(state.pgBuilds.byId(buildId)).toMatchObject({ status: "failed", active: false });
+    });
+
+    it("recovery racing a laned activate of a non-newest build — the guard leaves the explicit pick intact", async () => {
+      const { root, install, builds } = await scaffoldBuildDirs();
+      dirs.push(root);
+      await fakeInstallDir(install, "v17"); // baked v17 (minor 5)
+      const { oci } = fakeOci();
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      await registry.seedBaked();
+      registry.resolveActives(); // baked-v17 active
+
+      // d1: a ready but NON-newest build (minor 4 < baked 5). An operator explicitly activates it
+      // concurrently with the failing pull. An unconditional recovery re-picks baked (newest) and
+      // clobbers the deliberate choice; the guard must see 17 already has an active ready build.
+      const d1Dir = await fakeVolumeBuild(builds, 17, "d1",
+        { digest: DIGEST_B, tag: "d1", major: 17, minor: 4, extractedAt: "x" });
+      state.pgBuilds.insert({ id: "d1", major: 17, minor: 4, source: "downloaded", releaseTag: "d1",
+        imageDigest: DIGEST_B, path: d1Dir, status: "ready" });
+
+      let rejectRecompose!: (e: Error) => void;
+      recomposeDistrib.mockImplementationOnce(() => new Promise((_res, rej) => { rejectRecompose = rej; }));
+
+      const finalDir = join(builds, "v17", SHORT_A);
+      let releaseFinalDirRm!: () => void;
+      const finalDirRmGate = new Promise<void>((res) => { releaseFinalDirRm = res; });
+      rmMock.mockImplementation(async (...args: Parameters<typeof realFs.rm>) => {
+        const p = args[0];
+        if (p === finalDir) { await finalDirRmGate; return; }
+        return realFs.rm(...args);
+      });
+
+      const { buildId } = await provisioner.pull({ major: 17 });
+      await vi.waitFor(() => expect(recomposeDistrib).toHaveBeenCalled()); // auto-activate suspended
+
+      const activatePromise = provisioner.activate("d1"); // chains behind the in-flight mutation
+      rejectRecompose(new Error("recomposeDistrib: symlink farm rebuild failed"));
+      // Wait until the explicit activate has committed (d1 active) AND the pull row is failed (catch
+      // entered) — the catch is now suspended at its gated finalDir rm, before the recovery point.
+      await vi.waitFor(() => {
+        expect(state.pgBuilds.byId("d1")?.active).toBe(true);
+        expect(state.pgBuilds.byId(buildId)?.status).toBe("failed");
+      });
+
+      releaseFinalDirRm();
+      await new Promise((r) => setImmediate(r)); // drain: pre-fix, the un-laned resolveActives() clobbers d1 here
+      await activatePromise;
+      await new Promise((r) => setImmediate(r)); // let any laned recovery settle
+
+      // The explicit pick survives: d1 stays active (the guard saw an active ready build and did
+      // nothing). Pre-fix, resolveActives re-picked baked (5 > 4), silently discarding the choice.
+      expect(registry.pgbinFor(17).buildId).toBe("d1");
+      expect(state.pgBuilds.byId("baked-v17")?.active).toBe(false);
+    });
+  });
 });

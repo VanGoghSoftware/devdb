@@ -139,7 +139,7 @@ function fakeRegistry(): BuildRegistry {
 function fakeProvisioner(): Provisioner {
   return {
     check: vi.fn(), pull: vi.fn(), remove: vi.fn(), activate: vi.fn(),
-    updateAvailableFor: vi.fn(() => null), recomposeDistrib: vi.fn(),
+    updateAvailableFor: vi.fn(() => null),
   } as unknown as Provisioner;
 }
 

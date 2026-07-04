@@ -18,6 +18,14 @@ function versionString(row: PgBuildRow): string {
   return `${row.major}.${row.minor}`;
 }
 
+// Active-build preference, shared by resolveActives (every major, at boot) and resolveActiveFor
+// (a single major, failure recovery): newest minor wins; a tie goes to the baked build (its minor
+// came from a real --version probe at seed time, so it's the trusted default). Kept in one place
+// so the two callers can never drift into electing different winners for the same candidate set.
+function byActivePreference(a: PgBuildRow, b: PgBuildRow): number {
+  return (b.minor! - a.minor!) || ((a.source === "baked" ? -1 : 1) - (b.source === "baked" ? -1 : 1));
+}
+
 export class BuildRegistry {
   private degraded = new Set<number>();
 
@@ -123,8 +131,7 @@ export class BuildRegistry {
       else byMajor.set(row.major, [row]);
     }
     for (const [major, rows] of byMajor) {
-      rows.sort((a, b) =>
-        (b.minor! - a.minor!) || ((a.source === "baked" ? -1 : 1) - (b.source === "baked" ? -1 : 1)));
+      rows.sort(byActivePreference);
       const winner = rows[0]!;
       this.deps.state.pgBuilds.setActiveExclusive(winner.id);
       const lastRun = this.deps.state.pgMajors.lastRunMinor(major);
@@ -138,6 +145,27 @@ export class BuildRegistry {
       if (!byMajor.has(row.major)) this.deps.state.pgBuilds.clearActive(row.major);
     }
     return { degraded: [...this.degraded].sort((a, b) => a - b) };
+  }
+
+  // Scoped, single-major variant of resolveActives(): re-pick (or clear) ONE major's active
+  // pointer using the same winner rule. Unlike resolveActives it touches no other major and does
+  // NOT recompute degraded flags — it's a targeted recovery primitive, not boot re-derivation. The
+  // post-pull-failure path (Provisioner.runPipeline's catch) uses it to restore the "an active
+  // ready build exists" invariant for the single major it just broke; re-deriving every major there
+  // (as the global resolveActives it replaced did) would clobber an unrelated, explicitly-pinned
+  // major on a wholly unrelated pull's failure. No ready candidate ⇒ clear the major's active flag:
+  // a just-failed pull row keeps active=1 (setStatus doesn't touch it), which would otherwise 409
+  // assertRemovable/GC forever as "the active build". Degradation self-heals at the next boot's
+  // resolveActives() or the next explicit activate().
+  resolveActiveFor(major: number): void {
+    const ready = this.deps.state.pgBuilds.listByMajor(major)
+      .filter((r) => r.status === "ready" && r.minor !== null);
+    if (ready.length === 0) {
+      this.deps.state.pgBuilds.clearActive(major);
+      return;
+    }
+    ready.sort(byActivePreference);
+    this.deps.state.pgBuilds.setActiveExclusive(ready[0]!.id);
   }
 
   // The currently-active ready build for a major, or a 409 telling the caller how to fix it —
