@@ -45,14 +45,12 @@ export class BuildRegistry {
   // discipline is what makes presence trustworthy).
   async adoptVolumeBuilds(): Promise<void> {
     const majors = await readdir(this.deps.pgBuildsDir).catch(() => [] as string[]);
-    const seenPaths = new Set<string>();
     for (const vdir of majors) {
       if (!/^v\d+$/.test(vdir)) continue;
       const tags = await readdir(join(this.deps.pgBuildsDir, vdir)).catch(() => [] as string[]);
       for (const tag of tags) {
         if (tag.startsWith(".tmp-")) continue;
         const path = join(this.deps.pgBuildsDir, vdir, tag);
-        seenPaths.add(path);
         const id = `dl-${vdir.slice(1)}-${tag}`;
         if (this.deps.state.pgBuilds.byId(id)) continue;
         try {
@@ -67,10 +65,16 @@ export class BuildRegistry {
         }
       }
     }
+    // Fail any previously-adopted downloaded ready row whose bin/postgres is no longer accessible
+    // — whether the whole tag dir vanished (dir gone ⇒ postgres necessarily gone) or just the
+    // binary was removed while the dir + build.json survived. A direct access() probe subsumes
+    // both cases, so there's no separate "did we see the dir on this scan" bookkeeping to keep.
     for (const row of this.deps.state.pgBuilds.list()) {
       if (row.source !== "downloaded" || row.status !== "ready") continue;
-      if (!seenPaths.has(row.path)) {
-        this.deps.state.pgBuilds.setStatus(row.id, "failed", "build directory missing at boot");
+      try {
+        await access(join(row.path, "bin", "postgres"));
+      } catch {
+        this.deps.state.pgBuilds.setStatus(row.id, "failed", "build binary missing at boot");
       }
     }
   }
@@ -112,6 +116,13 @@ export class BuildRegistry {
       const lastRun = this.deps.state.pgMajors.lastRunMinor(major);
       if (lastRun !== null && winner.minor! < lastRun) this.degraded.add(major);
     }
+    // A major can have rows in the registry (e.g. a downloaded build whose only copy just went
+    // `failed`) without any of them being ready. byMajor above is built from ready rows only, so
+    // such a major is never visited — its stale `active=1` from a PRIOR resolve would otherwise
+    // survive forever, wrongly blocking assertRemovable/GC and giving pgbinFor nothing to explain.
+    for (const row of this.deps.state.pgBuilds.list()) {
+      if (!byMajor.has(row.major)) this.deps.state.pgBuilds.clearActive(row.major);
+    }
     return { degraded: [...this.degraded].sort((a, b) => a - b) };
   }
 
@@ -146,18 +157,24 @@ export class BuildRegistry {
   // row. A downgrade below the recorded last-run minor requires opts.consented — and consenting
   // deliberately LOWERS the high-water mark (setLastRunMinor, not recordRun) and clears the
   // degraded flag: the operator just told us the lower version is the intended baseline now.
+  // Conversely, activating a build at or above the high-water mark clears any pre-existing
+  // degraded flag immediately — re-pulling a build must un-degrade the major WITHOUT a reboot
+  // (resolveActives only re-evaluates degradation at boot).
   activate(id: string, opts?: { consented?: boolean }): PgBuildRow {
     const row = this.deps.state.pgBuilds.byId(id);
     if (!row || row.status !== "ready") {
       throw new DevdbError(409, `pg_build ${id} is not ready to activate`);
     }
     const lastRun = this.deps.state.pgMajors.lastRunMinor(row.major);
-    if (row.minor !== null && lastRun !== null && row.minor < lastRun) {
+    const isDowngrade = row.minor !== null && lastRun !== null && row.minor < lastRun;
+    if (isDowngrade) {
       if (!opts?.consented) {
         throw new DevdbError(409,
           `activating ${versionString(row)} would downgrade below the last-run ${row.major}.${lastRun} — pass consented:true (see docs on extension-catalog downgrades)`);
       }
-      this.deps.state.pgMajors.setLastRunMinor(row.major, row.minor);
+      this.deps.state.pgMajors.setLastRunMinor(row.major, row.minor!);
+      this.degraded.delete(row.major);
+    } else if (row.minor !== null) {
       this.degraded.delete(row.major);
     }
     this.deps.state.pgBuilds.setActiveExclusive(id);

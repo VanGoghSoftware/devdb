@@ -66,7 +66,8 @@ describe("BuildRegistry", () => {
     await registry.adoptVolumeBuilds();
     registry.resolveActives();
     expect(registry.pgbinFor(16).version).toBe("16.10"); // downloaded newer wins
-    // Force the tie: activate the equal-minor downloaded row is NOT what resolve does — resolve prefers baked on tie:
+    // NOTE: this does not exercise the tie-break (16.10 beats both 16.9 rows outright on minor).
+    // The baked-wins-a-genuine-tie case is covered separately below.
     expect(registry.versionForPgbin(registry.pgbinFor(16).path)).toBe("16.10");
   });
 
@@ -125,5 +126,80 @@ describe("BuildRegistry", () => {
     )).toThrow(/running endpoint/);
     // keep active (t3) + newest previous (t2) → only t1 is GC-eligible
     expect(registry.gcCandidates().map((r) => r.releaseTag)).toEqual(["t1"]);
+  });
+
+  it("resolveActives clears active for a major whose only rows are non-ready (no ready candidates)", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const v17 = await fakeInstallDir(install, "v17");
+    const v18 = await fakeVolumeBuild(builds, 18, "t1", { digest: "sha256:1", tag: "t1", major: 18, minor: 3, extractedAt: "x" });
+    const { registry } = makeRegistry({
+      install, builds,
+      versions: { [v16]: { major: 16, minor: 9 }, [v17]: { major: 17, minor: 4 }, [v18]: { major: 18, minor: 3 } },
+    });
+    await registry.seedBaked();
+    await registry.adoptVolumeBuilds();
+    registry.resolveActives(); // v18 downloaded-only build is active+ready here
+    const v18RowId = registry.pgbinFor(18).buildId;
+
+    await rm(v18, { recursive: true, force: true }); // the only v18 build vanishes
+    await registry.adoptVolumeBuilds(); // marks the v18 row failed (dir gone)
+    registry.resolveActives(); // v16/v17 still resolve fine; v18 has ZERO ready rows
+
+    expect(() => registry.pgbinFor(18)).toThrow(/no usable/);
+    // Stale active=1 from before must be cleared — assertRemovable must NOT see it as active.
+    expect(registry.assertRemovable(v18RowId, [])).toMatchObject({ id: v18RowId });
+    // Unaffected majors keep resolving normally.
+    expect(registry.pgbinFor(16).version).toBe("16.9");
+    expect(registry.pgbinFor(17).version).toBe("17.4");
+  });
+
+  it("stale sweep fails a downloaded ready row whose bin/postgres vanished but dir + build.json survive", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:1", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 }, [dl]: { major: 16, minor: 10 } } });
+    await registry.seedBaked();
+    await registry.adoptVolumeBuilds();
+    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
+    expect(row.status).toBe("ready");
+
+    await rm(join(dl, "bin", "postgres"), { force: true }); // dir + build.json survive; only the binary vanishes
+
+    await registry.adoptVolumeBuilds();
+
+    expect(state.pgBuilds.byId(row.id)!.status).toBe("failed");
+  });
+
+  it("baked wins a genuine tie at EQUAL minor against a downloaded build for the same major", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:1", tag: "t1", major: 16, minor: 9, extractedAt: "x" });
+    const { registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 }, [dl]: { major: 16, minor: 9 } } });
+    await registry.seedBaked();
+    await registry.adoptVolumeBuilds();
+    registry.resolveActives();
+
+    expect(registry.pgbinFor(16).buildId).toBe("baked-v16"); // baked wins the tie
+  });
+
+  it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {
+    const { install, builds } = await scaffold();
+    const v16 = await fakeInstallDir(install, "v16");
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 } } });
+    await registry.seedBaked();
+    state.pgMajors.recordRun(16, 10); // last-run high-water is AHEAD of the only ready build
+    registry.resolveActives(); // resolves to baked 16.9 < lastRunMinor(16)=10 → degraded
+    expect(registry.degradedMajors()).toEqual([16]);
+
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:2", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
+    await registry.adoptVolumeBuilds();
+    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
+    state.pgBuilds.setStatus(row.id, "ready"); // pretend the pull-and-extract just completed
+    void dl;
+
+    const activated = registry.activate(row.id); // minor 10 >= lastRunMinor 10 — NOT a downgrade, no consent needed
+    expect(activated.active).toBe(true);
+    expect(registry.degradedMajors()).toEqual([]); // cleared immediately, no reboot required
   });
 });
