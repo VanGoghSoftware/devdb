@@ -11,50 +11,59 @@ async function yieldingProbe(_port: number): Promise<boolean> {
   return true;
 }
 
+// Deterministic probes for the pure allocation-LOGIC tests below: they exercise allocatePort's
+// preferred / fallback / exhaustion / reserved branching without binding any real socket. Modeling
+// port occupancy explicitly keeps those tests hermetic — they previously bound fixed 56xxx loopback
+// ports, which a review-broker scan flagged (P4) as collision-prone with unrelated local/CI
+// processes. The real tryBind path is covered on its own, against an OS-assigned ephemeral port, in
+// the final test. The fixed port numbers that remain below are now just logical labels — nothing binds.
+const grantAll = (_port: number): Promise<boolean> => Promise.resolve(true);
+const denyAll = (_port: number): Promise<boolean> => Promise.resolve(false);
+
 describe("allocatePort", () => {
   it("prefers the sticky port when free", async () => {
-    expect(await allocatePort({ min: 56000, max: 56010 }, 56005)).toBe(56005);
+    // grantAll = the sticky port probes as free, so it must be returned without falling into the range.
+    expect(await allocatePort({ min: 56000, max: 56010 }, 56005, undefined, grantAll)).toBe(56005);
   });
   it("falls back into the range when sticky is taken, unclaiming the failed sticky candidate", async () => {
-    const blocker = net.createServer().listen(56005, "127.0.0.1");
-    await once(blocker, "listening");
+    const taken = 56005; // the probe rejects only this port (a taken sticky); every other is free.
+    const probed: number[] = [];
+    const probe = (port: number): Promise<boolean> => { probed.push(port); return Promise.resolve(port !== taken); };
     const reserved = new Set<number>();
-    try {
-      const p = await allocatePort({ min: 56000, max: 56010 }, 56005, reserved);
-      expect(p).toBeGreaterThanOrEqual(56000);
-      expect(p).toBeLessThanOrEqual(56010);
-      expect(p).not.toBe(56005);
-      // The sticky candidate was claimed for its probe, then released when the bind failed;
-      // only the port actually handed out stays claimed.
-      expect(reserved).toEqual(new Set([p]));
-    } finally { blocker.close(); }
+    const p = await allocatePort({ min: 56000, max: 56010 }, taken, reserved, probe);
+    expect(probed[0]).toBe(taken); // the sticky candidate is attempted FIRST (preferred), then rejected...
+    expect(p).not.toBe(taken); // ...so a different, free range port is handed out instead
+    expect(p).toBeGreaterThanOrEqual(56000);
+    expect(p).toBeLessThanOrEqual(56010);
+    // The sticky candidate was claimed for its probe, then released when the probe rejected it;
+    // only the port actually handed out stays claimed.
+    expect(reserved).toEqual(new Set([p]));
   });
   it("throws PortExhaustedError when range is fully occupied, leaving nothing claimed", async () => {
-    const blockers = await Promise.all([56020, 56021].map(async (p) => {
-      const s = net.createServer().listen(p, "127.0.0.1");
-      await once(s, "listening");
-      return s;
-    }));
     const reserved = new Set<number>();
-    try {
-      await expect(
-        allocatePort({ min: 56020, max: 56021 }, undefined, reserved),
-      ).rejects.toBeInstanceOf(PortExhaustedError);
-      expect(reserved.size).toBe(0); // every claim made for a probe was released on its failure
-    } finally { blockers.forEach((s) => s.close()); }
+    // denyAll = every candidate probes as in-use, so all 100 attempts fail and the range exhausts.
+    await expect(
+      allocatePort({ min: 56020, max: 56021 }, undefined, reserved, denyAll),
+    ).rejects.toBeInstanceOf(PortExhaustedError);
+    expect(reserved.size).toBe(0); // every claim made for a probe was released on its failure
   });
   it("skips already-reserved candidates, including the preferred port, and claims the free one", async () => {
     const reserved = new Set([56100]);
-    const p = await allocatePort({ min: 56100, max: 56101 }, 56100, reserved);
+    // 56100 is skipped by the reserved-set check before any probe (including as the preferred port);
+    // grantAll lets the only non-reserved candidate, 56101, probe as free.
+    const p = await allocatePort({ min: 56100, max: 56101 }, 56100, reserved, grantAll);
     expect(p).toBe(56101);
     expect(reserved).toEqual(new Set([56100, 56101])); // 56101 claimed by allocatePort itself
   });
   it("throws PortExhaustedError when every candidate in range is already reserved", async () => {
     const reserved = new Set([56100, 56101]);
+    let probeCalls = 0;
+    const probe = (_port: number): Promise<boolean> => { probeCalls++; return Promise.resolve(true); };
     await expect(
-      allocatePort({ min: 56100, max: 56101 }, undefined, reserved),
+      allocatePort({ min: 56100, max: 56101 }, undefined, reserved, probe),
     ).rejects.toBeInstanceOf(PortExhaustedError);
     expect(reserved).toEqual(new Set([56100, 56101])); // untouched — nothing new claimed
+    expect(probeCalls).toBe(0); // every candidate skipped by the reserved check BEFORE any probe/bind
   });
 
   // Reserve-then-probe TOCTOU coverage: a candidate must be CLAIMED into the shared reserved
@@ -110,8 +119,8 @@ describe("allocatePort", () => {
   });
 
   // Real-probe coverage (the tryBind default, no probe arg) against an OS-assigned ephemeral port
-  // rather than a fixed number. The other tests here either inject a probe or target fixed 56xxx
-  // ports; this one exercises the real net.createServer().listen path end to end. Binding :0 lets
+  // rather than a fixed number. Every other test in this file injects a deterministic probe, so this
+  // is the only one that exercises the real net.createServer().listen path end to end. Binding :0 lets
   // the OS hand us a port it knows is free *right now*, sidestepping the exact hazard that sank the
   // compute-manager tests — a hardcoded range (the default 54300-54339) sitting wholly under
   // docker-proxy while the compose container is up. tryBind must reject the port while it is held,
