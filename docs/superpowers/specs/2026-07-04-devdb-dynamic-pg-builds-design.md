@@ -27,7 +27,7 @@ New daemon unit `packages/daemon/src/compute/builds/` — three focused files:
 - **`provisioner.ts` (Provisioner)** — orchestrates check / pull → verify → extract → validate → activate as an async job; one global provisioning job at a time (concurrent attempts → generic 409). Writes a `jobs` row for bookkeeping; job *observability* this phase is the `pg_builds.status` field + SSE events + a `pgbuild:<id>` log channel (a jobs REST API remains phase 4's contract).
 - **`oci.ts` (OciClient)** — minimal anonymous registry-v2 pull: token → manifest list (select by `process.arch`) → layer blobs. Streams each blob to a spool file while sha256-verifying against its content address, then two `tar` passes (list → apply `.wh.` whiteouts → extract `usr/local/` only). **Zero new npm deps** (node `fetch`/`zlib`/`crypto` + system `tar`); registry base URL and image template are config-injectable.
 
-**Volume layout:** `/data/pg_builds/v{major}/{releaseTag}/` with a self-describing `build.json` marker (digest, tag, minor, extractedAt) inside each build dir. Extraction goes to a `.tmp-{tag}` sibling and is **atomically renamed** into place — a crash leaves only a sweepable `.tmp-*`, never a half-registered build.
+**Volume layout:** `/data/pg_builds/v{major}/{shortDigest}/` — **content-addressed**, not tag-addressed: `shortDigest` is the first 16 hex chars of the image's sha256 digest (`registry.ts`'s `shortDigest`), and it's also the row id's basis (`dl-{major}-{shortDigest}`). The release tag is recorded as row/marker **metadata only**, never as a path component — a self-describing `build.json` marker (digest, tag, minor, extractedAt) lives inside each build dir. Content-addressing means a re-pull of a mutable tag (e.g. `latest`) that has moved to a new digest lands in a new dir beside the old one instead of colliding with it. Extraction goes to a `.tmp-{shortDigest}` sibling and is **atomically renamed** into place — a crash leaves only a sweepable `.tmp-*`, never a half-registered build.
 
 **Seam changes in existing code:**
 - `compute/manager.ts:148` — `--pgbin` stops join-ing `cfg.pgInstallDir` and takes the path resolved via `pgbinFor(major)` (threaded from EndpointsService). `RunningCompute` gains `pgbinPath` (adoption hints; delete/GC protection).
@@ -43,12 +43,14 @@ Two additive migrations. `pg_builds`: `id, major, minor, source ('baked'|'downlo
 
 1. **Check** (`POST /api/pg-builds/check`) — compare remote `latest` digest per major against installed digests → "update available (Neon release 9124)". Tags are release numbers, not PG minors: the actual minor is only knowable post-extract, and the surface is honest about that (minor confirmed and shown after step 4). Explicit tags supported (also the rollback re-pull path).
 2. **Preflight** — `fs.statfs` on `/data`, require ~1.5 GB headroom; dedup by digest (already installed → friendly no-op).
-3. **Download + extract** — per the OciClient above, into `.tmp-{tag}`.
+3. **Download + extract** — per the OciClient above, into `.tmp-{shortDigest}`.
 4. **Fixup + marker** — run `bin/postgres --version`; **must match the requested major** (mismatch → failed); record minor + `du` size; write `build.json`; atomic rename into place.
 5. **Validation gate** (~90 s budget) — create a throwaway `_devdb_validate_{ts}` project of that major **through the normal service layer**; start its endpoint with an internal `pgbinPath` override (EndpointsService → ComputeManager; never exposed over REST/MCP); this exercises the real path — basebackup from the live pageserver, WAL to the safekeeper, neon extension load — then smoke SQL (`SELECT version()`, create/insert/select, a neon-GUC probe). Success → `ready`. Failure → `failed`: extracted dir deleted (no 250 MB corpses), job log tail kept, row kept for the record, retry allowed. Temp project deleted in `finally`; boot sweeps orphans.
 6. **Activate** — a validated pull **auto-activates** (that is what the pull gesture means): one atomic flip of `active` within the major + SSE event. Explicit activate/rollback among installed `ready` builds is allowed; rollback carries a confirm warning (decision 10) and consented rollback lowers `lastRunMinor` so it doesn't trip the guard. An endpoint start that already resolved the old path just runs the old build (adopt-on-restart tolerates the race; activation itself is a single synchronous SQLite update).
 
-**GC:** keep active + one previous per major; never delete a build whose path a running compute holds (`pgbinPath`) — explicit `DELETE` gets a 409. The rest is deletable explicitly; boot GC enforces keep-2.
+   **Decision (Jordan, 2026-07-05): the MCP `activate_pg_build` tool refuses downgrades outright.** It checks downgrade-ness against the `pg_majors` high-water mark *before* ever calling `BuildRegistry.activate`, and if the target is below the last-run minor it returns an error directing the caller to the human-consent path — it never passes `consented:true` on an agent's behalf, and never even attempts the call. The only ways to consent a downgrade are the **web UI's confirm dialog** or **REST `POST /api/pg-builds/:id/activate` with `{"consented":true}`**; both activate the build *and* lower `lastRunMinor`, clearing the degraded flag. Rationale: an autonomous agent must not silently roll a branch's data back onto an older Postgres minor — that has to be a human's call.
+
+**GC:** keep active + one previous per major; never delete a build whose path a running compute holds (`pgbinPath`) — explicit `DELETE` gets a 409. **Baked builds can never be deleted at all**: they ship in the image, have no removable on-disk pull dir, and `assertRemovable` 409s any baked row unconditionally (the web Settings card disables Delete for baked rows accordingly). Only downloaded rows are GC/delete-eligible. The rest is deletable explicitly; boot GC enforces keep-2.
 
 ## Boot reconciliation
 
@@ -62,10 +64,10 @@ Runs with state setup, before endpoints resume; the composed `/data/pg_distrib` 
 
 ## Surfaces
 
-- **REST:** `GET /api/pg-builds`; `POST /api/pg-builds/check`; `POST /api/pg-builds/pull {major, tag?}` → 202 (409 if one runs); `POST /api/pg-builds/:id/activate`; `DELETE /api/pg-builds/:id` (409 active/in-use). Zod → 400, generic 409s, per house rules.
+- **REST:** `GET /api/pg-builds`; `POST /api/pg-builds/check`; `POST /api/pg-builds/pull {major, tag?}` → 202 (409 if one runs); `POST /api/pg-builds/:id/activate`; `DELETE /api/pg-builds/:id` (409 active/in-use/baked). Zod → 400, generic 409s, per house rules.
 - **Events:** new type `pg_builds` in the strict whitelist (no ids) → invalidates builds query + status.
 - **Status:** `/api/status` gains `pgBuilds` (per major: active minor, source, last-seen update, degraded flags). This touch also folds in the deferred `StatusDto.engine` union widening (`"starting"` — handover §5).
-- **MCP:** `list_pg_builds`, `check_pg_updates`, `pull_pg_build {major, tag?}` (returns immediately; poll `list_pg_builds`), `activate_pg_build`. No MCP delete (infra-destructive stays human).
+- **MCP:** `list_pg_builds`, `check_pg_updates`, `pull_pg_build {major, tag?}` (returns immediately; poll `list_pg_builds`), `activate_pg_build` (refuses downgrades below the high-water mark — see Provisioning pipeline step 6). No MCP delete (infra-destructive stays human).
 - **UI:** one Settings card (per-major: active minor + source chip, check-for-updates, update badge, pull with progress via status + log tail, installed list with activate/rollback/delete, downgrade banner) + the per-endpoint "restart to adopt" chip (drawer/tree) where running `pgbinPath` ≠ active.
 
 ## Compatibility & security posture

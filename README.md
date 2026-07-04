@@ -106,9 +106,12 @@ registry with `DEVDB_PG_REGISTRY_BASE` (default `https://registry-1.docker.io`) 
 `{major}` placeholder).
 
 **Disk.** Each downloaded build costs roughly 250 MB on the `/data` volume. DevDB keeps the active
-build plus one previous per major as a fast rollback target and garbage-collects the rest; a build
-still in use by a running compute is never eligible for GC or delete (`DELETE` 409s on it).
-Reclaim space explicitly any time from the Settings card.
+build plus one previous per major as a fast rollback target. Garbage collection happens **at daemon
+boot** (part of reconciliation) and on **manual delete** from the Settings card or REST — there is no
+background/continuous collector running during normal operation. A build still in use by a running
+compute is never eligible for GC or delete (`DELETE` 409s on it), and baked builds are never
+GC/delete-eligible at all. Reclaim space explicitly any time from the Settings card, or restart the
+daemon to trigger boot GC.
 
 **New majors: works if your storage build supports it.** Pulling a newer *minor* of an already-baked
 major is the first-class, always-works case. Pulling a **new major** works too, but it's gated by
