@@ -143,11 +143,28 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
       throw new Error(`unsafe layer entry: ${name}`);
     }
   }
-  // (3) Only regular files ('-') and directories ('d') may live under the prefix. A symlink ('l')
-  //     lands in destDir pointing outside the tree (or a later whiteout `rm` could follow it out);
-  //     a hardlink ('h') or device/fifo/socket has no place in a postgres install. Member types
-  //     come from `tar -tvf` (ls-style mode string; first char is the type), zipped to names by
-  //     index — both listings emit one line per member in archive order.
+  // (3) Regular files ('-') and directories ('d') always live under the prefix unchecked. A real
+  //     compute-node image ships hundreds of legitimate IN-TREE relative symlinks under usr/local
+  //     (`lib/libpq.so.5 -> libpq.so.5.17`, extension template links) — rejecting every symlink
+  //     outright (the original C1 rule) would fail every real pull. So links ('l' symlink, 'h'
+  //     hardlink) get a TARGET-CONTAINMENT check instead of a blanket ban: reject the whole layer
+  //     if the target is absolute, or if it resolves outside the prefix. Device/char/fifo/socket
+  //     members ('b'/'c'/'p'/'s') have no place in a postgres install and are still rejected
+  //     outright, same as any unrecognized type.
+  //
+  //     Symlink vs hardlink targets are NOT resolved the same way — verified empirically (both
+  //     bsdtar 3.5.3 here and GNU tar 1.34 in the container image, `node:22-bookworm-slim`):
+  //       - Symlink ('l') lines end " <name> -> <target>"; <target> is the raw link string, which
+  //         for a RELATIVE target is resolved relative to the SYMLINK's OWN DIRECTORY (real
+  //         symlink/POSIX semantics) — e.g. `lib/libx.so.5 -> libx.so.5.17` means `lib/libx.so.5.17`.
+  //       - Hardlink ('h') lines end " <name> link to <target>" (a DIFFERENT separator — "link to",
+  //         not "->") and <target> is already an ARCHIVE-ROOT-RELATIVE path, same shape as any
+  //         member name — e.g. `bin/hardlinked link to lib/orig.txt` refers to `lib/orig.txt` from
+  //         the archive root, NOT `bin/lib/orig.txt`. Applying the symlink's dirname-join formula to
+  //         a hardlink target would silently mis-resolve it. So hardlink targets are prefix-checked
+  //         directly (post-normalize), exactly like the per-prefix NAME check in (2) above.
+  //     Types+targets come from `tar -tvf` (ls-style header line), zipped to names by index — both
+  //     listings emit one line per member in archive order.
   const verbose = (await execFileP("tar", ["-tvf", a.spool], { maxBuffer: 64 * 1024 * 1024 })).stdout
     .split("\n")
     .filter((line) => line.length > 0);
@@ -156,8 +173,26 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
   }
   for (const [i, name] of names.entries()) {
     if (!name.startsWith(a.prefix)) continue;
-    const type = (verbose[i] ?? "").charAt(0);
-    if (type !== "-" && type !== "d") throw new Error(`unsafe layer entry: ${name} (type "${type || "?"}")`);
+    const line = verbose[i] ?? "";
+    const type = line.charAt(0);
+    if (type === "-" || type === "d") continue;
+    if (type === "l" || type === "h") {
+      const separator = type === "l" ? " -> " : " link to "; // GNU tar & bsdtar agree on both strings
+      const marker = `${name}${separator}`;
+      const idx = line.indexOf(marker);
+      if (idx === -1) throw new Error(`unsafe layer entry: ${name} (type "${type}", unparsed link target)`);
+      const target = line.slice(idx + marker.length);
+      if (target.length === 0) throw new Error(`unsafe layer entry: ${name} (type "${type}", empty link target)`);
+      if (target.startsWith("/")) throw new Error(`unsafe layer entry: ${name} (type "${type}", absolute target "${target}")`);
+      // Symlink: target is dirname-relative. Hardlink: target is already archive-root-relative
+      // (see comment above) — do NOT join it against the member's dirname.
+      const resolved = type === "l" ? posix.normalize(posix.join(posix.dirname(name), target)) : posix.normalize(target);
+      if (!resolved.startsWith(a.prefix)) {
+        throw new Error(`unsafe layer entry: ${name} (type "${type}", target "${target}" escapes prefix)`);
+      }
+      continue;
+    }
+    throw new Error(`unsafe layer entry: ${name} (type "${type || "?"}")`);
   }
 
   // Belt-and-suspenders for the whiteout `rm`s below: even though (1)/(2) already reject `..` and

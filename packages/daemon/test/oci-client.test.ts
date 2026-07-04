@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -390,7 +390,7 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     await expect(access(destDir)).rejects.toThrow();
   });
 
-  it("C1(d): rejects a symlink member under the prefix (would land in destDir pointing outside)", async () => {
+  it("C1(d): rejects an absolute-target symlink member under the prefix (would land in destDir pointing outside)", async () => {
     const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
       { name: "usr/local/evil-link", type: "2", linkname: "/etc/passwd" },
     ]);
@@ -400,6 +400,78 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     ).rejects.toThrow(/unsafe layer entry/);
     expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
     await expect(access(destDir)).rejects.toThrow(); // the out-pointing symlink never reached destDir
+  });
+
+  // --- Fix round 2: symlink policy refined from "reject all links" to TARGET-CONTAINMENT. Real
+  // compute-node images ship hundreds of legitimate in-tree relative symlinks under usr/local
+  // (`lib/libpq.so.5 -> libpq.so.5.17`); a blanket ban would fail every real pull. ---
+
+  it("passes a legit in-tree relative symlink (target stays inside usr/local/)", async () => {
+    const { client, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/lib/libx.so.5.17", type: "0", content: "shared object bytes" },
+      { name: "usr/local/lib/libx.so.5", type: "2", linkname: "libx.so.5.17" },
+    ]);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).resolves.toBeUndefined();
+    const st = await lstat(join(destDir, "lib", "libx.so.5"));
+    expect(st.isSymbolicLink()).toBe(true);
+    expect(await readlink(join(destDir, "lib", "libx.so.5"))).toBe("libx.so.5.17");
+  });
+
+  it("rejects an absolute-target symlink (refined policy: still rejected)", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/link", type: "2", linkname: "/etc/passwd" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("rejects an escaping relative-target symlink (resolves outside usr/local/ via ../..)", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/link", type: "2", linkname: "../../../../etc/passwd" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  // --- Hardlink target semantics DIFFER from symlinks (verified empirically against both bsdtar
+  // 3.5.3 and GNU tar 1.34 / node:22-bookworm-slim, the container base image): a hardlink's
+  // `-tvf` line uses " link to " (not " -> "), and its target is an ARCHIVE-ROOT-RELATIVE path
+  // (same shape as any member name) — NOT resolved against the member's own directory the way a
+  // symlink's relative target is. These two tests exercise that path specifically; the raw USTAR
+  // `linkname` field is confirmed (by direct header inspection) to already hold the full
+  // archive-relative path, so `TarEntry.linkname` below is written the same way real tar does. ---
+
+  it("passes a legit in-tree hardlink whose target is an archive-relative path under usr/local/", async () => {
+    const { client, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/lib/orig.txt", type: "0", content: "shared object bytes" },
+      { name: "usr/local/bin/hardlinked", type: "1", linkname: "usr/local/lib/orig.txt" },
+    ]);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).resolves.toBeUndefined();
+    await expect(access(join(destDir, "bin", "hardlinked"))).resolves.toBeUndefined();
+  });
+
+  it("rejects a hardlink whose archive-relative target escapes usr/local/ (not dirname-joined)", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/bin/hardlinked", type: "1", linkname: "usr/other/evil.txt" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow();
   });
 
   it("P2: rejects a manifest whose body does not match the requested content-address, before any blob download", async () => {
