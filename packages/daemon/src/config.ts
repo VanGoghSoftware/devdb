@@ -19,6 +19,7 @@ const EnvSchema = z.object({
   PG_INSTALL_DIR: z.string().trim().min(1),
   DEVDB_MCP_ALLOWED_HOSTS: z.string().optional(),
   DEVDB_MCP_ALLOWED_ORIGINS: z.string().optional(),
+  DEVDB_WEB_DIST: z.string().optional(),
 });
 
 export interface DevdbConfig {
@@ -38,6 +39,7 @@ export interface DevdbConfig {
   };
   mcpAllowedHosts: string[];
   mcpAllowedOrigins: string[];
+  webDistDir: string | null;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
@@ -85,6 +87,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     throw new Error(`DEVDB_HTTP_PORT ${httpPort} is a reserved engine port`);
   }
 
+  // Phase 3: directory of the built web UI (vite output). Unset => UI not served — the local-dev
+  // daemon case, where `pnpm --filter @devdb/web dev` serves the SPA and proxies /api here.
+  // The Docker image sets DEVDB_WEB_DIST=/app/packages/web/dist (docker/Dockerfile).
+  const webDistDir = e.DEVDB_WEB_DIST?.trim() ? e.DEVDB_WEB_DIST.trim() : null;
+
   return {
     httpPort,
     dataDir: e.DEVDB_DATA_DIR,
@@ -94,5 +101,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     engine: { ...ENGINE_PORTS },
     mcpAllowedHosts: e.DEVDB_MCP_ALLOWED_HOSTS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
     mcpAllowedOrigins: e.DEVDB_MCP_ALLOWED_ORIGINS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
+    webDistDir,
   };
 }

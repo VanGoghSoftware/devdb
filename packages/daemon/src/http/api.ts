@@ -18,6 +18,7 @@ import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
 import { daemonLogChannel } from "../logging/logger.js";
 import { registerMcp } from "../mcp/http.js";
+import { registerWebUi } from "./static.js";
 
 // T16 rider (ledgered at Task 12, optional): /api/status's top-level "version" comes from this
 // package's own package.json instead of a hand-maintained literal. Read once at module load —
@@ -405,5 +406,6 @@ export function buildServer(deps: Deps): FastifyInstance {
     return deps.services.sql.run(body.branchId, body.query);
   });
 
+  registerWebUi(app, deps.cfg); // must stay last — SPA fallback owns the not-found handler
   return app;
 }
