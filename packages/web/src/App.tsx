@@ -1,10 +1,11 @@
-import { AppShell, Group, Anchor, Text, ActionIcon, useMantineColorScheme } from "@mantine/core";
+import { AppShell, Group, Anchor, Text, ActionIcon, Tooltip, useMantineColorScheme } from "@mantine/core";
 import { Link, Outlet } from "react-router";
+import { useEvents } from "./api/hooks.js";
 
-// Top-bar shell (spec Decision 4): brand, global nav, theme toggle. The SSE connection dot is
-// added by Task 7 (it needs the events stream). No sidebar — too few global destinations.
+// Top-bar shell (spec Decision 4): brand, global nav, theme toggle, SSE connection dot.
 export function App() {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
+  const eventsStatus = useEvents();
   return (
     <AppShell header={{ height: 52 }} padding="md">
       <AppShell.Header>
@@ -17,6 +18,9 @@ export function App() {
             <Anchor component={Link} to="/settings" size="sm">Settings</Anchor>
           </Group>
           <Group gap="sm">
+            <Tooltip label={eventsStatus === "open" ? "live updates connected" : `live updates: ${eventsStatus}`}>
+              <Text span data-testid="conn-dot" c={eventsStatus === "open" ? "green.6" : "yellow.6"}>●</Text>
+            </Tooltip>
             <ActionIcon
               variant="subtle"
               aria-label="toggle color scheme"
