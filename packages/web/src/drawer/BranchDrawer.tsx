@@ -116,8 +116,11 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
             <Tabs.Tab value="restore">Restore</Tabs.Tab>
             <Tabs.Tab value="info">Info</Tabs.Tab>
           </Tabs.List>
-          <Tabs.Panel value="logs">{b && <LogsTab branchId={b.id} />}</Tabs.Panel>
-          <Tabs.Panel value="restore">{b && <RestoreTab branch={b} />}</Tabs.Panel>
+          {/* Keyed by branch id so re-targeting the drawer remounts fresh — no stale logs buffer /
+              restore selection / leaked EventSource (both tabs hold branch-scoped component-local
+              state that a prop-only update, without a key, would otherwise carry across branches). */}
+          <Tabs.Panel value="logs">{b && <LogsTab key={b.id} branchId={b.id} />}</Tabs.Panel>
+          <Tabs.Panel value="restore">{b && <RestoreTab key={b.id} branch={b} />}</Tabs.Panel>
           <Tabs.Panel value="info"><InfoTab branch={b} /></Tabs.Panel>
         </Tabs>
 

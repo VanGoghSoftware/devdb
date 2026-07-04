@@ -1,9 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { renderApp } from "./render.js";
+import { renderApp, makeQueryClient } from "./render.js";
 import { BranchDrawer, maskConnstring } from "../src/drawer/BranchDrawer.js";
 import { formatBytes } from "../src/drawer/InfoTab.js";
+import { keys } from "../src/api/keys.js";
 
 vi.mock("../src/api/client.js", () => ({
   ApiError: class extends Error {},
@@ -21,12 +22,19 @@ import type { BranchDto } from "@devdb/shared";
 // concerns (rename, connstring, danger zone, etc.), not the log stream's content, so an inert stub
 // (no real connection, no automatic events) is all that's needed to keep the drawer's mount hermetic.
 // logs-tab.test.tsx covers the real SSE behavior via its own injected FakeES.
+//
+// `static last` + `closed` (Fix 1): mirrors logs-tab.test.tsx's own FakeES shape so the stale-Logs
+// re-target test below can reach the live instance directly (LogsTab always calls `new
+// EventSource(url)` itself here — there's no `makeSource` injection point through BranchDrawer —
+// and can assert it was actually closed on remount, not just left dangling).
 class InertEventSource {
+  static last: InertEventSource | null = null;
   onopen: (() => void) | null = null;
   onmessage: ((m: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
-  constructor(public url: string) {}
-  close(): void {}
+  closed = false;
+  constructor(public url: string) { InertEventSource.last = this; }
+  close(): void { this.closed = true; }
 }
 vi.stubGlobal("EventSource", InertEventSource);
 
@@ -46,9 +54,17 @@ const rootBranch: BranchDto = {
   ...branch, id: "b-root", parentBranchId: null, name: "main", connectionString: null,
 };
 
+// A second, distinct non-root branch (sibling of `branch`) for the stale-tab-state re-target test
+// below (Fix 1) — needs its own id so LogsTab/RestoreTab's per-branch component-local state has
+// something to (incorrectly, pre-fix) leak across.
+const branch2: BranchDto = { ...branch, id: "b2", name: "other-branch" };
+
 beforeEach(() => {
-  vi.mocked(api.branches.get).mockImplementation(async (id: string) =>
-    id === rootBranch.id ? rootBranch : branch);
+  vi.mocked(api.branches.get).mockImplementation(async (id: string) => {
+    if (id === rootBranch.id) return rootBranch;
+    if (id === branch2.id) return branch2;
+    return branch;
+  });
 });
 
 describe("maskConnstring", () => {
@@ -126,6 +142,82 @@ describe("BranchDrawer", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(await screen.findByRole("button", { name: /rename/i })).toBeDisabled();
     expect(vi.mocked(api.branches.rename).mock.calls).toHaveLength(callsBefore);
+  });
+
+  // Fix 1 (broker: same recurring stale-state class as the root-rename test above, Tasks 10/12
+  // precedent). LogsTab and RestoreTab are unkeyed children of the Tabs.Panel — a branchId change
+  // on the SAME BranchDrawer instance (re-targeting the drawer to a different branch without
+  // closing/reopening it) updates their `branchId`/`branch` props but does NOT unmount them, so
+  // their internal `useState` (LogsTab's `lines`; RestoreTab's `to`/`selectedPreset`/`mode`/`name`)
+  // survives untouched. A leftover in-place restore selection on the OLD branch would leave the
+  // Restore button enabled against the NEW branch with no user having chosen a restore point for
+  // it — a rewind that could fire against the wrong target. Keying both tabs by `b.id` forces
+  // React to remount them fresh on every branchId change, which this test proves from the outside.
+  it("Restore selection does not survive a switch to a different branch (stale-state class, cf. root-rename above)", async () => {
+    // Pre-seed b2 into the SAME query client the drawer will use (staleTime: Infinity, per
+    // makeQueryClient — so this cached entry is treated as fresh, no background refetch races it).
+    // Without this, `useBranch`'s query key changes (["branch","b1"] -> ["branch","b2"]) on the
+    // rerender below, `data` transiently goes undefined while the new key's fetch resolves, and
+    // BranchDrawer's `if (!b) return <Skeleton/>` branch actually unmounts the whole Tabs tree on
+    // its own — which would ALSO wipe RestoreTab's state, accidentally masking the exact bug this
+    // test exists to catch. Seeding the cache keeps `b` continuously truthy across the branchId
+    // change, so any state surviving the rerender can only be surviving because it's unkeyed, not
+    // because of an incidental loading-state unmount.
+    const client = makeQueryClient();
+    client.setQueryData(keys.branch(branch2.id), branch2);
+
+    const { rerender } = renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />, { client });
+    await userEvent.click(await screen.findByRole("tab", { name: /restore/i }));
+
+    // Pick a preset on b1: this enables the Restore button (a selected timestamp is the only gate
+    // for `in_place` mode, the tab's default).
+    await userEvent.click(await screen.findByRole("checkbox", { name: /30 m/i }));
+    expect(screen.getByRole("button", { name: /restore/i })).toBeEnabled();
+
+    // Re-target the SAME drawer instance to a different, unrelated branch (b2) — mirrors a user
+    // clicking a different node in the branch tree while the drawer stays open.
+    rerender(<BranchDrawer branchId="b2" onClose={() => {}} />);
+
+    // Land back on the Restore tab for b2 (Tabs itself does not persist the active tab across a
+    // remount of its owning component in this app's usage, so re-select it explicitly) and assert
+    // NO restore point carried over: the button must be freshly disabled, not still enabled against
+    // a selection the user never made for b2.
+    await userEvent.click(await screen.findByRole("tab", { name: /restore/i }));
+    expect(await screen.findByRole("button", { name: /restore/i })).toBeDisabled();
+    expect(screen.queryByRole("checkbox", { name: /30 m/i, checked: true })).not.toBeInTheDocument();
+  });
+
+  // Companion to the Restore test above: same re-target apparatus (cache-primed b2, no incidental
+  // Skeleton unmount), proving LogsTab's `lines` buffer specifically does not survive a BranchDrawer
+  // re-target, AND that the stale b1 EventSource actually gets closed (not just abandoned) —
+  // exercised at the BranchDrawer level itself (LogsTab has no `makeSource` injection point through
+  // BranchDrawer, so this drives the file's InertEventSource directly, unlike logs-tab.test.tsx's
+  // own FakeES-injected coverage of the same contract in isolation).
+  it("Logs buffer and connection do not survive a switch to a different branch (stale-state class)", async () => {
+    const client = makeQueryClient();
+    client.setQueryData(keys.branch(branch2.id), branch2);
+
+    const { rerender } = renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />, { client });
+    await userEvent.click(await screen.findByRole("tab", { name: /logs/i }));
+    const b1Source = InertEventSource.last!;
+    expect(b1Source.url).toBe("/api/branches/b1/logs");
+
+    act(() => { b1Source.onmessage?.({ data: JSON.stringify("b1 log line") } as MessageEvent); });
+    expect(await screen.findByText("b1 log line")).toBeInTheDocument();
+
+    // Re-target the SAME drawer instance to b2 — mirrors a user clicking a different branch-tree
+    // node while the drawer stays open on the Logs tab.
+    rerender(<BranchDrawer branchId="b2" onClose={() => {}} />);
+    await userEvent.click(await screen.findByRole("tab", { name: /logs/i }));
+
+    // The stale b1 stream must be closed (not silently left open, e.g. if a fix connected a new
+    // stream without tearing down the old one), and b2 gets its OWN fresh connection + empty buffer.
+    expect(b1Source.closed).toBe(true);
+    const b2Source = InertEventSource.last!;
+    expect(b2Source).not.toBe(b1Source);
+    expect(b2Source.url).toBe("/api/branches/b2/logs");
+    expect(screen.queryByText("b1 log line")).not.toBeInTheDocument();
+    expect(await screen.findByText(/no output yet/i)).toBeInTheDocument();
   });
 
   describe("danger zone: delete", () => {

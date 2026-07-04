@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Group, ScrollArea, Switch, Text } from "@mantine/core";
 
-const MAX_LINES = 500; // mirror the server-side ring
+// Client-side display cap (upper bound on rendered history), NOT a mirror of the server: the
+// server's ring buffer (LogsService, `ringSize = 500`) is 500, but its SSE replay-on-connect only
+// sends the most recent `recent(channel)` default n=200 lines — so 500 here is deliberately looser
+// than what any single connection actually replays, giving headroom for lines accumulated live
+// after connect before ever approaching this cap.
+const MAX_LINES = 500;
 
 export function LogsTab(a: { branchId: string; makeSource?: (url: string) => EventSource }) {
   const [lines, setLines] = useState<string[]>([]);
