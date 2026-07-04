@@ -34,7 +34,11 @@ describe("/api/events invalidation channel", () => {
     // endpoint.status sequence on start (starting → running at minimum)
     const sRes = await fetch(`${dev.base}/api/branches/${branch.id}/endpoint/start`, { method: "POST" });
     expect(sRes.status).toBe(200);
-    JSON.parse(await nextMatching(gen, (p) => p.includes('"endpoint.status"')));
+    const esEvt = JSON.parse(await nextMatching(gen, (p) => {
+      try { const e = JSON.parse(p); return e.type === "endpoint.status" && e.branchId === branch.id; }
+      catch { return false; }
+    }));
+    expect(esEvt).toMatchObject({ type: "endpoint.status", branchId: branch.id });
 
     // rename → branch.updated + round-trip visible via GET
     const rRes = await fetch(`${dev.base}/api/branches/${branch.id}`, {

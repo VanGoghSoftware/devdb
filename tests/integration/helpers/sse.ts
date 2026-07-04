@@ -31,10 +31,16 @@ export async function nextMatching(
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error("SSE: no matching event before timeout");
-    const race = await Promise.race([
-      gen.next(),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("SSE timeout")), remaining)),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => rej(new Error("SSE timeout")), remaining);
+    });
+    let race;
+    try {
+      race = await Promise.race([gen.next(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
     if (race.done) throw new Error("SSE stream ended before a matching event");
     if (pred(race.value)) return race.value;
   }

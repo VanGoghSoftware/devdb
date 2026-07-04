@@ -17,7 +17,9 @@ describe("web UI serving", () => {
     const html = await (await fetch(`${dev.base}/`)).text();
     const assetPath = html.match(/\/assets\/[^"]+\.js/)?.[0];
     expect(assetPath).toBeTruthy();
-    expect((await fetch(`${dev.base}${assetPath}`)).status).toBe(200);
+    const assetRes = await fetch(`${dev.base}${assetPath}`);
+    expect(assetRes.status).toBe(200);
+    expect(assetRes.headers.get("content-type")).toMatch(/javascript/);
   });
 
   it("SPA-falls-back on deep links but keeps unknown API routes as JSON 404", async () => {
