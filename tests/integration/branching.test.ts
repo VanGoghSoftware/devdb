@@ -13,6 +13,11 @@ describe("branching isolation (the money test)", () => {
 
     const mainEp = await api<{ connectionString: string }>(
       dev, "POST", `/api/branches/${mainBranch.id}/endpoint/start`);
+    // Regression guard (IPv6-loopback bug): the emitted host must be the IPv4 literal 127.0.0.1,
+    // not "localhost" — endpoint ports are published on 127.0.0.1 only, so "localhost" would
+    // resolve to ::1 first on IPv6-preferring hosts and refuse external DB clients (SQLSTATE 08001).
+    // The connect() below dials that exact host, proving the emitted string is usable as-is.
+    expect(new URL(mainEp.connectionString).hostname).toBe("127.0.0.1");
     const main = await connect(dev, mainEp.connectionString);
     await main.query("CREATE TABLE notes (id serial PRIMARY KEY, body text)");
     await main.query("INSERT INTO notes (body) VALUES ('from-main')");

@@ -19,7 +19,7 @@ Start `main`'s endpoint and connect:
 
     curl -X POST http://localhost:4400/api/branches/<mainBranchId>/endpoint/start
     # the start response includes connectionString — use it directly with psql
-    psql 'postgresql://postgres:<password>@localhost:<port>/postgres'
+    psql 'postgresql://postgres:<password>@127.0.0.1:<port>/postgres'
 
 Branch it (instant, copy-on-write) and get an isolated database:
 

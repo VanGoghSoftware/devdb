@@ -196,10 +196,16 @@ describe("BranchesService", () => {
   // encodeURIComponent — passwords are alphanumeric today (see compute/scram.ts CHARSET) so the
   // encoded form is identical to the raw one, but the contract is now safe if that charset ever
   // grows special characters.
-  it("connectionString shape (password percent-encoded)", async () => {
+  it("connectionString shape (password percent-encoded, IPv4-loopback host)", async () => {
     const { branches, mainBranch } = await seeded();
-    expect(branches.connectionString(mainBranch, 54301))
-      .toBe(`postgresql://postgres:${encodeURIComponent(mainBranch.password)}@localhost:54301/postgres`);
+    const cs = branches.connectionString(mainBranch, 54301);
+    expect(cs).toBe(`postgresql://postgres:${encodeURIComponent(mainBranch.password)}@127.0.0.1:54301/postgres`);
+    // Regression guard (IPv6-loopback bug): the emitted host MUST be the IPv4 literal 127.0.0.1,
+    // never "localhost". compose.yaml publishes endpoint ports on 127.0.0.1 only, so on
+    // IPv6-preferring hosts (macOS) "localhost" resolves to ::1 first — which isn't published —
+    // and external clients (DataGrip/psql/JDBC) get ECONNREFUSED / SQLSTATE 08001.
+    expect(new URL(cs).hostname).toBe("127.0.0.1");
+    expect(cs).not.toContain("localhost");
   });
 
   it("jdbcUrl shape (127.0.0.1, creds as query params, sslmode=disable)", async () => {

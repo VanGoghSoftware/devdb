@@ -49,9 +49,18 @@ export class BranchesService {
   // Amendment A11 (controller): percent-encode the password via encodeURIComponent — passwords
   // are alphanumeric today (compute/scram.ts CHARSET) so this is a no-op in practice, but it
   // keeps the connection-string contract safe if that charset ever grows URL-special characters.
+  //
+  // Host is the IPv4 literal 127.0.0.1, NOT "localhost": docker/compose.yaml publishes the
+  // endpoint ports on 127.0.0.1 only (loopback-scoped by intent — see the "Do NOT widen to ::1"
+  // posture). On IPv6-preferring hosts (macOS) "localhost" resolves to ::1 first, which isn't
+  // published, so external clients that copy this string verbatim (DataGrip/psql/JDBC) fail to
+  // connect — JDBC surfaces it as SQLSTATE 08001 "The connection attempt failed", psql as
+  // ECONNREFUSED. This is the USER-FACING string only; the internal engine/compute/SQL-console
+  // connections dial 127.0.0.1 inside the container on their own paths (a devdb product choice, so
+  // the host intentionally diverges from the oracle below).
   // oracle: src/mgmt/model/branch.rs get_connection_string; no sslmode (no TLS in devdb)
   connectionString(branch: BranchRow, port: number): string {
-    return `postgresql://postgres:${encodeURIComponent(branch.password)}@localhost:${port}/postgres`;
+    return `postgresql://postgres:${encodeURIComponent(branch.password)}@127.0.0.1:${port}/postgres`;
   }
 
   // JDBC URL for GUI clients (DataGrip/DBeaver). Differs from connectionString() deliberately:

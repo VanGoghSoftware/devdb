@@ -261,7 +261,7 @@ describe("MCP read tools", () => {
       expect(h.engineFakes.computes.start).toHaveBeenCalled();
       expect(firstLine(firstText(res))).toMatch(/project "shop"/);
       expect(firstLine(firstText(res))).toMatch(/branch "main"/);
-      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
     });
 
     it("on a missing project returns an actionable error naming list_projects", async () => {
@@ -309,7 +309,7 @@ describe("MCP read tools", () => {
       expect(h.engineFakes.computes.start).toHaveBeenCalled();
       expect(firstLine(firstText(res))).toMatch(/project "shop"/);
       expect(firstLine(firstText(res))).toMatch(/branch "agent\/try-index"/);
-      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
       expect(firstText(res).toLowerCase()).toMatch(/next:/);
     });
 
@@ -658,7 +658,7 @@ describe("MCP read tools", () => {
       expect(res.isError).toBeFalsy();
       expect(firstLine(firstText(res))).toMatch(/project "shop"/);
       expect(firstText(res)).toMatch(/reset to parent/);
-      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
     });
 
     it("refuses on a branch with no parent (main) and surfaces the remediation", async () => {
@@ -723,7 +723,7 @@ describe("MCP read tools", () => {
       expect(firstLine(firstText(res))).toMatch(/project "shop"/);
       expect(firstLine(firstText(res))).toMatch(/branch "recovered"/);
       expect(firstLine(firstText(res))).toMatch(/forked from "main"/);
-      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
       expect(firstText(res).toLowerCase()).toMatch(/next:/);
 
       // the SOURCE branch ("main") must be untouched — this is the non-destructive path.
@@ -798,7 +798,7 @@ describe("MCP read tools", () => {
       expect(firstText(res)).toMatch(/restored in place/);
       expect(firstText(res)).toMatch(/2026-07-01T00:00:00Z/);
       expect(firstText(res).toLowerCase()).toMatch(/auto-stopped|auto-restart|restarted/);
-      expect(firstText(res)).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(firstText(res)).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
 
       // Identity swap (services/timetravel.ts's swapOntoNewTimeline, oracle-derived): "main" is
       // now a FRESH row at the resolved point, and the pre-restore row survives archived under a
@@ -935,7 +935,7 @@ describe("MCP read tools", () => {
       expect(res.isError).toBeFalsy();
       const body = firstText(res);
       expect(body.toLowerCase()).toMatch(/restarted/);
-      expect(body).toMatch(/postgresql:\/\/.+@localhost:54301\/postgres/);
+      expect(body).toMatch(/postgresql:\/\/.+@127\.0\.0\.1:54301\/postgres/);
     });
 
     // Fix 5 (task-11 fix wave, fold): pins the SWAPPED-LIVE identity explicitly. The existing

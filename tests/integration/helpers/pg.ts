@@ -17,7 +17,12 @@ import type { Devdb } from "./container.js";
 export async function connect(dev: Devdb, connectionString: string): Promise<pg.Client> {
   const url = new URL(connectionString);
   const client = new pg.Client({
-    host: "localhost",
+    // Dial the emitted host verbatim — now the IPv4 literal 127.0.0.1 (see services/branches.ts),
+    // the exact host external clients copy — so a regression back to "localhost" would surface
+    // here too, not just in the unit assertion. Only the PORT is remapped: the connstring's port
+    // is the container-internal endpoint port, which testcontainers republishes on a random host
+    // port (compose's fixed 127.0.0.1:54300-54339 binding isn't in play under testcontainers).
+    host: url.hostname,
     port: dev.mappedPort(Number(url.port)),
     user: url.username,
     password: decodeURIComponent(url.password),
