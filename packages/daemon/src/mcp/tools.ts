@@ -564,7 +564,7 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
 
   const ActivatePgBuildShape = { major: PgVersionSchema, version: z.string().regex(/^\d+\.\d+$/) };
   server.registerTool("activate_pg_build", {
-    description: "Make a specific ready build the active one for its major (e.g. rolling back to an older minor). MCP activation is explicit agent intent, so a downgrade below the last-run minor is consented automatically — the response warns when that happens.",
+    description: "Make a specific ready build the active one for its major. Refuses downgrades below the last-run minor — an agent cannot silently roll a branch back; downgrading requires human consent via the web UI or REST.",
     inputSchema: ActivatePgBuildShape,
   }, guard("activate_pg_build", deps, async ({ major, version }: z.infer<z.ZodObject<typeof ActivatePgBuildShape>>) => {
     const candidates = deps.registry.list().filter((r) => r.major === major);
@@ -577,26 +577,34 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
       );
     }
 
-    // Determine downgrade-ness BEFORE calling activate: the SAME predicate BuildRegistry.activate
-    // uses internally (registry.ts) against the pg_majors high-water mark — reached directly via
-    // deps.state (Deps.state is the same StateDb instance the registry itself holds), since
-    // BuildRegistry has no public lastRunMinor passthrough. Checked pre-activation because a
-    // successful downgrade-with-consent clears the degraded flag as a side effect, so the
-    // pre-activation state is the only point at which "was this actually a downgrade" is still
-    // observable.
+    // FIX-8 (Jordan's decision, 2026-07-05): "Refuse downgrades over MCP." An agent must NOT be
+    // able to unilaterally roll a branch back to an older minor — downgrading is a human decision,
+    // gated behind explicit consent (the web UI Settings card's confirm dialog, or REST
+    // `POST /api/pg-builds/:id/activate {consented:true}`). Determine downgrade-ness BEFORE calling
+    // activate at all: the SAME predicate BuildRegistry.activate uses internally (registry.ts)
+    // against the pg_majors high-water mark, reached directly via deps.state (Deps.state is the
+    // same StateDb instance the registry itself holds) since BuildRegistry has no public
+    // lastRunMinor passthrough. Checking here — rather than calling activate() with no consent and
+    // catching its 409 — means a downgrade target is REFUSED WITHOUT EVER CALLING
+    // provisioner.activate: no risk of the guard's own 409 path being changed out from under this
+    // check later and silently reintroducing an activation attempt on the agent's behalf.
     const lastRun = deps.state.pgMajors.lastRunMinor(major);
     const isDowngrade = target.minor !== null && lastRun !== null && target.minor < lastRun;
+    if (isDowngrade) {
+      return errorResult(
+        `refused: ${version} is a downgrade below the last-run PG ${major}.${lastRun} — MCP cannot consent to downgrades on an agent's behalf.\n` +
+        `Downgrades require human consent: use the web UI Settings card (confirm dialog) or ` +
+        `POST /api/pg-builds/:id/activate with {"consented":true}.`,
+      );
+    }
 
-    // MCP activation is explicit agent intent (the agent named an exact major+version to switch
-    // to) — consent is implied by making the call at all, unlike the REST route (which requires
-    // an explicit `consented` body flag from its caller). See registry.ts's activate() for the
-    // 409-without-consent guard this bypasses.
-    const row = await deps.provisioner.activate(target.id, { consented: true });
-    const warning = isDowngrade
-      ? ` — WARNING: rollback below last-run ${major}.${lastRun} — extension-catalog downgrades are forward-only; see README §Postgres builds`
-      : "";
+    // Not a downgrade (minor >= last-run high-water, or no high-water recorded yet) — activates
+    // unchanged. No `{consented: true}` passed: this path never needs consent (registry.ts's
+    // activate() only demands it when isDowngrade), and MCP must never auto-consent regardless —
+    // see the refusal branch above for the downgrade case, which never reaches this call at all.
+    const row = await deps.provisioner.activate(target.id);
     return text(
-      `[devdb] activated ${versionString(row)} for PG ${major}${warning}\n` +
+      `[devdb] activated ${versionString(row)} for PG ${major}\n` +
       `Next: list_pg_builds to confirm, or restart any running endpoint on this major to pick it up.`,
     );
   }));

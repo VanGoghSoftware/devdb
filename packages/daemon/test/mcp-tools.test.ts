@@ -1255,7 +1255,38 @@ describe("MCP read tools", () => {
     });
 
     describe("activate_pg_build", () => {
-      it("activates the resolved ready row by major+version, calling provisioner.activate with consented:true", async () => {
+      // FIX-8 (Jordan's decision, 2026-07-05): MCP must REFUSE downgrades outright — an agent may
+      // not unilaterally roll a branch back to an older minor. Unlike the pre-fix behavior (auto-
+      // consenting with a "rollback" warning), a below-high-water target is now never activated at
+      // all: no call to provisioner.activate, high-water/active pointer untouched, and the result
+      // redirects the agent to the human-consent path (web UI Settings card confirm dialog, or
+      // REST POST /api/pg-builds/:id/activate {consented:true}).
+      it("refuses a downgrade below the last-run high-water — does not call provisioner.activate, and points at the human-consent path", async () => {
+        h = await makeReadToolsHarness();
+        const row = fakeRow({ id: "dl-16-old", major: 16, minor: 9, source: "downloaded", releaseTag: "8464", status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
+        // Simulates registry's own last-run high-water via state.pgMajors — 16.10 has already run,
+        // so activating 16.9 is a downgrade.
+        h.deps.state.pgMajors.recordRun(16, 10);
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate);
+
+        const res = await h.call("activate_pg_build", { major: 16, version: "16.9" });
+
+        expect(res.isError).toBe(true);
+        const body = firstText(res);
+        // Names the downgrade and the high-water it falls below.
+        expect(body.toLowerCase()).toMatch(/downgrade/);
+        expect(body).toMatch(/16\.10/); // the last-run minor it would fall below
+        // Redirects to the human-consent path — never implies the agent can just retry over MCP.
+        expect(body).toMatch(/consented.*true|consent/i);
+        expect(body.toLowerCase()).toMatch(/web ui|settings/);
+        expect(body).toMatch(/POST \/api\/pg-builds\/:id\/activate|\/api\/pg-builds/);
+        // Never activated: no provisioner call at all, so the high-water can't have been lowered
+        // and the active pointer can't have moved — this is the whole point of the fix.
+        expect(activateSpy).not.toHaveBeenCalled();
+      });
+
+      it("activates the resolved ready row by major+version when it is NOT a downgrade (no consent needed/passed)", async () => {
         h = await makeReadToolsHarness();
         const row = fakeRow({ id: "dl-16-old", major: 16, minor: 9, source: "downloaded", releaseTag: "8464", status: "ready", active: false });
         vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
@@ -1264,39 +1295,24 @@ describe("MCP read tools", () => {
         const res = await h.call("activate_pg_build", { major: 16, version: "16.9" });
 
         expect(res.isError).toBeFalsy();
-        expect(activateSpy).toHaveBeenCalledWith("dl-16-old", { consented: true });
+        // No {consented:true} auto-consent — the MCP path never auto-consents, downgrade or not.
+        expect(activateSpy).toHaveBeenCalledWith("dl-16-old");
         expect(firstText(res)).toMatch(/activated 16\.9/);
       });
 
-      it("warns when the activation lowered the high-water (a rollback)", async () => {
-        h = await makeReadToolsHarness();
-        const row = fakeRow({ id: "dl-16-old", major: 16, minor: 9, source: "downloaded", releaseTag: "8464", status: "ready", active: false });
-        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
-        // Simulates registry's own last-run high-water via state.pgMajors — 16.10 has already run,
-        // so activating 16.9 is a downgrade.
-        h.deps.state.pgMajors.recordRun(16, 10);
-        vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
-
-        const res = await h.call("activate_pg_build", { major: 16, version: "16.9" });
-
-        expect(res.isError).toBeFalsy();
-        const body = firstText(res);
-        expect(body).toMatch(/rollback/i);
-        expect(body).toMatch(/16\.10/); // names the last-run version it fell below
-        expect(body.toLowerCase()).toMatch(/forward-only|downgrade/);
-      });
-
-      it("does not warn when activating at or above the high-water mark", async () => {
+      it("still succeeds when activating AT OR ABOVE the high-water mark (not a downgrade)", async () => {
         h = await makeReadToolsHarness();
         const row = fakeRow({ id: "dl-16-new", major: 16, minor: 10, source: "downloaded", releaseTag: "9124", status: "ready", active: false });
         vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
         h.deps.state.pgMajors.recordRun(16, 9);
-        vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
 
         const res = await h.call("activate_pg_build", { major: 16, version: "16.10" });
 
         expect(res.isError).toBeFalsy();
-        expect(firstText(res).toLowerCase()).not.toMatch(/rollback/);
+        expect(activateSpy).toHaveBeenCalledWith("dl-16-new");
+        expect(firstText(res)).toMatch(/activated 16\.10/);
+        expect(firstText(res).toLowerCase()).not.toMatch(/downgrade|refused/);
       });
 
       it("unknown version -> errorResult listing available ready versions for that major", async () => {
