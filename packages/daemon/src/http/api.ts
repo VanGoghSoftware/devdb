@@ -14,6 +14,8 @@ import type { LogsService } from "../services/logs.js";
 import type { EventsService } from "../services/events.js";
 import type { SqlService } from "../services/sql.js";
 import type { Logger } from "../logging/logger.js";
+import type { BuildRegistry } from "../compute/builds/registry.js";
+import type { Provisioner } from "../compute/builds/provisioner.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
 import { daemonLogChannel } from "../logging/logger.js";
@@ -46,6 +48,13 @@ export interface Deps {
   // don't all need editing just to satisfy a new required field. Only mcp/tools.ts's guard()
   // reads this, falling back to console.error when absent (see tools.ts's guard() comment).
   logger?: Logger;
+  // Task 9 (dynamic-pg-builds): optional for the SAME reason as logger? above — the pg-builds
+  // REST routes (GET/pull/activate/remove) that actually consume these are Task 10's job, not
+  // this task's. Wiring the fields into Deps now (rather than waiting for Task 10) means index.ts
+  // only needs to be edited once for the full boot order, and any test file that doesn't touch
+  // pg-builds routes keeps typechecking unchanged with no registry/provisioner in its fakeDeps().
+  registry?: BuildRegistry;
+  provisioner?: Provisioner;
   services: {
     projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService;
     timetravel: TimeTravelService; sql: SqlService;

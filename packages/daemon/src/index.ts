@@ -1,4 +1,4 @@
-import { open, rm } from "node:fs/promises";
+import { mkdir, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { loadConfig } from "./config.js";
@@ -22,6 +22,10 @@ import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js
 import { engineDirs } from "./engine/configs.js";
 import { BuildRegistry } from "./compute/builds/registry.js";
 import { detectPostgresVersion } from "./compute/builds/version.js";
+import { composePgDistrib } from "./compute/builds/pgdistrib.js";
+import { Provisioner, du as duDir, statfsFree } from "./compute/builds/provisioner.js";
+import { OciClient } from "./compute/builds/oci.js";
+import { makeValidationRunner, sweepValidationProjects } from "./compute/builds/validate.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -62,6 +66,44 @@ async function main(): Promise<void> {
     // transitions no service write initiates — a crash, or an engine component dying/restarting).
     const events = new EventsService();
     const logger = createLogger(logs);
+
+    // Task 9 (dynamic-pg-builds): the FULL boot order replacing Task 8's minimal seed/adopt/
+    // resolve-only prerequisite. BuildRegistry must exist — and pg_distrib must be composed from
+    // it — BEFORE EngineRuntime is even constructed: pageserver.toml's `pg_distrib_dir` now points
+    // at `cfg.pgDistribDir` (Task 5), which nothing else creates, and EngineRuntime.start() writes
+    // + reads that toml as part of launching the pageserver. Constructing EngineRuntime itself is
+    // harmless before this point (its constructor only touches storcon_db), but `await
+    // engine.start()` is moved down below `recomposeDistrib()` so the ordering is unambiguous in
+    // the source, not just "safe by accident."
+    const registry = new BuildRegistry({
+      state, pgInstallDir: cfg.pgInstallDir, pgBuildsDir: cfg.pgBuildsDir,
+      detectVersion: detectPostgresVersion, logger,
+    });
+    await mkdir(cfg.pgBuildsDir, { recursive: true });
+    await registry.seedBaked();
+    await registry.adoptVolumeBuilds();
+    const sweptTmp = await registry.sweepTmp();
+    if (sweptTmp > 0) console.error(`boot: swept ${sweptTmp} interrupted pg_build extraction(s)`);
+    const { degraded } = registry.resolveActives();
+    if (degraded.length > 0) {
+      console.error(`boot: PG major(s) ${degraded.join(", ")} resolved BELOW their last-run minor — see /api/status pgBuilds (re-pull to clear)`);
+    }
+    // Boot GC (spec §Pipeline: keep active + one previous per major) — nothing is running yet, so
+    // no in-use check is needed here; runtime deletes still go through assertRemovable.
+    for (const stale of registry.gcCandidates()) {
+      await rm(stale.path, { recursive: true, force: true });
+      state.pgBuilds.delete(stale.id);
+      console.error(`boot: GC'd pg build ${stale.major}.${stale.minor} (${stale.releaseTag}) — keep-2 policy`);
+    }
+    // recomposeDistrib is also handed to the Provisioner below (re-run after every activate/
+    // remove) — defined once here so boot and runtime share the exact same composition logic.
+    const recomposeDistrib = async () => composePgDistrib({
+      distribDir: cfg.pgDistribDir, pgInstallDir: cfg.pgInstallDir,
+      downloadedOnly: registry.list().filter((r) => r.source === "downloaded" && r.status === "ready" && r.active)
+        .map((r) => ({ major: r.major, path: r.path })),
+    });
+    await recomposeDistrib(); // MUST precede engine.start(): pageserver.toml's pg_distrib_dir points here
+
     // Task 3 (phase 3): the 4th ctor arg is the async-observer hook for engine components dying/
     // restarting with no service write (e.g. pageserver crashing mid-session) — publishes a
     // coarse `engine.health` invalidation hint for /api/events subscribers to react to.
@@ -95,20 +137,6 @@ async function main(): Promise<void> {
     });
     const queue = new BranchQueue();
 
-    // Task 8 (dynamic-pg-builds): minimal prerequisite for the daemon to compile with
-    // EndpointsService/ProjectsService/BranchesService now requiring/accepting a `builds` dep —
-    // the FULL boot order (pg_distrib compose, sweepTmp, Provisioner construction, gate wiring) is
-    // Task 9's job; this is deliberately just enough to seed/adopt/resolve once at boot so
-    // pgbinFor()/installedMajors()/versionForPgbin() return real answers before any service can be
-    // asked to start a compute or create a project.
-    const builds = new BuildRegistry({
-      state, pgInstallDir: cfg.pgInstallDir, pgBuildsDir: cfg.pgBuildsDir,
-      detectVersion: detectPostgresVersion, logger,
-    });
-    await builds.seedBaked();
-    await builds.adoptVolumeBuilds();
-    builds.resolveActives();
-
     // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
     // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.
     // Fix 1 (final review wave): `queue` wired into ProjectsService too — delete()'s per-leaf
@@ -121,19 +149,45 @@ async function main(): Promise<void> {
     // endpoint-status seam actually announces its invalidation hint in production, not just
     // under test (`events?` is optional on ProjectsDeps precisely so this wiring can be threaded
     // here without touching every existing unit test's construction).
-    // Task 8: `builds` (the BuildRegistry constructed above) wired into all three — REQUIRED by
-    // EndpointsService (resolves --pgbin fresh per start), OPTIONAL-but-present for
+    // Task 8/9: `builds: registry` (the BuildRegistry constructed above) wired into all three —
+    // REQUIRED by EndpointsService (resolves --pgbin fresh per start), OPTIONAL-but-present for
     // ProjectsService (major-installed guard) and BranchesService (runningPgVersion enrichment).
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds });
-    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds });
-    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, events, logger, builds });
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds: registry });
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds: registry });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, events, logger, builds: registry });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, events, logger });
     const sql = new SqlService({ branches, endpoints });
+
+    // Task 9: a boot-time sweep of orphaned validation-gate projects — left behind only when a
+    // prior gate run's own cleanup (validate.ts's finally block) failed (e.g. the daemon crashed
+    // mid-gate, or the engine was briefly unreachable during that finally). Runs AFTER the
+    // services above exist (sweepValidationProjects calls through the real ProjectsService.delete,
+    // which needs a live storcon/pageserver/safekeeper/queue) but BEFORE the Provisioner is
+    // constructed, so no new pull can race a leftover gate project sharing engine state.
+    const sweptValidate = await sweepValidationProjects(projects);
+    if (sweptValidate > 0) {
+      console.error(`boot: swept ${sweptValidate} orphaned _devdb_validate_* project(s)`);
+    }
+    // Task 9: the Provisioner composition root — wires the validation gate (makeValidationRunner,
+    // itself built from the real projects/endpoints/sql services above), the OCI puller, disk
+    // helpers, and recomposeDistrib (defined above, shared with boot's own initial compose call).
+    const provisioner = new Provisioner({
+      registry, state, logs, events, logger,
+      oci: new OciClient({ registryBase: cfg.pgRegistryBase }),
+      cfg: { pgBuildsDir: cfg.pgBuildsDir, pgImageTemplate: cfg.pgImageTemplate },
+      validate: makeValidationRunner({ projects, endpoints, sql, logger }),
+      detectVersion: detectPostgresVersion, du: duDir, statfsFree, recomposeDistrib,
+    });
 
     // Task 9 fix wave: `logger` threaded into Deps so mcp/tools.ts's guard() can log an
     // unexpected/non-DevdbError tool failure's stack somewhere other than a swallowed message —
     // this is the SAME logger instance already wired into every service above (Task 4).
-    const app = buildServer({ cfg, state, engine, logs, events, logger, services: { projects, branches, endpoints, timetravel, sql } });
+    // Task 9 (dynamic-pg-builds): `registry`/`provisioner` added — Task 10 wires the pg-builds
+    // REST routes (GET/pull/activate/remove) off these two.
+    const app = buildServer({
+      cfg, state, engine, logs, events, logger, registry, provisioner,
+      services: { projects, branches, endpoints, timetravel, sql },
+    });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });
 
     // Both are always assigned by this point (we're past the two lines above that set them) —
