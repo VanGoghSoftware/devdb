@@ -59,11 +59,11 @@ describe("ProjectPage", () => {
     expect(await screen.findByText("main")).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /rails/i })).toBeChecked();
   });
-  it("toggle switches to the canvas slot", async () => {
+  it("toggle switches to the React Flow canvas", async () => {
     renderPage();
     await screen.findByText("main");
     await userEvent.click(screen.getByRole("radio", { name: /canvas/i }));
-    expect(screen.getByTestId("canvas-placeholder")).toBeInTheDocument();
+    expect(document.querySelector(".react-flow")).toBeInTheDocument();
   });
   it("creates a branch through the modal (defaults parent to main)", async () => {
     vi.mocked(api.branches.create).mockResolvedValue({ ...main, id: "b2", name: "dev" });

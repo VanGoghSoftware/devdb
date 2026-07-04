@@ -4,6 +4,7 @@ import { Link, useParams, useSearchParams } from "react-router";
 import type { BranchDto } from "@devdb/shared";
 import { useBranches, useCreateBranch } from "../api/hooks.js";
 import { RailsView } from "../tree/RailsView.js";
+import { CanvasView } from "../tree/CanvasView.js";
 import { getDefaultTreeView, type TreeView } from "../prefs.js";
 
 function NewBranchModal(a: { projectId: string; branches: BranchDto[]; opened: boolean; onClose: () => void; defaultParentId?: string }) {
@@ -92,7 +93,7 @@ export function ProjectPage() {
       )}
       {view === "rails"
         ? <RailsView branches={branches} onSelect={select} onBranchFrom={(id) => setCreating({ parentId: id })} />
-        : <div data-testid="canvas-placeholder"><Text c="dimmed">canvas view lands in Task 11</Text></div>}
+        : <CanvasView branches={branches} onSelect={select} />}
       <NewBranchModal
         projectId={projectId}
         branches={branches}
