@@ -345,4 +345,13 @@ export class Provisioner {
     await this.deps.recomposeDistrib();
     this.publish();
   }
+
+  // Task 10 (REST): thin public passthrough to the injected recomposeDistrib, so the POST
+  // /api/pg-builds/:id/activate route (which calls registry.activate() directly — activate has
+  // no reason to live on Provisioner, it's pure registry/SQLite bookkeeping) can still trigger the
+  // SAME pg_distrib recomposition every other activation path (pull's auto-activate, remove())
+  // already goes through, without api.ts reaching into a private ctor dep.
+  async recomposeDistrib(): Promise<void> {
+    await this.deps.recomposeDistrib();
+  }
 }

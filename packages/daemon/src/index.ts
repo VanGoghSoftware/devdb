@@ -182,10 +182,14 @@ async function main(): Promise<void> {
     // Task 9 fix wave: `logger` threaded into Deps so mcp/tools.ts's guard() can log an
     // unexpected/non-DevdbError tool failure's stack somewhere other than a swallowed message —
     // this is the SAME logger instance already wired into every service above (Task 4).
-    // Task 9 (dynamic-pg-builds): `registry`/`provisioner` added — Task 10 wires the pg-builds
-    // REST routes (GET/pull/activate/remove) off these two.
+    // Task 10 (dynamic-pg-builds): `registry`/`provisioner` are now REQUIRED on Deps — the
+    // pg-builds REST routes (GET/check/pull/activate/DELETE) and /api/status's real pgBuilds
+    // block consume them unconditionally. `computes` (the SAME ComputeManager instance already
+    // threaded into projects/branches/endpoints above) is new at this task: GET /api/pg-builds's
+    // inUse and DELETE's in-use guard both need runningPgbins(), which isn't exposed through any
+    // of those services' own public surfaces (see api.ts's Deps doc comment for why).
     const app = buildServer({
-      cfg, state, engine, logs, events, logger, registry, provisioner,
+      cfg, state, engine, logs, events, logger, registry, provisioner, computes,
       services: { projects, branches, endpoints, timetravel, sql },
     });
     await app.listen({ host: "0.0.0.0", port: cfg.httpPort });

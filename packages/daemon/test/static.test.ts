@@ -13,6 +13,9 @@ import type { TimeTravelService } from "../src/services/timetravel.js";
 import type { SqlService } from "../src/services/sql.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
+import type { BuildRegistry } from "../src/compute/builds/registry.js";
+import type { Provisioner } from "../src/compute/builds/provisioner.js";
+import type { ComputesApi } from "../src/services/engine-api.js";
 
 // Same fake-Deps recipe as test/api.test.ts / test/mcp-http.test.ts (fakeEngine/fakeProjects/etc.
 // pattern) — only `cfg` varies per test here (that's the whole point of this file), so the
@@ -35,6 +38,12 @@ function fakeDeps(overrides: { cfg: DevdbConfig }): Deps {
     engine: { status: () => ({}) } as unknown as EngineRuntime,
     logs: new LogsService(),
     events: new EventsService(),
+    // Task 10 (dynamic-pg-builds): registry/provisioner/computes are now required on Deps — this
+    // file's routes under test never touch a pg-builds route (static/SPA-fallback and early-guard
+    // paths only), so bare vi.fn() stand-ins are enough, same rationale as the service fakes below.
+    registry: { list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []) } as unknown as BuildRegistry,
+    provisioner: { updateAvailableFor: vi.fn(() => null) } as unknown as Provisioner,
+    computes: { runningPgbins: vi.fn(() => []) } as unknown as ComputesApi,
     services: {
       projects: { create: vi.fn(), list: vi.fn(), byIdOr404: vi.fn(), delete: vi.fn() } as unknown as ProjectsService,
       branches: {

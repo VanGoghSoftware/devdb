@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { connect } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -14,6 +14,9 @@ import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
+import type { BuildRegistry } from "../src/compute/builds/registry.js";
+import type { Provisioner } from "../src/compute/builds/provisioner.js";
+import type { ComputesApi } from "../src/services/engine-api.js";
 
 // Same fake-Deps pattern as test/api.test.ts (fakeEngine/fakeProjects/etc.) — only the fields
 // registerMcp's guard hook and its 400 "no session" branch touch need to exist; nothing here
@@ -32,6 +35,18 @@ function fakeDeps(env: Record<string, string> = {}) {
     engine: { status: () => ({}) } as unknown as EngineRuntime,
     logs: new LogsService(),
     events: new EventsService(),
+    // Task 10 (dynamic-pg-builds): registry/provisioner/computes are now required on Deps. Most
+    // requests in this file never reach a pg-builds route (every /mcp case 403s in the onRequest
+    // hook or 400s on isInitializeRequest before any route logic runs) — BUT the "leaves non-/mcp
+    // routes untouched" test below deliberately hits GET /api/status, which unconditionally calls
+    // registry.installedMajors()/list() and provisioner.updateAvailableFor() (see api.ts's status
+    // route). Bare `{}` stand-ins (this test's pre-fix state) crash that route with a 500 instead
+    // of proving the 200 the test asserts — these need real no-op vi.fn()s, same as static.test.ts.
+    registry: {
+      list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []),
+    } as unknown as BuildRegistry,
+    provisioner: { updateAvailableFor: vi.fn(() => null) } as unknown as Provisioner,
+    computes: { runningPgbins: vi.fn(() => []) } as unknown as ComputesApi,
     services: {
       projects: {} as unknown as ProjectsService,
       branches: {} as unknown as BranchesService,

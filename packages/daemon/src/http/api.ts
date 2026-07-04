@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { z, ZodError } from "zod";
-import { PgVersionSchema, BranchContextSchema } from "@devdb/shared";
+import { PgVersionSchema, BranchContextSchema, type PgMajorStatusDto } from "@devdb/shared";
 import type { DevdbConfig } from "../config.js";
 import type { StateDb } from "../state/db.js";
 import type { EngineRuntime } from "../engine/boot.js";
@@ -16,8 +16,9 @@ import type { SqlService } from "../services/sql.js";
 import type { Logger } from "../logging/logger.js";
 import type { BuildRegistry } from "../compute/builds/registry.js";
 import type { Provisioner } from "../compute/builds/provisioner.js";
+import type { ComputesApi } from "../services/engine-api.js";
 import { DevdbError } from "../services/errors.js";
-import { toBranchDto, toProjectDto } from "../services/dto.js";
+import { toBranchDto, toPgBuildDto, toProjectDto } from "../services/dto.js";
 import { daemonLogChannel } from "../logging/logger.js";
 import { registerMcp } from "../mcp/http.js";
 import { registerWebUi } from "./static.js";
@@ -48,13 +49,17 @@ export interface Deps {
   // don't all need editing just to satisfy a new required field. Only mcp/tools.ts's guard()
   // reads this, falling back to console.error when absent (see tools.ts's guard() comment).
   logger?: Logger;
-  // Task 9 (dynamic-pg-builds): optional for the SAME reason as logger? above — the pg-builds
-  // REST routes (GET/pull/activate/remove) that actually consume these are Task 10's job, not
-  // this task's. Wiring the fields into Deps now (rather than waiting for Task 10) means index.ts
-  // only needs to be edited once for the full boot order, and any test file that doesn't touch
-  // pg-builds routes keeps typechecking unchanged with no registry/provisioner in its fakeDeps().
-  registry?: BuildRegistry;
-  provisioner?: Provisioner;
+  // Task 10 (dynamic-pg-builds): required (unlike Task 9's optional placeholder above) — the
+  // pg-builds REST routes below call registry/provisioner unconditionally, and GET /api/status's
+  // pgBuilds block (also below) is no longer the Task-1 `{}` stopgap. `computes` is new at this
+  // task: none of the OTHER services expose a `runningPgbins()` passthrough (it's a private ctor
+  // dep of ProjectsService/BranchesService/EndpointsService, consumed internally — see
+  // engine-api.ts's ComputesApi), so the routes that need "which pgbins are currently running"
+  // (GET /api/pg-builds's inUse, DELETE's in-use guard) take the compute manager directly here
+  // rather than reaching through an unrelated service's public surface for it.
+  registry: BuildRegistry;
+  provisioner: Provisioner;
+  computes: ComputesApi;
   services: {
     projects: ProjectsService; branches: BranchesService; endpoints: EndpointsService;
     timetravel: TimeTravelService; sql: SqlService;
@@ -96,11 +101,26 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.get("/api/status", async () => {
     const engine = deps.engine.status();
     const healthy = Object.values(engine).every((p) => p.state === "running");
+    // Task 10: real registry-backed block, replacing the Task-1 `{}` stopgap. Keyed by major as
+    // a string (the wire contract — see PgMajorStatusDto/StatusDto's own doc comments in shared).
+    // `active` here means the row BuildRegistry.resolveActives() picked as this major's exclusive
+    // winner AND that's still ready — not merely "some row happens to have active=1 set", though
+    // in practice those never diverge (resolveActives/activate keep the flag in sync with status).
+    const pgBuilds: Record<string, PgMajorStatusDto> = {};
+    for (const major of deps.registry.installedMajors()) {
+      const active = deps.registry.list().find((r) => r.major === major && r.active && r.status === "ready") ?? null;
+      pgBuilds[String(major)] = {
+        activeVersion: active?.minor != null ? `${active.major}.${active.minor}` : null,
+        source: active?.source ?? null,
+        degradedDowngrade: deps.registry.degradedMajors().includes(major),
+        updateAvailable: deps.provisioner.updateAvailableFor(major),
+      };
+    }
     return {
       version: PACKAGE_VERSION, healthy, engine,
       portRange: deps.cfg.portRange,
       storage: "none" as const, // phase 4 wires real modes (spec §Daemon additions)
-      pgBuilds: {}, // Task 10 wires the real registry-backed block
+      pgBuilds,
     };
   });
 
@@ -414,6 +434,60 @@ export function buildServer(deps: Deps): FastifyInstance {
   app.post("/api/sql", async (req) => {
     const body = SqlBody.parse(req.body);
     return deps.services.sql.run(body.branchId, body.query);
+  });
+
+  // Task 10 (dynamic-pg-builds): REST over BuildRegistry (rows/status queries — synchronous,
+  // in-process SQLite) + Provisioner (check/pull/remove — the only routes with real I/O: OCI
+  // registry egress and filesystem work). GET is a pure read; the four mutating routes below all
+  // delegate to the registry/provisioner for validation (409s come from assertRemovable/activate's
+  // downgrade guard/the pull mutex, not from anything checked here) — this file stays a thin HTTP
+  // adapter, same posture as every other route above it.
+  app.get("/api/pg-builds", async () => {
+    const runningPgbins = deps.computes.runningPgbins();
+    return deps.registry.list().map((row) => toPgBuildDto(row, runningPgbins));
+  });
+
+  // Body-optional: an absent (or empty) `majors` defaults to every currently-installed major —
+  // "recheck what I have" is the common case; an explicit array (e.g. probing a not-yet-installed
+  // major before pulling it) is the exception. THE only egress trigger besides pull() itself —
+  // both hit the OCI registry over the network, everything else in this block is local-only.
+  const CheckBody = z.object({ majors: z.array(z.number().int()).optional() });
+  app.post("/api/pg-builds/check", async (req) => {
+    const body = CheckBody.parse(req.body ?? {});
+    const majors = body.majors ?? deps.registry.installedMajors();
+    return deps.provisioner.check(majors);
+  });
+
+  // 202, not 200: pull() returns as soon as the `downloading` row is inserted — the real work
+  // (OCI pull, fixup, validation gate, auto-activate) runs after this response is sent. Callers
+  // poll GET /api/pg-builds (or the pg_builds SSE event) for the row's status to advance. A
+  // concurrent pull is the provisioner's own global-mutex 409 (see Provisioner.pull), surfaced
+  // through the standard DevdbError branch of the error handler above — no special-casing here.
+  const PullBody = z.object({ major: PgVersionSchema, tag: z.string().min(1).optional() });
+  app.post("/api/pg-builds/pull", async (req, reply) => {
+    const body = PullBody.parse(req.body);
+    const result = await deps.provisioner.pull(body);
+    return reply.status(202).send(result);
+  });
+
+  // Explicit activation (e.g. picking an older build from the UI, or clearing a degraded-downgrade
+  // flag with consent). registry.activate() is pure registry/SQLite bookkeeping — it has no
+  // opinion on pg_distrib, so recomposeDistrib() runs right after (same as pull's auto-activate
+  // and remove() below), followed by a pg_builds invalidation hint for SSE subscribers.
+  const ActivateBody = z.object({ consented: z.boolean().optional() });
+  app.post("/api/pg-builds/:id/activate", async (req) => {
+    const { id } = req.params as { id: string };
+    const body = ActivateBody.parse(req.body ?? {});
+    const row = deps.registry.activate(id, { consented: body.consented });
+    await deps.provisioner.recomposeDistrib();
+    deps.events.publish({ type: "pg_builds" });
+    return toPgBuildDto(row, deps.computes.runningPgbins());
+  });
+
+  app.delete("/api/pg-builds/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    await deps.provisioner.remove(id, deps.computes.runningPgbins());
+    return reply.status(204).send();
   });
 
   registerWebUi(app, deps.cfg); // must stay last — SPA fallback owns the not-found handler

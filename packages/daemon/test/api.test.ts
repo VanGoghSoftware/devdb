@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildServer } from "../src/http/api.js";
 import type { EngineRuntime } from "../src/engine/boot.js";
 import type { ProjectsService } from "../src/services/projects.js";
@@ -11,7 +11,13 @@ import { EventsService } from "../src/services/events.js";
 import { DevdbError } from "../src/services/errors.js";
 import { loadConfig } from "../src/config.js";
 import { openState } from "../src/state/db.js";
-import { toBranchDto } from "../src/services/dto.js";
+import { toBranchDto, toPgBuildDto } from "../src/services/dto.js";
+import { BuildRegistry } from "../src/compute/builds/registry.js";
+import type { Provisioner } from "../src/compute/builds/provisioner.js";
+import type { ComputesApi } from "../src/services/engine-api.js";
+import {
+  cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs,
+} from "./helpers/build-fixtures.js";
 
 // Task 3 (DTO mappers): a realistic, FULLY-populated BranchDetail fixture — including the
 // internal-only `password`/`stickyPort`/`importStatus`/`importError` columns — so route tests
@@ -90,6 +96,42 @@ function fakeSql(): SqlService {
   return { run: vi.fn() } as unknown as SqlService;
 }
 
+// Task 10 (dynamic-pg-builds): Deps.computes/registry/provisioner became required so the
+// pg-builds routes below can call them unconditionally (Task 9 left them optional purely so
+// this file's ~30 pre-existing inline Deps literals — none of which touched pg-builds — didn't
+// all need editing just to satisfy a new required field; Task 10 IS the task that touches them).
+// A minimal no-op fake is enough for every route test that doesn't exercise pg-builds; the
+// pg-builds describe block below overrides these three per test.
+function fakeComputes(): ComputesApi {
+  return {
+    start: vi.fn(), stop: vi.fn(), statusOf: vi.fn(), portOf: vi.fn(),
+    runningPorts: vi.fn(() => []), runningPgbin: vi.fn(() => null), runningPgbins: vi.fn(() => []),
+    onLine: vi.fn(() => () => {}), stopAll: vi.fn(),
+  } as unknown as ComputesApi;
+}
+
+// Same rationale as fakeProjects()/fakeBranches() above — Deps.registry is typed against the
+// concrete BuildRegistry class. Only the methods the pg-builds routes call need to exist; the
+// pg-builds describe block below builds a REAL BuildRegistry over scaffolded temp dirs (via
+// makePgBuildsRegistry) instead of this bare default, since those tests need real row/fs behavior.
+function fakeRegistry(): BuildRegistry {
+  return {
+    list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []),
+    activate: vi.fn(), pgbinFor: vi.fn(), versionForPgbin: vi.fn(() => null),
+    assertRemovable: vi.fn(), gcCandidates: vi.fn(() => []),
+  } as unknown as BuildRegistry;
+}
+
+// Only the methods api.ts's pg-builds routes actually call need to exist — same rationale as
+// fakeProjects()/fakeBranches() etc. above. Deps.provisioner is typed against the concrete
+// Provisioner class, so a plain fake needs the same narrowly-scoped cast.
+function fakeProvisioner(): Provisioner {
+  return {
+    check: vi.fn(), pull: vi.fn(), remove: vi.fn(),
+    updateAvailableFor: vi.fn(() => null), recomposeDistrib: vi.fn(),
+  } as unknown as Provisioner;
+}
+
 function testCfg() {
   return loadConfig({
     DEVDB_DATA_DIR: "/tmp/devdb-api-test-only",
@@ -104,6 +146,7 @@ describe("buildServer error handling", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -135,6 +178,7 @@ describe("buildServer error handling", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects, branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -156,6 +200,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -191,6 +236,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -218,6 +264,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.list).mockResolvedValue(rows);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects, branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -240,6 +287,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -265,6 +313,7 @@ describe("buildServer branch routes", () => {
     });
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -281,6 +330,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.delete).mockResolvedValueOnce(undefined);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -313,6 +363,7 @@ describe("buildServer branch routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -334,6 +385,7 @@ describe("buildServer branch routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -355,6 +407,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.start).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -377,6 +430,7 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -394,6 +448,7 @@ describe("buildServer endpoint routes", () => {
     vi.mocked(endpoints.stop).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints, timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -416,6 +471,7 @@ describe("buildServer endpoint routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -434,6 +490,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.lsnAtTimestamp).mockResolvedValue("0/1A2B3C");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -449,6 +506,7 @@ describe("buildServer time travel routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -467,6 +525,7 @@ describe("buildServer time travel routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -484,6 +543,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.restoreInPlace).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -513,6 +573,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(branches.detail).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches, endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -537,6 +598,7 @@ describe("buildServer time travel routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -556,6 +618,7 @@ describe("buildServer time travel routes", () => {
     vi.mocked(timetravel.resetToParent).mockResolvedValue(fakeDetail);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -577,6 +640,7 @@ describe("buildServer time travel routes", () => {
     );
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel, sql: fakeSql() },
     });
 
@@ -596,6 +660,7 @@ describe("buildServer /api/sql", () => {
     vi.mocked(sql.run).mockResolvedValue(fakeResult as unknown as Awaited<ReturnType<SqlService["run"]>>);
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -615,6 +680,7 @@ describe("buildServer /api/sql", () => {
     const sql = fakeSql();
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -631,6 +697,7 @@ describe("buildServer /api/sql", () => {
     const sql = fakeSql();
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -648,6 +715,7 @@ describe("buildServer /api/sql", () => {
     vi.mocked(sql.run).mockRejectedValue(new DevdbError(502, `endpoint for "main" is not running`));
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql },
     });
 
@@ -670,6 +738,7 @@ describe("buildServer /api/status", () => {
     const engine = { status: () => ({ storcon_db: { state: "running", pid: 123 } }) } as unknown as EngineRuntime;
     const app = buildServer({
       cfg, state, engine, logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -693,6 +762,7 @@ describe("buildServer /api/status", () => {
     } as unknown as EngineRuntime;
     const app = buildServer({
       cfg, state, engine, logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -710,6 +780,7 @@ describe("buildServer /api/status", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -738,6 +809,7 @@ describe("buildServer SSE log routes", () => {
     const state = openState(":memory:");
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs, events: extra.events ?? fakeEvents(),
+      registry: fakeRegistry(), provisioner: fakeProvisioner(), computes: fakeComputes(),
       services: {
         projects: fakeProjects(),
         branches: extra.branches ?? fakeBranches(),
@@ -940,5 +1012,289 @@ describe("buildServer SSE log routes", () => {
     } finally {
       await app.close();
     }
+  });
+});
+
+// Task 10 (dynamic-pg-builds): REST routes over BuildRegistry (Task 4) + Provisioner (Task 7),
+// wired into Deps at Task 9. Unlike the generic fakeRegistry()/fakeProvisioner() used by every
+// OTHER describe block above (which never touch a pg-builds route and so get bare vi.fn() stand-
+// ins), these tests need a REAL BuildRegistry over scaffolded temp dirs — its whole job is real
+// fs scanning + real SQLite row bookkeeping (toPgBuildDto, installedMajors, degradedMajors,
+// activate's downgrade-consent logic) that a typed fake would just have to reimplement badly.
+// Provisioner stays a typed fake here (per the task brief): its own real behavior (OCI pulls,
+// validation gate, disk preflight) is covered end-to-end in provisioner.test.ts; these tests only
+// need to prove the ROUTE calls the right Provisioner method with the right args and maps the
+// result/error correctly.
+describe("buildServer pg-builds routes", () => {
+  const pgBuildsDirs = trackedDirs();
+  afterEach(async () => { await cleanupDirs(pgBuildsDirs); });
+
+  // A real BuildRegistry seeded with one baked v16 row (active) and one downloaded v17 row (also
+  // active — different major, so no exclusivity conflict) via the SAME seedBaked/adoptVolumeBuilds/
+  // resolveActives pipeline pg-build-registry.test.ts exercises directly. Returns state too, so
+  // tests needing extra seeding (e.g. pgMajors.recordRun for the degraded-status test) can reach it.
+  async function makePgBuildsRegistry(): Promise<{ registry: BuildRegistry; state: ReturnType<typeof openState> }> {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    pgBuildsDirs.push(root);
+    const v16 = await fakeInstallDir(install, "v16");
+    const v17dl = await fakeVolumeBuild(builds, 17, "9124", {
+      digest: "sha256:" + "a".repeat(64), tag: "9124", major: 17, minor: 5, extractedAt: "2026-07-01T00:00:00.000Z",
+    });
+    const state = openState(":memory:");
+    const registry = new BuildRegistry({
+      state, pgInstallDir: install, pgBuildsDir: builds, logger: noopLogger,
+      detectVersion: async (pgbin) => {
+        if (pgbin.startsWith(v16)) return { major: 16, minor: 9 };
+        if (pgbin.startsWith(v17dl)) return { major: 17, minor: 5 };
+        throw new Error(`no fake version for ${pgbin}`);
+      },
+    });
+    await registry.seedBaked();
+    await registry.adoptVolumeBuilds();
+    registry.resolveActives();
+    return { registry, state };
+  }
+
+  it("GET /api/pg-builds lists rows as DTOs with inUse derived from running pgbins", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const { registry } = await makePgBuildsRegistry();
+    const rows = registry.list();
+    const downloadedRow = rows.find((r) => r.source === "downloaded")!;
+    const computes = fakeComputes();
+    // Running pgbin path is UNDER the downloaded build's dir (path + "/bin/postgres") — inUse
+    // derivation (toPgBuildDto) checks a prefix match against row.path + "/", not exact equality.
+    vi.mocked(computes.runningPgbins).mockReturnValue([`${downloadedRow.path}/bin/postgres`]);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner: fakeProvisioner(), computes,
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/pg-builds" });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toHaveLength(2);
+    const dl = body.find((r: { source: string }) => r.source === "downloaded");
+    const baked = body.find((r: { source: string }) => r.source === "baked");
+    expect(dl).toMatchObject({ major: 17, minor: 5, version: "17.5", inUse: true, active: true, status: "ready" });
+    expect(baked).toMatchObject({ major: 16, minor: 9, version: "16.9", inUse: false, active: true, status: "ready" });
+    // Cross-check against the real mapper directly, not just field-by-field — proves the route
+    // is genuinely delegating to toPgBuildDto rather than reimplementing (or drifting from) it.
+    expect(body).toEqual(
+      expect.arrayContaining(rows.map((r) => toPgBuildDto(r, [`${downloadedRow.path}/bin/postgres`]))),
+    );
+  });
+
+  it("POST /api/pg-builds/pull returns 202 with buildId; concurrent pull surfaces 409", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.pull)
+      .mockResolvedValueOnce({ buildId: "b1" })
+      .mockRejectedValueOnce(new DevdbError(409, "a build pull is already in progress"));
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const first = await app.inject({ method: "POST", url: "/api/pg-builds/pull", payload: { major: 17 } });
+    expect(first.statusCode).toBe(202);
+    expect(first.json()).toEqual({ buildId: "b1" });
+    expect(provisioner.pull).toHaveBeenCalledWith({ major: 17, tag: undefined });
+
+    const second = await app.inject({ method: "POST", url: "/api/pg-builds/pull", payload: { major: 17 } });
+    expect(second.statusCode).toBe(409);
+    expect(second.json().error).toMatch(/already in progress/);
+  });
+
+  it("POST /api/pg-builds/pull — zod 400 on an invalid major (below the gte(14) floor)", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const provisioner = fakeProvisioner();
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry: fakeRegistry(), provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/pg-builds/pull", payload: { major: 9 } });
+
+    expect(res.statusCode).toBe(400);
+    expect(provisioner.pull).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/pg-builds/:id/activate returns the activated dto; DELETE returns 204", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const { registry } = await makePgBuildsRegistry();
+    const bakedId = registry.list().find((r) => r.source === "baked")!.id;
+    const events = fakeEvents();
+    const publishSpy = vi.spyOn(events, "publish");
+    const provisioner = fakeProvisioner();
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events,
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const activateRes = await app.inject({
+      method: "POST", url: `/api/pg-builds/${bakedId}/activate`, payload: {},
+    });
+    expect(activateRes.statusCode).toBe(200);
+    const activated = registry.list().find((r) => r.id === bakedId)!;
+    expect(activateRes.json()).toEqual(toPgBuildDto(activated, []));
+    expect(provisioner.recomposeDistrib).toHaveBeenCalledTimes(1);
+    expect(publishSpy).toHaveBeenCalledWith({ type: "pg_builds" });
+
+    // DELETE targets the (now-inactive) downloaded v17 row — the active baked-v16 row above would
+    // 409 via assertRemovable's "is the active build" guard, which isn't what this test proves.
+    const downloadedId = registry.list().find((r) => r.source === "downloaded")!.id;
+    vi.mocked(provisioner.remove).mockResolvedValue(undefined);
+    const deleteRes = await app.inject({ method: "DELETE", url: `/api/pg-builds/${downloadedId}` });
+    expect(deleteRes.statusCode).toBe(204);
+    expect(provisioner.remove).toHaveBeenCalledWith(downloadedId, []);
+  });
+
+  // Fastify sets req.body to `undefined` (not `{}`) when a request carries no payload at all —
+  // verified empirically against this installed Fastify version (a bare inject() with no
+  // `payload` key produces `bodyType: "undefined"`, only an explicit `payload: {}` produces an
+  // actual object). ActivateBody/CheckBody's `.parse(req.body ?? {})` fallback exists specifically
+  // for this real-client case (a plain `POST .../activate` with no body); every OTHER `it()` in
+  // this describe block only ever tests the `payload: {}` case, which would pass even without
+  // that `?? {}` guard — this test is the one that actually exercises the guard's reason to exist.
+  it("POST /api/pg-builds/:id/activate — a request with NO body at all (not even {}) still defaults consented to undefined", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const { registry } = await makePgBuildsRegistry();
+    const bakedId = registry.list().find((r) => r.source === "baked")!.id;
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner: fakeProvisioner(), computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "POST", url: `/api/pg-builds/${bakedId}/activate` }); // no payload key
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ id: bakedId, active: true });
+  });
+
+  it("POST /api/pg-builds/:id/activate — 409 surfaces the registry's downgrade-consent DevdbError", async () => {
+    const cfg = testCfg();
+    // NOTE: reuses the `state` makePgBuildsRegistry() itself constructed `registry` over (NOT a
+    // second, unrelated openState(":memory:")) — the seeded "older" row below must land in the
+    // SAME SQLite instance registry.activate()'s lookups actually query, or byId() correctly
+    // finds nothing and this test would only prove the generic "not found" 409, not the downgrade-
+    // consent one it's named for.
+    const { registry, state } = await makePgBuildsRegistry();
+    const downloadedId = registry.list().find((r) => r.source === "downloaded")!.id;
+    registry.activate(downloadedId); // 17.5 becomes active
+    // registry.activate() alone does NOT raise the high-water mark — only recordRun() does (it
+    // models an endpoint START of that version, see registry.ts's own doc comment on recordRun).
+    // Without this explicit call, activate()'s downgrade check (which compares against
+    // pgMajors.lastRunMinor) would see lastRun === null and never flag a downgrade at all — same
+    // recipe pg-build-registry.test.ts's own downgrade tests use (state.pgMajors.recordRun(...)).
+    registry.recordRun(17, 5);
+    // Re-seed an OLDER 17.x row to attempt a downgrade activation against.
+    state.pgBuilds.insert({
+      id: "dl-17-older", major: 17, minor: 4, source: "downloaded",
+      releaseTag: "old", imageDigest: "sha256:" + "b".repeat(64), path: "/fake/older", status: "ready",
+    });
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner: fakeProvisioner(), computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/pg-builds/dl-17-older/activate", payload: {} });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/downgrade/);
+  });
+
+  it("DELETE /api/pg-builds/:id — 409 when the registry refuses (e.g. active/baked/in-use)", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const { registry } = await makePgBuildsRegistry();
+    const bakedId = registry.list().find((r) => r.source === "baked")!.id; // active baked row
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.remove).mockRejectedValue(
+      new DevdbError(409, `pg_build ${bakedId} is a baked build and cannot be removed`),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "DELETE", url: `/api/pg-builds/${bakedId}` });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/baked build and cannot be removed/);
+  });
+
+  it("POST /api/pg-builds/check forwards majors and returns the provisioner's map", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const { registry } = await makePgBuildsRegistry(); // installedMajors() -> [16, 17]
+    const provisioner = fakeProvisioner();
+    const checkResult = {
+      "16": { tag: "latest" as const, digest: "sha256:c".repeat(1), isNew: false, at: "2026-07-04T00:00:00.000Z" },
+      "17": { tag: "latest" as const, digest: "sha256:d".repeat(1), isNew: true, at: "2026-07-04T00:00:00.000Z" },
+    };
+    vi.mocked(provisioner.check).mockResolvedValue(checkResult);
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    // Default: truly NO body at all (no `payload` key — Fastify leaves req.body `undefined` in
+    // this case, verified empirically; see the activate route's own "no body at all" test above
+    // for the same guard) -> majors defaults to registry.installedMajors().
+    const defaultRes = await app.inject({ method: "POST", url: "/api/pg-builds/check" });
+    expect(defaultRes.statusCode).toBe(200);
+    expect(provisioner.check).toHaveBeenCalledWith([16, 17]);
+    expect(defaultRes.json()).toEqual(checkResult);
+
+    // Explicit majors -> forwarded as-is, not defaulted.
+    vi.mocked(provisioner.check).mockClear();
+    vi.mocked(provisioner.check).mockResolvedValue({ "18": checkResult["17"]! });
+    const explicitRes = await app.inject({ method: "POST", url: "/api/pg-builds/check", payload: { majors: [18] } });
+    expect(explicitRes.statusCode).toBe(200);
+    expect(provisioner.check).toHaveBeenCalledWith([18]);
+  });
+
+  it("GET /api/status carries pgBuilds with activeVersion/degradedDowngrade/updateAvailable", async () => {
+    const cfg = testCfg();
+    const { registry, state } = await makePgBuildsRegistry();
+    // Force major 16 into a degraded state: record a HIGHER minor as having run than the one
+    // currently resolved active, then re-resolve — mirrors pg-build-registry.test.ts's own
+    // "silent downgrade forbidden" test recipe (state.pgMajors.recordRun then resolveActives()).
+    state.pgMajors.recordRun(16, 99);
+    registry.resolveActives();
+    const provisioner = fakeProvisioner();
+    vi.mocked(provisioner.updateAvailableFor).mockImplementation((major) =>
+      major === 17 ? "latest@abc123def456" : null,
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      registry, provisioner, computes: fakeComputes(),
+      services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/status" });
+
+    expect(res.statusCode).toBe(200);
+    const { pgBuilds } = res.json();
+    expect(pgBuilds["16"]).toEqual({
+      activeVersion: "16.9", source: "baked", degradedDowngrade: true, updateAvailable: null,
+    });
+    expect(pgBuilds["17"]).toEqual({
+      activeVersion: "17.5", source: "downloaded", degradedDowngrade: false, updateAvailable: "latest@abc123def456",
+    });
   });
 });

@@ -18,6 +18,8 @@ import type { ToolCtx } from "../../src/mcp/server.js";
 import type { Deps } from "../../src/http/api.js";
 import type { EngineRuntime } from "../../src/engine/boot.js";
 import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../../src/services/engine-api.js";
+import type { BuildRegistry } from "../../src/compute/builds/registry.js";
+import type { Provisioner } from "../../src/compute/builds/provisioner.js";
 import type { Logger } from "../../src/logging/logger.js";
 import type { EndpointStatus } from "@devdb/shared";
 
@@ -150,6 +152,14 @@ export async function makeReadToolsHarness(opts?: {
     // assert guard() actually logged a non-DevdbError failure through THIS instance, not just that
     // some logger somewhere was called.
     logger: f.logger,
+    // Task 10 (dynamic-pg-builds): registry/provisioner/computes are now required on Deps — no
+    // MCP read tool this harness drives touches a pg-builds route (those are REST-only per this
+    // task's brief; MCP pg-builds tool coverage, if any, is Task 11's job), so bare stand-ins are
+    // enough here. `computes` reuses the SAME typed ComputesApi fake (`f.computes`) already wired
+    // into every service above, rather than a second divergent one.
+    registry: { list: vi.fn(() => []), installedMajors: vi.fn(() => []), degradedMajors: vi.fn(() => []) } as unknown as BuildRegistry,
+    provisioner: { updateAvailableFor: vi.fn(() => null) } as unknown as Provisioner,
+    computes: f.computes,
     services: { projects, branches, endpoints, timetravel, sql },
   };
 
