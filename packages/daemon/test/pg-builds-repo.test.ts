@@ -44,6 +44,26 @@ describe("PgBuildsRepo", () => {
     s.pgBuilds.delete("b1");
     expect(s.pgBuilds.byId("b1")).toBeNull();
   });
+
+  it("two rows may share (major, release_tag) at different digests — tags are metadata, digests are identity", () => {
+    const s = mem();
+    s.pgBuilds.insert({ id: "old", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "sha256:aaa", path: "/d/v17/aaa", status: "ready" });
+    // A mutable-tag re-pull at a newer digest — the old UNIQUE(major, release_tag) made this throw.
+    s.pgBuilds.insert({ id: "new", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "sha256:bbb", path: "/d/v17/bbb", status: "ready" });
+    expect(s.pgBuilds.list().map((r) => r.id).sort()).toEqual(["new", "old"]);
+  });
+
+  it("setDigestPath fills digest+path on an in-flight row; byDigest prefers a ready row over a failed one at the same digest", () => {
+    const s = mem();
+    s.pgBuilds.insert({ id: "r1", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "", path: "", status: "downloading" });
+    s.pgBuilds.setDigestPath("r1", { imageDigest: "sha256:abc", path: "/d/v17/abc" });
+    expect(s.pgBuilds.byId("r1")).toMatchObject({ imageDigest: "sha256:abc", path: "/d/v17/abc", status: "downloading" });
+
+    // A later successful retry at the same digest must win the dedup lookup over the failed attempt.
+    s.pgBuilds.setStatus("r1", "failed", "gate timed out after 90s");
+    s.pgBuilds.insert({ id: "r2", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "sha256:abc", path: "/d/v17/abc2", status: "ready" });
+    expect(s.pgBuilds.byDigest("sha256:abc")?.id).toBe("r2");
+  });
 });
 
 describe("PgMajorsRepo", () => {

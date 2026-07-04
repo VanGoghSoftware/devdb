@@ -199,8 +199,14 @@ export class PgBuildsRepo {
     const r = this.db.prepare("SELECT * FROM pg_builds WHERE id = ?").get(id);
     return r ? pgBuildRow(r as Record<string, unknown>) : null;
   }
+  // Multiple rows may legitimately share a digest (e.g. a gate-failed attempt followed by a
+  // successful retry) — prefer a ready row, then the newest, so the dedup check ("is this digest
+  // already installed?") never lands on a stale failed attempt when a usable install exists.
   byDigest(digest: string): PgBuildRow | null {
-    const r = this.db.prepare("SELECT * FROM pg_builds WHERE image_digest = ? AND image_digest != ''").get(digest);
+    const r = this.db.prepare(
+      `SELECT * FROM pg_builds WHERE image_digest = ? AND image_digest != ''
+       ORDER BY (status = 'ready') DESC, created_at DESC, rowid DESC LIMIT 1`,
+    ).get(digest);
     return r ? pgBuildRow(r as Record<string, unknown>) : null;
   }
   byMajorAndTag(major: number, tag: string): PgBuildRow | null {
@@ -223,6 +229,11 @@ export class PgBuildsRepo {
   }
   updatePath(id: string, path: string): void {
     this.db.prepare("UPDATE pg_builds SET path = ? WHERE id = ?").run(path, id);
+  }
+  // Fills in the digest + content-addressed path on an in-flight row once resolveDigest has run —
+  // pull() inserts the row with the '' digest sentinel before either is known.
+  setDigestPath(id: string, a: { imageDigest: string; path: string }): void {
+    this.db.prepare("UPDATE pg_builds SET image_digest = ?, path = ? WHERE id = ?").run(a.imageDigest, a.path, id);
   }
   // Transactional: at most one active row per major, ever (spec: "one atomic flip within the major").
   setActiveExclusive(id: string): void {

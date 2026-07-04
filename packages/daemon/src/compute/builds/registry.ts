@@ -6,6 +6,14 @@ import type { PgBuildRow } from "../../state/repos.js";
 
 interface BuildMarker { digest: string; tag: string; major: number; minor: number; extractedAt: string }
 
+// The first 16 hex chars of a sha256 image digest — the content-address component used for a
+// downloaded build's directory name (`v{major}/{shortDigest}`, `.tmp-{shortDigest}` while
+// extracting) and its adopted-row id (`dl-{major}-{shortDigest}`). Tags are NOT identity: a
+// mutable tag (`latest`) re-pulled at a newer digest must land in a new dir beside the old one.
+export function shortDigest(digest: string): string {
+  return digest.replace(/^sha256:/, "").slice(0, 16);
+}
+
 function versionString(row: PgBuildRow): string {
   return `${row.major}.${row.minor}`;
 }
@@ -38,23 +46,29 @@ export class BuildRegistry {
     }
   }
 
-  // Re-inserts registry rows from build.json markers under pgBuildsDir/v*/<tag>/ (skipping
-  // .tmp-* — in-progress installs). Markers are self-describing so this recovers registry state
-  // even from a lost SQLite. Rows whose backing dir has vanished since the last adopt are marked
-  // failed via a presence check on bin/postgres (not a re-hash — the atomic-rename install
-  // discipline is what makes presence trustworthy).
+  // Re-inserts registry rows from build.json markers under pgBuildsDir/v*/<shortDigest>/
+  // (skipping .tmp-* — in-progress installs). Markers are self-describing (digest/tag/major/
+  // minor), so identity comes from the marker's DIGEST, never from the dir name — this recovers
+  // registry state even from a lost SQLite. A dir already tracked by an existing row (a
+  // pull-created row keeps its UUID id, not the dl- form) is skipped by a path claim check:
+  // without it every boot would re-adopt pulled dirs as duplicate rows sharing one path, and a
+  // later GC/remove of the duplicate would rm the live build's directory. Rows whose backing dir
+  // has vanished since the last adopt are marked failed via a presence check on bin/postgres
+  // (not a re-hash — the atomic-rename install discipline is what makes presence trustworthy).
   async adoptVolumeBuilds(): Promise<void> {
+    const claimedPaths = new Set(this.deps.state.pgBuilds.list().map((r) => r.path));
     const majors = await readdir(this.deps.pgBuildsDir).catch(() => [] as string[]);
     for (const vdir of majors) {
       if (!/^v\d+$/.test(vdir)) continue;
-      const tags = await readdir(join(this.deps.pgBuildsDir, vdir)).catch(() => [] as string[]);
-      for (const tag of tags) {
-        if (tag.startsWith(".tmp-")) continue;
-        const path = join(this.deps.pgBuildsDir, vdir, tag);
-        const id = `dl-${vdir.slice(1)}-${tag}`;
-        if (this.deps.state.pgBuilds.byId(id)) continue;
+      const entries = await readdir(join(this.deps.pgBuildsDir, vdir)).catch(() => [] as string[]);
+      for (const entry of entries) {
+        if (entry.startsWith(".tmp-")) continue;
+        const path = join(this.deps.pgBuildsDir, vdir, entry);
+        if (claimedPaths.has(path)) continue;
         try {
           const marker = JSON.parse(await readFile(join(path, "build.json"), "utf8")) as BuildMarker;
+          const id = `dl-${marker.major}-${shortDigest(marker.digest)}`;
+          if (this.deps.state.pgBuilds.byId(id)) continue;
           await access(join(path, "bin", "postgres"));
           this.deps.state.pgBuilds.insert({
             id, major: marker.major, minor: marker.minor, source: "downloaded",
@@ -194,13 +208,17 @@ export class BuildRegistry {
   }
 
   // 409s a removal request for: the active row (would strand the major mid-use), any baked row
-  // (not ours to delete — it ships with the image), or a row whose path is a prefix of a pgbin
-  // some running compute currently has open (deleting out from under a live process).
+  // (not ours to delete — it ships with the image), a row whose pull is still in flight
+  // (remove() must not race a live extraction/validation), or a row whose path is a prefix of a
+  // pgbin some running compute currently has open (deleting out from under a live process).
   assertRemovable(id: string, runningPgbins: string[]): PgBuildRow {
     const row = this.deps.state.pgBuilds.byId(id);
     if (!row) throw new DevdbError(409, `pg_build ${id} not found`);
     if (row.active) throw new DevdbError(409, `pg_build ${id} is the active build for major ${row.major}`);
     if (row.source === "baked") throw new DevdbError(409, `pg_build ${id} is a baked build and cannot be removed`);
+    if (row.status === "downloading" || row.status === "validating") {
+      throw new DevdbError(409, `pg_build ${id} has a pull in flight — wait for it to finish or fail`);
+    }
     if (runningPgbins.some((p) => p.startsWith(row.path + "/"))) {
       throw new DevdbError(409, `pg_build ${id} is in use by a running endpoint`);
     }

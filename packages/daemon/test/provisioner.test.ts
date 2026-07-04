@@ -6,15 +6,19 @@ import { BuildRegistry } from "../src/compute/builds/registry.js";
 import { Provisioner } from "../src/compute/builds/provisioner.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
+import { DevdbError } from "../src/services/errors.js";
 import type { OciPuller } from "../src/compute/builds/oci.js";
 import type { DevdbEvent } from "@devdb/shared";
-import { cleanupDirs, fakeInstallDir, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
+import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
 const dirs = trackedDirs();
 afterEach(async () => { await cleanupDirs(dirs); });
 
 const DIGEST_A = "sha256:" + "a".repeat(64);
 const DIGEST_B = "sha256:" + "b".repeat(64);
+// Content-address components (shortDigest): first 16 hex chars after the sha256: prefix.
+const SHORT_A = DIGEST_A.slice(7, 23);
+const SHORT_B = DIGEST_B.slice(7, 23);
 
 // A fake OciPuller that writes a scaffold `bin/postgres` into destDir — standing in for a real
 // pull/extract. Returns spies so tests can assert call counts precisely (dedup / preflight cases).
@@ -260,6 +264,124 @@ describe("Provisioner", () => {
     // Mutex must still clear on this path too — a subsequent pull must be ACCEPTED, not rejected.
     const { buildId: nextId } = await provisioner.pull({ major: 16 });
     expect(nextId).not.toBe(buildId);
+  });
+
+  it("mutable-tag re-pull: same tag at a NEW digest installs a NEW build in a digest-named dir; the old digest's row and dir persist", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    // Seed: an earlier `latest` pull, ready + active at digest A, living in its digest-named dir.
+    const oldDir = await fakeVolumeBuild(builds, 17, SHORT_A,
+      { digest: DIGEST_A, tag: "latest", major: 17, minor: 4, extractedAt: "x" });
+    // The registry now serves a NEWER digest for the same `latest` tag (a new minor was published).
+    const { oci } = fakeOci({ digest: DIGEST_B });
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({
+      id: "old-latest", major: 17, minor: 4, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: oldDir, status: "ready",
+    });
+    state.pgBuilds.setActiveExclusive("old-latest");
+
+    // Same tag, new digest — the old (major, tag) identity model made this collide and throw.
+    const { buildId } = await provisioner.pull({ major: 17, tag: "latest" });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("ready");
+      return r!;
+    });
+    expect(row.active).toBe(true);
+    expect(row.imageDigest).toBe(DIGEST_B);
+    expect(row.releaseTag).toBe("latest"); // tag survives as metadata (what was asked for)
+    expect(row.path).toBe(join(builds, "v17", SHORT_B)); // digest-derived dir, no tag collision
+    await access(join(row.path, "bin", "postgres"));
+
+    // The old digest's row + dir persist untouched (until GC) — only the active pointer moved.
+    expect(state.pgBuilds.byId("old-latest")).toMatchObject({
+      status: "ready", active: false, imageDigest: DIGEST_A, path: oldDir,
+    });
+    await access(join(oldDir, "bin", "postgres"));
+  });
+
+  it("pull() inserts the downloading row BEFORE returning — an immediate byId(buildId) poll sees it", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci, release } = blockingOci(); // pipeline held open inside pullPrefix
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    // Synchronously after pull() resolves: the row must already exist, in `downloading`.
+    const row = state.pgBuilds.byId(buildId);
+    expect(row).not.toBeNull();
+    expect(row?.status).toBe("downloading");
+    expect(row?.releaseTag).toBe("latest");
+    expect(row?.source).toBe("downloaded");
+
+    release(); // let the pipeline finish so no async work outlives the test
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("ready"));
+  });
+
+  it("malformed tag → 400 before any row, path, or network work; mutex not latched", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci, resolveDigestSpy, pullPrefixSpy } = fakeOci();
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+
+    for (const tag of ["../x", "a/b"]) {
+      try {
+        await provisioner.pull({ major: 17, tag });
+        expect.unreachable(`pull must reject tag ${tag}`);
+      } catch (e) {
+        expect(e).toBeInstanceOf(DevdbError);
+        if (e instanceof DevdbError) {
+          expect(e.statusCode).toBe(400);
+          expect(e.message).toBe(`invalid tag: ${tag}`);
+        }
+      }
+    }
+    expect(resolveDigestSpy).not.toHaveBeenCalled();
+    expect(pullPrefixSpy).not.toHaveBeenCalled();
+    expect(state.pgBuilds.list()).toEqual([]); // no row was ever inserted
+
+    // The rejection must not have latched the single-flight mutex — a valid pull still runs.
+    const { buildId } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("ready"));
+  });
+
+  it("non-409 activate() failure propagates: row AND job end failed, not ready-but-inactive", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    vi.spyOn(registry, "activate").mockImplementation(() => {
+      throw new Error("sqlite: disk I/O error"); // a genuine malfunction, NOT a downgrade 409
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    expect(row.error).toMatch(/disk I\/O error/);
+    const job = state.raw.prepare("SELECT status FROM jobs WHERE kind = 'pg_build_pull'").get() as { status: string };
+    expect(job.status).toBe("failed");
+  });
+
+  it("activate() 409 (deliberate downgrade re-pull) stays tolerated: ready-but-inactive, pipeline completes", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+    const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+    vi.spyOn(registry, "activate").mockImplementation(() => {
+      throw new DevdbError(409, "activating 17.5 would downgrade below the last-run 17.9");
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    await vi.waitFor(() => expect(recomposeDistrib).toHaveBeenCalled()); // ran PAST the tolerated 409
+    expect(state.pgBuilds.byId(buildId)).toMatchObject({ status: "ready", active: false, error: null });
   });
 
   it("check(): isNew digest reported; updateAvailableFor exposes short digest; known digest → isNew false", async () => {

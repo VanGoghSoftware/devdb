@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { DevdbError } from "../../services/errors.js";
 import type { StateDb } from "../../state/db.js";
 import type { PgBuildRow } from "../../state/repos.js";
+import { shortDigest } from "./registry.js";
 import type { BuildRegistry } from "./registry.js";
 import type { OciPuller } from "./oci.js";
 import type { LogsService } from "../../services/logs.js";
@@ -14,6 +15,11 @@ const execFileP = promisify(execFile);
 
 const MIN_FREE_BYTES = 1.5 * 2 ** 30;
 const GATE_TIMEOUT_MS = 90_000;
+
+// OCI distribution-spec tag grammar. Belt-and-suspenders: build paths are digest-derived (a tag
+// never becomes a filesystem name), but the tag still flows to resolveDigest URLs and into row
+// metadata, so reject anything malformed before any row/path/network work happens.
+const OCI_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 
 // Real `du -sk` default (index.ts wires this in) — kilobyte total of a directory tree, converted
 // to bytes. Returns null (never throws) on any failure: sizeBytes is informational, not load-bearing.
@@ -44,9 +50,12 @@ interface CheckResult { tag: "latest"; digest: string; isNew: boolean; at: strin
 
 // Orchestrates check/pull: preflight → OCI pull/extract → fixup (version detect + marker) →
 // validation gate (injected) → auto-activate → recompose pg_distrib. One pull runs at a time
-// globally (private `pulling` mutex); `pull()` itself returns as soon as the job is queued —
-// REST/MCP callers get a buildId immediately and poll `GET /api/pg-builds` (or the pg_builds
-// event) for completion, same shape as every other long daemon operation.
+// globally (private `pulling` mutex); `pull()` inserts the `downloading` row synchronously and
+// returns its buildId — REST/MCP callers can poll `GET /api/pg-builds` (or the pg_builds event)
+// for that id immediately, same shape as every other long daemon operation. Build identity is
+// the image DIGEST (row + dir are digest-addressed, `v{major}/{shortDigest}`); the tag is
+// metadata recording what was asked for — re-pulling a mutable tag at a new digest installs a
+// NEW build beside the old one.
 export class Provisioner {
   private pulling = false;
   private lastCheck = new Map<number, CheckResult>();
@@ -101,12 +110,25 @@ export class Provisioner {
   // may run at a time process-wide; a concurrent call rejects with a generic 409 rather than
   // queuing — the caller (human or agent) retries once the first finishes.
   async pull(a: { major: number; tag?: string }): Promise<{ buildId: string }> {
+    if (a.tag !== undefined && !OCI_TAG_RE.test(a.tag)) {
+      throw new DevdbError(400, `invalid tag: ${a.tag}`);
+    }
     if (this.pulling) {
       throw new DevdbError(409, "a build pull is already in progress");
     }
-    this.pulling = true;
     const id = crypto.randomUUID();
     const tag = a.tag ?? "latest";
+    // Contract: the `downloading` row exists BEFORE pull() returns, so an immediate byId(buildId)
+    // poll always finds it. Digest and path are unknown until resolveDigest runs — the '' digest
+    // sentinel is excluded from byDigest() dedup lookups, and the pipeline fills both in via
+    // setDigestPath. (No await sits between the mutex check and the flag set, and the flag is set
+    // only after the insert succeeded, so a synchronous insert failure cannot latch the mutex.)
+    this.deps.state.pgBuilds.insert({
+      id, major: a.major, source: "downloaded", releaseTag: tag, imageDigest: "", path: "",
+      status: "downloading",
+    });
+    this.pulling = true;
+    this.publish();
     // Fire-and-forget: the pipeline runs after this method returns. Errors inside runPipeline
     // are always caught and recorded on the row itself (never surfaced as an unhandled rejection).
     void this.runPipeline(id, a.major, tag).finally(() => { this.pulling = false; });
@@ -119,15 +141,11 @@ export class Provisioner {
     const repo = this.repoFor(major);
     let jobStatus: "done" | "failed" = "failed";
     try {
-      // --- Preflight: disk headroom, BEFORE any network. No digest is known yet at this point,
-      // so a preflight-failed row is inserted with an empty (unresolved) imageDigest sentinel —
-      // same sentinel baked rows use, and byDigest() already excludes '' from dedup lookups.
+      // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
+      // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
+      // already excludes '' from dedup lookups.
       const free = await deps.statfsFree(deps.cfg.pgBuildsDir);
       if (free < MIN_FREE_BYTES) {
-        state.pgBuilds.insert({
-          id, major, source: "downloaded", releaseTag: tag, imageDigest: "",
-          path: join(deps.cfg.pgBuildsDir, `v${major}`, `.tmp-${tag}`), status: "failed",
-        });
         state.pgBuilds.setStatus(id, "failed", "insufficient disk space on /data (< 1.5 GB free)");
         this.log(id, "preflight failed: insufficient disk space on /data (< 1.5 GB free)");
         this.publish();
@@ -135,14 +153,13 @@ export class Provisioner {
       }
 
       // --- Dedup: resolve the digest, then check whether it's already installed & ready.
+      // Identity is the DIGEST, never the tag: a mutable tag (`latest`) re-pulled at a new digest
+      // is a NEW build (this row proceeds; the old digest's row and dir persist until GC), while
+      // the same digest already ready — whatever tag it arrived under — is a no-op. The no-op row
+      // keeps the '' digest sentinel so it can never shadow the real install in byDigest().
       const { digest } = await deps.oci.resolveDigest(repo, tag);
-      const tmpDir = join(deps.cfg.pgBuildsDir, `v${major}`, `.tmp-${tag}`);
       const existing = state.pgBuilds.byDigest(digest);
       if (existing && existing.status === "ready") {
-        state.pgBuilds.insert({
-          id, major, source: "downloaded", releaseTag: tag, imageDigest: digest,
-          path: tmpDir, status: "failed",
-        });
         const versionStr = existing.minor !== null ? `${existing.major}.${existing.minor}` : `${existing.major}.x`;
         const msg = `already installed as ${versionStr} — no-op`;
         state.pgBuilds.setStatus(id, "failed", msg);
@@ -151,11 +168,9 @@ export class Provisioner {
         return;
       }
 
-      // Row now enters the real pipeline: downloading.
-      state.pgBuilds.insert({
-        id, major, source: "downloaded", releaseTag: tag, imageDigest: digest,
-        path: tmpDir, status: "downloading",
-      });
+      // Row now enters the real pipeline: digest + content-addressed extraction path are known.
+      const tmpDir = join(deps.cfg.pgBuildsDir, `v${major}`, `.tmp-${shortDigest(digest)}`);
+      state.pgBuilds.setDigestPath(id, { imageDigest: digest, path: tmpDir });
       this.publish();
 
       // --- jobs bookkeeping (write-only this phase; a jobs REST API is phase 4's contract).
@@ -169,21 +184,9 @@ export class Provisioner {
           .run(jobStatus, jobId);
       }
     } catch (err) {
-      // Any uncaught failure anywhere above (preflight/resolveDigest/insert) still needs recording
-      // if a row wasn't already written — but every branch above already writes+returns on its own
-      // failure path, so reaching here means resolveDigest (or an insert) itself threw. Best-effort
-      // record it on the id if no row exists yet.
-      if (!state.pgBuilds.byId(id)) {
-        try {
-          state.pgBuilds.insert({
-            id, major, source: "downloaded", releaseTag: tag, imageDigest: "",
-            path: join(deps.cfg.pgBuildsDir, `v${major}`, `.tmp-${tag}`), status: "failed",
-          });
-        } catch {
-          // insert itself failing here means the id is somehow already taken — nothing more we
-          // can do; the error is still logged below.
-        }
-      }
+      // Any uncaught failure anywhere above (statfsFree/resolveDigest/extract/gate machinery/a
+      // non-downgrade activate error) lands here. The row always exists — pull() inserted it
+      // before the pipeline started — so record the failure on it.
       state.pgBuilds.setStatus(id, "failed", firstLine(err));
       this.log(id, `pull failed: ${firstLine(err)}`);
       deps.logger.error(`pg_build ${id} pull failed`, err);
@@ -222,7 +225,9 @@ export class Provisioner {
     await writeFile(join(tmpDir, "build.json"), JSON.stringify({ digest, tag, major, minor, extractedAt }));
     const sizeBytes = await deps.du(tmpDir);
 
-    const finalDir = join(deps.cfg.pgBuildsDir, `v${major}`, tag);
+    // Content-addressed final home: the digest, not the tag, names the dir — two pulls of the
+    // same mutable tag at different digests coexist side by side.
+    const finalDir = join(deps.cfg.pgBuildsDir, `v${major}`, shortDigest(digest));
     await rename(tmpDir, finalDir);
     state.pgBuilds.updatePath(id, finalDir);
     state.pgBuilds.setDetected(id, { minor, sizeBytes });
@@ -252,13 +257,19 @@ export class Provisioner {
     this.publish();
 
     // --- Activate: a validated pull auto-activates. A fresh pull is never a downgrade in the
-    // ordinary case, but re-pulling an old tag deliberately can be — that 409 is expected and
-    // left as a ready-but-inactive build (not a pipeline failure).
+    // ordinary case, but re-pulling an old tag deliberately can be — ONLY that 409 is expected
+    // and left as a ready-but-inactive build (not a pipeline failure). Anything else (a genuine
+    // activation malfunction) must propagate to the outer pipeline catch, which marks the row
+    // and the job failed.
     try {
       this.deps.registry.activate(id);
       this.log(id, `activated ${major}.${minor}`);
     } catch (err) {
-      this.log(id, `${firstLine(err)} — call activate to make ${major}.${minor} the running build`);
+      if (err instanceof DevdbError && err.statusCode === 409) {
+        this.log(id, `${firstLine(err)} — call activate to make ${major}.${minor} the running build`);
+      } else {
+        throw err;
+      }
     }
 
     await deps.recomposeDistrib(); // covers the new-major case (no baked slot existed before)

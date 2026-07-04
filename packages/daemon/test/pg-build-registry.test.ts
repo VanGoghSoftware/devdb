@@ -169,6 +169,58 @@ describe("BuildRegistry", () => {
     expect(registry.pgbinFor(16).buildId).toBe("baked-v16"); // baked wins the tie
   });
 
+  it("adoptVolumeBuilds derives the row id from the marker's digest (dl-{major}-{digest16}) — the dir name is not identity", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "c".repeat(64);
+    // Deliberately NOT digest-named: identity must come from the marker, not the dir basename.
+    const dir = await fakeVolumeBuild(builds, 17, "renamed-by-hand",
+      { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    await registry.adoptVolumeBuilds();
+
+    const row = state.pgBuilds.byId(`dl-17-${"c".repeat(16)}`);
+    expect(row).toMatchObject({
+      major: 17, minor: 5, source: "downloaded", releaseTag: "latest",
+      imageDigest: digest, path: dir, status: "ready",
+    });
+    expect(state.pgBuilds.list()).toHaveLength(1); // and nothing keyed off the dir name
+  });
+
+  it("adoptVolumeBuilds skips a dir already claimed by an existing (pull-created, UUID-id) row — no duplicate rows across boots", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "d".repeat(64);
+    const dir = await fakeVolumeBuild(builds, 17, "d".repeat(16),
+      { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    // A pull-created row keeps its UUID id (never the dl- form) but owns the same dir.
+    state.pgBuilds.insert({
+      id: "3b9a4c1e-uuid-of-the-pull", major: 17, minor: 5, source: "downloaded",
+      releaseTag: "latest", imageDigest: digest, path: dir, status: "ready",
+    });
+
+    await registry.adoptVolumeBuilds();
+
+    // Without the path claim check this would insert a dl-17-… duplicate sharing the same dir —
+    // whose later removal/GC would rm the live build's directory out from under the real row.
+    expect(state.pgBuilds.list()).toHaveLength(1);
+    expect(state.pgBuilds.byId("3b9a4c1e-uuid-of-the-pull")?.status).toBe("ready");
+  });
+
+  it("assertRemovable rejects a row whose pull is in flight (downloading/validating)", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    state.pgBuilds.insert({
+      id: "dl-a", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "downloading",
+    });
+    state.pgBuilds.insert({
+      id: "dl-b", major: 17, source: "downloaded", releaseTag: "latest",
+      imageDigest: "sha256:" + "e".repeat(64), path: join(builds, "v17", "e".repeat(16)), status: "validating",
+    });
+    expect(() => registry.assertRemovable("dl-a", [])).toThrow(/in flight/);
+    expect(() => registry.assertRemovable("dl-b", [])).toThrow(/in flight/);
+  });
+
   it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {
     const { install, builds } = await scaffold();
     const v16 = await fakeInstallDir(install, "v16");
