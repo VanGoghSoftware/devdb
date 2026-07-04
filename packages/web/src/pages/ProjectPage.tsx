@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Group, Modal, SegmentedControl, Select, Skeleton, Stack, Text, TextInput, Title } from "@mantine/core";
 import { Link, useParams, useSearchParams } from "react-router";
 import type { BranchDto } from "@devdb/shared";
@@ -11,6 +11,17 @@ function NewBranchModal(a: { projectId: string; branches: BranchDto[]; opened: b
   const [name, setName] = useState("");
   const mainId = a.branches.find((b) => b.parentBranchId === null)?.id;
   const [parent, setParent] = useState<string | undefined>(a.defaultParentId ?? mainId);
+  // The modal wrapper never unmounts (only Mantine's own <Modal opened> toggles) — so `parent`/
+  // `name`'s useState initializers above only ever run once, on first mount. Without this reset,
+  // reopening via "Branch from here" (which changes defaultParentId) or reopening "+ New branch"
+  // after a manual parent pick both leave stale state behind: Create would silently submit the
+  // PREVIOUS session's parent instead of the one implied by how the modal was just opened.
+  useEffect(() => {
+    if (a.opened) { setParent(a.defaultParentId ?? mainId); setName(""); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mainId intentionally re-read fresh
+    // from the body on each open rather than listed as a dep: it's derived from `a.branches` and
+    // we don't want every branch-list refetch to reset an already-open modal's in-progress edit.
+  }, [a.opened, a.defaultParentId]);
   return (
     <Modal opened={a.opened} onClose={a.onClose} title="New branch">
       <Stack>
