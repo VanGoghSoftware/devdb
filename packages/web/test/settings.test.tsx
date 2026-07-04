@@ -13,6 +13,10 @@ vi.mock("../src/api/client.js", () => ({
       version: "0.1.0", healthy: true, engine: {}, portRange: { min: 54300, max: 54339 }, storage: "none", pgBuilds: {},
     }),
     projects: {}, branches: {},
+    // SettingsPage mounts PgBuildsCard (Task 13), which calls usePgBuilds() unconditionally —
+    // these tests all use an empty status.pgBuilds (no majors), so the card itself renders no
+    // per-major sections, but the list() call still fires and must resolve to something.
+    pgBuilds: { list: vi.fn().mockResolvedValue([]), check: vi.fn(), pull: vi.fn(), activate: vi.fn(), remove: vi.fn() },
   },
 }));
 import { api } from "../src/api/client.js";

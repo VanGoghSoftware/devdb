@@ -2,6 +2,7 @@ import { Card, Divider, Group, SegmentedControl, Skeleton, Stack, Text, Title, u
 import { useState } from "react";
 import { useStatus } from "../api/hooks.js";
 import { getDefaultTreeView, setDefaultTreeView, type ThemePref, type TreeView } from "../prefs.js";
+import { PgBuildsCard } from "../settings/PgBuildsCard.js";
 
 export function SettingsPage() {
   const { data: status } = useStatus();
@@ -29,6 +30,8 @@ export function SettingsPage() {
           </Stack>
         )}
       </Card>
+
+      <PgBuildsCard />
 
       <Card withBorder>
         <Title order={4}>Preferences</Title>
