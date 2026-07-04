@@ -634,10 +634,20 @@ describe("OciClient — whiteout-symlink & digest-pin hardening (round 4)", () =
       a: [{ name: "usr/local/sneak", type: "2", linkname: victimDir }],
       b: [{ name: "usr/local/sneak/.wh.evil", type: "0", content: "" }],
     }));
+    // Accept EITHER rejection message: the load-bearing `parentChainIsRealDir` guard (which runs BEFORE
+    // any rm and so prevents the deletion), OR the round-2 assertSafeExtractedTree backstop (which only
+    // runs AFTER extraction/rename and so — on production GNU tar — would reject too late, having let the
+    // whiteout `rm` already delete the outside victim). The message is secondary; see below.
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe whiteout: symlink parent component/);
-    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS"); // no rm followed the symlink
+    ).rejects.toThrow(/unsafe whiteout: symlink parent component|unsafe extracted entry/);
+    // PRIMARY security assertion: the outside victim must still contain its original sentinel content.
+    // This is the assertion that actually distinguishes the two failure modes above — "guard fired
+    // before rm" (victim survives) from "backstop caught it after rm" (victim already gone). Asserting
+    // only on the rejection message would pass either way and prove nothing about WHEN the rejection
+    // happened; this is what proves parentChainIsRealDir — not the tree-walk backstop — is what stops
+    // the deletion on real GNU tar.
+    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS");
     await expect(access(destDir)).rejects.toThrow(); // nothing materialized
   });
 
@@ -648,10 +658,15 @@ describe("OciClient — whiteout-symlink & digest-pin hardening (round 4)", () =
       a: [{ name: "usr/local/sneak", type: "2", linkname: victimDir }],
       b: [{ name: "usr/local/sneak/.wh..wh..opq", type: "0", content: "" }],
     }));
+    // See P1(a) above: either message is acceptable (guard vs. backstop), but the victim-survival
+    // assertion below is the one that actually proves the guard — not the backstop — stopped the rm.
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
-    ).rejects.toThrow(/unsafe whiteout: symlink parent component/);
-    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS"); // no readdir/rm followed the symlink
+    ).rejects.toThrow(/unsafe whiteout: symlink parent component|unsafe extracted entry/);
+    // PRIMARY security assertion — see the comment in P1(a): this is the load-bearing check, not the
+    // rejection message above. If parentChainIsRealDir were removed, this would fail (victim deleted)
+    // even though the pull would still reject via the round-2 backstop with a different message.
+    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS");
     await expect(access(destDir)).rejects.toThrow();
   });
 
@@ -673,6 +688,34 @@ describe("OciClient — whiteout-symlink & digest-pin hardening (round 4)", () =
     expect(await readFile(join(destDir, "realdir", "new.txt"), "utf8")).toBe("new");
     await expect(access(join(destDir, "realdir", "keep.txt"))).rejects.toThrow(); // whiteout applied
     await expect(access(join(destDir, "realdir", ".wh.keep.txt"))).rejects.toThrow(); // marker cleaned
+  });
+
+  it("P1(d): rejects a whiteout reached through an IN-TREE relative symlink dir alias (deliberate over-rejection)", async () => {
+    // Layer A creates a real target dir `usr/local/lib64/old.so` AND a relative in-tree symlink alias
+    // `usr/local/lib -> lib64` (both endpoints stay inside usr/local/ — this is the shape the "legit
+    // in-tree relative symlink" test elsewhere in this file accepts as a normal PASS for non-whiteout
+    // extraction). Layer B whiteouts THROUGH the alias: `usr/local/lib/.wh.old.so`. parentChainIsRealDir
+    // walks `usr/local/lib` and finds a symlink (not a real dir) as a parent COMPONENT of the whiteout
+    // target, so it throws — even though the alias never leaves usr/local/ and the whiteout's ultimate
+    // target (`usr/local/lib64/old.so`) is itself perfectly in-tree.
+    //
+    // This is a DELIBERATE safety-over-availability decision, not a bug: parentChainIsRealDir only asks
+    // "is every parent component a real (non-symlink) directory", never "does this symlink's target stay
+    // in-tree" — resolving the latter for every parent of every whiteout, on every pull, would add real
+    // cost and complexity to a guard that exists for a narrow adversarial case. Real Docker/OCI image
+    // layers emit whiteouts at CANONICAL paths (the path the file was actually created at), never through
+    // a symlink alias — so this only over-rejects adversarial/unusual layers, never a normal image. See
+    // the comment at `parentChainIsRealDir` in oci.ts for the revisit condition.
+    const { client, destDir, manifestDigest } = await twoLayerVictimSetup(() => ({
+      a: [
+        { name: "usr/local/lib64/old.so", type: "0", content: "old" },
+        { name: "usr/local/lib", type: "2", linkname: "lib64" },
+      ],
+      b: [{ name: "usr/local/lib/.wh.old.so", type: "0", content: "" }],
+    }));
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe whiteout: symlink parent component/);
   });
 
   it("P2: resolveDigest rejects a direct manifest whose docker-content-digest header is a mutable ref (latest)", async () => {
@@ -717,6 +760,11 @@ describe("OciClient — whiteout-symlink & digest-pin hardening (round 4)", () =
     await expect(
       client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
     ).rejects.toThrow(/not a sha256 content-address/);
+    // PRIMARY assertion: zero blob fetches happened. This directly proves the preflight rejected the
+    // descriptor BEFORE any fetch was attempted — if the preflight were removed, the client would fetch
+    // `blobs/latest` and fail with an unrelated fixture 404, which would still satisfy a message-only
+    // rejection check but would NOT satisfy this assertion. So this — not the rejection message above —
+    // is what actually catches a dropped preflight.
     expect(fixture.blobFetches).toEqual([]);
     await expect(access(destDir)).rejects.toThrow();
   });

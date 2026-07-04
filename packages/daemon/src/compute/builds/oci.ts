@@ -184,6 +184,14 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
   //           readdir were no-ops too), so skip this whiteout without over-rejecting.
   // and THROWS if a component EXISTS but is a symlink or non-directory (the escape vector) — the layer
   // is rejected before any disk mutation.
+  //
+  // DELIBERATE safety-over-availability tradeoff: this also rejects a whiteout reached through an
+  // in-tree-CONTAINED relative symlink alias (e.g. `usr/local/lib -> lib64` then `usr/local/lib/.wh.x`),
+  // even though that alias never escapes extractRoot — it checks "is every parent a real dir", not "does
+  // this symlink's target stay in-tree". Real Docker/OCI layers emit whiteouts at the file's CANONICAL
+  // path, never through a symlink alias, so this only over-rejects adversarial/unusual layers. If a real
+  // compute-node image is ever found to trip it (the Task 15 integration pull is the validating signal),
+  // revisit by resolving the parent's realpath and allowing in-tree-contained targets through.
   const parentChainIsRealDir = async (dir: string): Promise<boolean> => {
     const rel = relative(extractRootResolved, resolve(dir));
     if (rel === "") return true; // dir IS extractRoot (a real dir we mkdtemp'd); assertUnder ran first
