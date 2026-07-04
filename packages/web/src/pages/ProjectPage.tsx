@@ -6,6 +6,7 @@ import { useBranches, useCreateBranch } from "../api/hooks.js";
 import { RailsView } from "../tree/RailsView.js";
 import { CanvasView } from "../tree/CanvasView.js";
 import { getDefaultTreeView, type TreeView } from "../prefs.js";
+import { BranchDrawer } from "../drawer/BranchDrawer.js";
 
 function NewBranchModal(a: { projectId: string; branches: BranchDto[]; opened: boolean; onClose: () => void; defaultParentId?: string }) {
   const create = useCreateBranch();
@@ -101,7 +102,7 @@ export function ProjectPage() {
         onClose={() => setCreating(null)}
         defaultParentId={creating?.parentId}
       />
-      {/* Task 12 mounts <BranchDrawer branchId={selected} onClose={() => select(null)} /> here */}
+      <BranchDrawer branchId={selected} onClose={() => select(null)} />
     </Stack>
   );
 }
