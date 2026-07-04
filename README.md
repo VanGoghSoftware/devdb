@@ -8,6 +8,8 @@ One Docker container; branches are copy-on-write and cost nothing to create.
     docker compose -f docker/compose.yaml up --build -d
     curl http://localhost:4400/api/status
 
+Open the dashboard at [http://localhost:4400](http://localhost:4400).
+
 Create a project (comes with a `main` branch):
 
     curl -X POST http://localhost:4400/api/projects \
@@ -64,6 +66,16 @@ Copy the shipped skills into your agent's skills directory:
 
 Even with no skills installed, connected agents receive the core branch-per-task workflow via the
 MCP server's `initialize` instructions.
+
+## Developing the UI
+
+The daemon serves the built UI from `DEVDB_WEB_DIST` (set in the image). For UI development,
+run the daemon (or the container) as usual, then:
+
+    pnpm --filter @devdb/web dev
+
+Vite serves the SPA on :5173 and proxies `/api` + `/mcp` to `localhost:4400` — no CORS, and
+SSE (live logs, /api/events) streams through the proxy unbuffered.
 
 ## Troubleshooting
 

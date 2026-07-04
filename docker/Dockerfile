@@ -12,7 +12,8 @@ ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
     PG_INSTALL_DIR=/usr/local/share/neon/pg_install \
     DEVDB_DATA_DIR=/data \
     DEVDB_HTTP_PORT=4400 \
-    DEVDB_PORT_RANGE=54300-54339
+    DEVDB_PORT_RANGE=54300-54339 \
+    DEVDB_WEB_DIST=/app/packages/web/dist
 RUN corepack enable && mkdir -p /data /app && chown -R node:node /data /app
 WORKDIR /app
 COPY --chown=node:node package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json ./
