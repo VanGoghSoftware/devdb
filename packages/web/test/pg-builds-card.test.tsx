@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "./render.js";
 import { PgBuildsCard } from "../src/settings/PgBuildsCard.js";
@@ -47,6 +47,24 @@ const builds: PgBuildDto[] = [
     imageDigest: "", active: true, inUse: true,
   }),
 ];
+
+// Fix round 1: the exact post-resolveActives scenario the review flagged — a baked build for a
+// major that ALSO has a downloaded build demoted to non-active, non-inUse the moment that
+// downloaded build activates. It's "ready" and looks just like any other deletable row, but the
+// daemon's assertRemovable (registry.ts) 409s ANY source:"baked" row unconditionally, regardless
+// of active/inUse. major 18 is otherwise unused by any other test in this file/major list.
+const bakedNonActiveBuild = build({
+  id: "b18-3", major: 18, minor: 3, version: "18.3", source: "baked", releaseTag: "18.3",
+  imageDigest: "", active: false, inUse: false,
+});
+const buildsWithBakedNonActive: PgBuildDto[] = [...builds, bakedNonActiveBuild];
+const statusWithMajor18: StatusDto = {
+  ...baseStatus,
+  pgBuilds: {
+    ...baseStatus.pgBuilds,
+    "18": { activeVersion: "18.4", source: "downloaded", degradedDowngrade: false, updateAvailable: null },
+  },
+};
 
 beforeEach(() => {
   vi.mocked(api.status).mockResolvedValue(baseStatus);
@@ -164,5 +182,50 @@ describe("PgBuildsCard", () => {
     // directly (same leak dashboard.test.tsx documents for api.projects.delete) — assert the
     // first argument only.
     await waitFor(() => expect(vi.mocked(api.pgBuilds.remove).mock.calls.at(-1)?.[0]).toEqual("b16-9"));
+  });
+
+  // Fix round 1 (Important): assertRemovable 409s ANY baked row unconditionally, but a baked
+  // build for a major with an active downloaded build is non-active/non-inUse — the pre-fix
+  // deleteDisabled (row.active || row.inUse) left its Delete button enabled, so clicking it
+  // always 409s. This is a rendering assertion, independent of the click-to-409 path (the daemon
+  // side of that path already has its own coverage in registry.test.ts); it should fail against
+  // pre-fix code (baked non-active row's Delete would come back ENABLED).
+  it("Delete is disabled for a baked build even when it is not the active/inUse row", async () => {
+    vi.mocked(api.status).mockResolvedValue(statusWithMajor18);
+    vi.mocked(api.pgBuilds.list).mockResolvedValue(buildsWithBakedNonActive);
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 18");
+
+    const bakedRow = screen.getByText(/18\.3 · baked · ready/i).closest("div");
+    expect(bakedRow).not.toBeNull();
+    const bakedDeleteButton = within(bakedRow as HTMLElement).getByRole("button", { name: /^delete$/i });
+    expect(bakedDeleteButton).toBeDisabled();
+  });
+
+  // Fix round 2 (P4): a disabled Mantine Button doesn't emit the hover/focus events Tooltip
+  // relies on to open (Tooltip.mjs clones its reference props — onMouseEnter/onPointerEnter/etc
+  // — directly onto its single child), so wrapping the bare disabled Button leaves the
+  // explanatory tooltip unreachable. Mantine's documented fix is to give Tooltip a non-disabled
+  // wrapper as its direct child instead, so the WRAPPER — not the inert control — is what
+  // receives those props; the Button inside stays functionally disabled (no click-through).
+  // Hover-in-jsdom is flaky (see render.tsx's Popover hideDetached note), so this asserts the
+  // STRUCTURAL fix rather than the resulting hover behavior.
+  //
+  // Discriminator (confirmed by probing the actual pre-fix DOM): today the disabled Delete
+  // Button's parentElement IS the surrounding Mantine `Group` (a <div class="...mantine-Group-
+  // root...">) — Tooltip clones its reference props straight onto the Button with no intervening
+  // node. Once the fix wraps the Button in something else (e.g. a <span> Box) for Tooltip to
+  // target, an extra element sits between the Button and that Group, so the Button's immediate
+  // parent is no longer the Group itself. Fails pre-fix; passes for any wrapper element choice.
+  it("the disabled Delete button is not a direct child of the Group — a wrapper sits between it and Tooltip", async () => {
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+
+    const deleteButtons = await screen.findAllByRole("button", { name: /^delete$/i });
+    const disabledDelete = deleteButtons.find((b) => b.hasAttribute("disabled"));
+    expect(disabledDelete).toBeDefined();
+    const parent = disabledDelete!.parentElement;
+    expect(parent).not.toBeNull();
+    expect(parent!.className).not.toMatch(/mantine-Group-root/);
   });
 });
