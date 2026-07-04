@@ -40,4 +40,23 @@ describe("loadConfig", () => {
   it("rejects http port inside the endpoint range", () => {
     expect(() => loadConfig({ ...base, DEVDB_HTTP_PORT: "54310" })).toThrow(/54310/);
   });
+
+  describe("DEVDB_WEB_DIST", () => {
+    it("is null when unset", () => {
+      expect(loadConfig(base).webDistDir).toBeNull();
+    });
+    it("is null when whitespace-only", () => {
+      expect(loadConfig({ ...base, DEVDB_WEB_DIST: "   " }).webDistDir).toBeNull();
+    });
+    it("rejects a relative value", () => {
+      expect(() => loadConfig({ ...base, DEVDB_WEB_DIST: "packages/web/dist" })).toThrow(
+        /DEVDB_WEB_DIST/,
+      );
+    });
+    it("passes through an absolute value", () => {
+      expect(loadConfig({ ...base, DEVDB_WEB_DIST: "/app/packages/web/dist" }).webDistDir).toBe(
+        "/app/packages/web/dist",
+      );
+    });
+  });
 });

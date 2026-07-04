@@ -90,7 +90,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
   // Phase 3: directory of the built web UI (vite output). Unset => UI not served — the local-dev
   // daemon case, where `pnpm --filter @devdb/web dev` serves the SPA and proxies /api here.
   // The Docker image sets DEVDB_WEB_DIST=/app/packages/web/dist (docker/Dockerfile).
-  const webDistDir = e.DEVDB_WEB_DIST?.trim() ? e.DEVDB_WEB_DIST.trim() : null;
+  const webDistDirRaw = e.DEVDB_WEB_DIST?.trim() ? e.DEVDB_WEB_DIST.trim() : null;
+  if (webDistDirRaw !== null && !isAbsolute(webDistDirRaw)) {
+    throw new Error(`DEVDB_WEB_DIST must be an absolute path, got: ${webDistDirRaw}`);
+  }
+  const webDistDir = webDistDirRaw;
 
   return {
     httpPort,
