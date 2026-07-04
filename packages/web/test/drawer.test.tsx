@@ -14,7 +14,7 @@ vi.mock("../src/api/client.js", () => ({
   },
 }));
 import { api } from "../src/api/client.js";
-import type { BranchDto } from "@devdb/shared";
+import type { BranchDto, StatusDto } from "@devdb/shared";
 
 // BranchDrawer now mounts LogsTab (Task 13) unconditionally on its Logs tab, which reaches for a
 // real EventSource when no `makeSource` is injected — jsdom has none (mirrors app.test.tsx's own
@@ -60,12 +60,23 @@ const rootBranch: BranchDto = {
 // something to (incorrectly, pre-fix) leak across.
 const branch2: BranchDto = { ...branch, id: "b2", name: "other-branch" };
 
+// Default status fixture (Task 14): InfoTab now calls useStatus() itself for the restart-to-adopt
+// chip. An empty pgBuilds keeps the existing (pre-Task-14) drawer tests inert — InfoTab.tsx only
+// renders the Badge when `status.pgBuilds[major]?.activeVersion` differs from `runningPgVersion`,
+// and the shared `branch` fixture's `runningPgVersion` is null, so this default never fires it.
+const status: StatusDto = {
+  version: "0.1.0", healthy: true,
+  engine: { pageserver: { state: "running", pid: 1 }, safekeeper: { state: "running", pid: 2 } },
+  portRange: { min: 54300, max: 54339 }, storage: "none", pgBuilds: {},
+};
+
 beforeEach(() => {
   vi.mocked(api.branches.get).mockImplementation(async (id: string) => {
     if (id === rootBranch.id) return rootBranch;
     if (id === branch2.id) return branch2;
     return branch;
   });
+  vi.mocked(api.status).mockResolvedValue(status);
 });
 
 describe("maskConnstring", () => {
@@ -115,6 +126,45 @@ describe("BranchDrawer", () => {
     await userEvent.click(screen.getByRole("tab", { name: /info/i }));
     expect(screen.getByText("0/169AD58")).toBeInTheDocument();
     expect(screen.getByText(/23\.0 MB/)).toBeInTheDocument(); // 24117248 bytes
+  });
+
+  describe("restart-to-adopt chip (Info tab)", () => {
+    it("shows the badge when the running compute's major has a newer active build", async () => {
+      vi.mocked(api.branches.get).mockResolvedValue({ ...branch, runningPgVersion: "16.9" });
+      vi.mocked(api.status).mockResolvedValue({
+        ...status,
+        pgBuilds: { "16": { activeVersion: "16.10", source: "downloaded", degradedDowngrade: false, updateAvailable: null } },
+      });
+      renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />);
+      await userEvent.click(await screen.findByRole("tab", { name: /info/i }));
+      expect(await screen.findByText("restart to adopt 16.10")).toBeInTheDocument();
+    });
+
+    it("shows no badge when the running version already matches the active build", async () => {
+      vi.mocked(api.branches.get).mockResolvedValue({ ...branch, runningPgVersion: "16.10" });
+      vi.mocked(api.status).mockResolvedValue({
+        ...status,
+        pgBuilds: { "16": { activeVersion: "16.10", source: "downloaded", degradedDowngrade: false, updateAvailable: null } },
+      });
+      renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />);
+      await userEvent.click(await screen.findByRole("tab", { name: /info/i }));
+      // Wait on a real element from this Info render before asserting a negative, so the query
+      // doesn't just pass because the tab hasn't painted yet.
+      expect(await screen.findByText("0/169AD58")).toBeInTheDocument();
+      expect(screen.queryByText(/restart to adopt/i)).not.toBeInTheDocument();
+    });
+
+    it("shows no badge when the endpoint is stopped (runningPgVersion null)", async () => {
+      vi.mocked(api.branches.get).mockResolvedValue({ ...branch, runningPgVersion: null });
+      vi.mocked(api.status).mockResolvedValue({
+        ...status,
+        pgBuilds: { "16": { activeVersion: "16.10", source: "downloaded", degradedDowngrade: false, updateAvailable: null } },
+      });
+      renderApp(<BranchDrawer branchId="b1" onClose={() => {}} />);
+      await userEvent.click(await screen.findByRole("tab", { name: /info/i }));
+      expect(await screen.findByText("0/169AD58")).toBeInTheDocument();
+      expect(screen.queryByText(/restart to adopt/i)).not.toBeInTheDocument();
+    });
   });
 
   it("root-rename edit state does not survive a switch to the root branch", async () => {
