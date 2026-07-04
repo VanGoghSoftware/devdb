@@ -1,34 +1,20 @@
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
+import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
-const dirs: string[] = [];
+const dirs = trackedDirs();
+// Thin local adapter over the shared scaffoldBuildDirs(): this file's call sites only ever
+// destructure `{ install, builds }` and rely on `root` being auto-tracked for afterEach cleanup —
+// preserved here so every existing call site (`const { install, builds } = await scaffold()`)
+// needs no change.
 async function scaffold(): Promise<{ install: string; builds: string }> {
-  const root = await mkdtemp(join(tmpdir(), "devdb-reg-"));
+  const { root, install, builds } = await scaffoldBuildDirs();
   dirs.push(root);
-  const install = join(root, "pg_install");
-  const builds = join(root, "pg_builds");
-  await mkdir(install, { recursive: true });
-  await mkdir(builds, { recursive: true });
   return { install, builds };
 }
-async function fakeInstallDir(base: string, name: string): Promise<string> {
-  const d = join(base, name);
-  await mkdir(join(d, "bin"), { recursive: true });
-  await writeFile(join(d, "bin", "postgres"), "#!/bin/sh\n");
-  return d;
-}
-async function fakeVolumeBuild(builds: string, major: number, tag: string, marker: object): Promise<string> {
-  const d = join(builds, `v${major}`, tag);
-  await mkdir(join(d, "bin"), { recursive: true });
-  await writeFile(join(d, "bin", "postgres"), "#!/bin/sh\n");
-  await writeFile(join(d, "build.json"), JSON.stringify(marker));
-  return d;
-}
-const noopLogger = { info: () => {}, error: () => {} };
 function makeRegistry(a: { install: string; builds: string; versions: Record<string, { major: number; minor: number }> }) {
   const state = openState(":memory:");
   const registry = new BuildRegistry({
@@ -41,7 +27,7 @@ function makeRegistry(a: { install: string; builds: string; versions: Record<str
   });
   return { state, registry };
 }
-afterEach(async () => { await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }))); });
+afterEach(async () => { await cleanupDirs(dirs); });
 
 describe("BuildRegistry", () => {
   it("seedBaked scans v* dirs, skips vanilla_*, and resolveActives picks baked when alone", async () => {
