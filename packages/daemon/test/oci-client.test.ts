@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { gzipSync } from "node:zlib";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { OciClient } from "../src/compute/builds/oci.js";
 
@@ -42,6 +43,72 @@ async function buildLayerTarGz(files: Record<string, string>): Promise<Buffer> {
   // COPYFILE_DISABLE keeps macOS bsdtar from emitting AppleDouble (._*) entries.
   await execFileP("tar", ["-czf", out, "-C", dir, "usr"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
   return readFile(out);
+}
+
+// --- Hand-crafted USTAR tar builder, for adversarial layers the system `tar -c` refuses to
+// produce (absolute names, `..` components, symlinks). One 512-byte header per member (+ padded
+// body), two zero blocks terminate the archive. `tar -tf`/`-tvf` list these verbatim (verified:
+// bsdtar 3.5.3 preserves `..` and leading `/` in listings, and encodes member type as the first
+// char of the `-tvf` mode string). ---
+type TarType = "0" | "2" | "5" | "1"; // regular | symlink | dir | hardlink
+interface TarEntry {
+  name: string;
+  type: TarType;
+  content?: string;
+  linkname?: string;
+}
+function tarHeader(o: { name: string; type: string; size: number; linkname?: string; mode?: number }): Buffer {
+  const h = Buffer.alloc(512, 0);
+  const put = (s: string, off: number, len: number): void => {
+    Buffer.from(s, "utf8").copy(h, off, 0, Math.min(Buffer.byteLength(s), len));
+  };
+  const octal = (n: number, off: number, len: number): void => {
+    put(n.toString(8).padStart(len - 1, "0"), off, len - 1);
+    h[off + len - 1] = 0;
+  };
+  put(o.name, 0, 100);
+  octal(o.mode ?? 0o644, 100, 8);
+  octal(0, 108, 8); // uid
+  octal(0, 116, 8); // gid
+  octal(o.size, 124, 12);
+  octal(0, 136, 12); // mtime
+  for (let i = 148; i < 156; i++) h[i] = 0x20; // chksum field = spaces while summing
+  h[156] = o.type.charCodeAt(0); // typeflag
+  if (o.linkname !== undefined) put(o.linkname, 157, 100);
+  put("ustar", 257, 6); // magic
+  h[263] = 0x30; // version "00"
+  h[264] = 0x30;
+  const sum = h.reduce((s, b) => s + b, 0);
+  put(sum.toString(8).padStart(6, "0"), 148, 6);
+  h[154] = 0;
+  h[155] = 0x20;
+  return h;
+}
+function makeTar(entries: TarEntry[]): Buffer {
+  const parts: Buffer[] = [];
+  for (const e of entries) {
+    const content = Buffer.from(e.content ?? "", "utf8");
+    const bodyless = e.type === "2" || e.type === "5" || e.type === "1";
+    const size = bodyless ? 0 : content.length;
+    parts.push(tarHeader({ name: e.name, type: e.type, size, linkname: e.linkname }));
+    if (size > 0) {
+      parts.push(content);
+      const pad = (512 - (size % 512)) % 512;
+      if (pad > 0) parts.push(Buffer.alloc(pad, 0));
+    }
+  }
+  parts.push(Buffer.alloc(1024, 0));
+  return Buffer.concat(parts);
+}
+function singleManifest(layerGz: Buffer, layerDigest: string): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      config: { mediaType: "application/vnd.oci.image.config.v1+json", digest: sha256(Buffer.from("cfg")), size: 3 },
+      layers: [{ mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: layerDigest, size: layerGz.length }],
+    }),
+  );
 }
 
 function ociManifest(configSeed: string): Buffer {
@@ -100,6 +167,7 @@ interface Fixture {
   base: string;
   tokenHits: number;
   manifestFetches: string[];
+  blobFetches: string[];
   close(): Promise<void>;
 }
 
@@ -111,8 +179,13 @@ afterAll(async () => {
   await Promise.all(scratchDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
 });
 
-async function startFixture(opts: { challenge?: boolean; corruptDigest?: string }): Promise<Fixture> {
-  const fixture: Fixture = { base: "", tokenHits: 0, manifestFetches: [], close: async () => {} };
+async function startFixture(opts: {
+  challenge?: boolean;
+  corruptDigest?: string;
+  manifestOverrides?: Record<string, Buffer>;
+  blobOverrides?: Record<string, Buffer>;
+}): Promise<Fixture> {
+  const fixture: Fixture = { base: "", tokenHits: 0, manifestFetches: [], blobFetches: [], close: async () => {} };
   const server = http.createServer((req, res) => {
     const send = (code: number, body: Buffer | string, headers: Record<string, string> = {}): void => {
       res.writeHead(code, headers);
@@ -131,6 +204,15 @@ async function startFixture(opts: { challenge?: boolean; corruptDigest?: string 
     const manifestRef = /^\/v2\/(.+)\/manifests\/([^/]+)$/.exec(path)?.[2];
     if (manifestRef !== undefined) {
       fixture.manifestFetches.push(manifestRef);
+      const mOverride = opts.manifestOverrides?.[manifestRef];
+      if (mOverride !== undefined) {
+        // Serve the override body VERBATIM under the requested ref (digest NOT recomputed) — this is
+        // how a substituted / malformed manifest reaches the client's own verification.
+        return send(200, mOverride, {
+          "content-type": "application/vnd.oci.image.manifest.v1+json",
+          "docker-content-digest": manifestRef,
+        });
+      }
       if (manifestRef === "latest" || manifestRef === indexDigest) {
         return send(200, indexBytes, { "content-type": "application/vnd.oci.image.index.v1+json", "docker-content-digest": indexDigest });
       }
@@ -144,6 +226,9 @@ async function startFixture(opts: { challenge?: boolean; corruptDigest?: string 
     }
     const blobDigest = /^\/v2\/(.+)\/blobs\/([^/]+)$/.exec(path)?.[2];
     if (blobDigest !== undefined) {
+      fixture.blobFetches.push(blobDigest);
+      const bOverride = opts.blobOverrides?.[blobDigest];
+      if (bOverride !== undefined) return send(200, bOverride, { "content-type": "application/octet-stream" });
       const bytes = blobDigest === gz1Digest ? gz1 : blobDigest === gz2Digest ? gz2 : null;
       if (!bytes) return send(404, "blob unknown");
       if (opts.corruptDigest === blobDigest) {
@@ -169,7 +254,13 @@ async function startFixture(opts: { challenge?: boolean; corruptDigest?: string 
 }
 
 async function startFixtureAndClient(
-  opts: { challenge?: boolean; corruptDigest?: string; arch?: string } = {},
+  opts: {
+    challenge?: boolean;
+    corruptDigest?: string;
+    arch?: string;
+    manifestOverrides?: Record<string, Buffer>;
+    blobOverrides?: Record<string, Buffer>;
+  } = {},
 ): Promise<{ fixture: Fixture; client: OciClient; workDir: string; destDir: string }> {
   const fixture = await startFixture(opts);
   const workDir = await mkdtemp(join(tmpdir(), "devdb-oci-work-"));
@@ -224,5 +315,114 @@ describe("OciClient", () => {
     await client.pullPrefix({ repository: REPO, digest, destDir, prefix: "usr/local/" });
     expect(fixture.tokenHits).toBe(1); // challenged once; token cached for every later fetch
     await expect(access(join(destDir, "bin", "postgres"))).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial layers & manifest content-address pinning (security fix round 1).
+// Threat model: image layers are UNTRUSTED — the per-layer sha only proves the
+// blob matches the manifest, and one hostile author controls both. Extraction
+// must be safe against hostile member names ON ITS OWN.
+// ---------------------------------------------------------------------------
+describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
+  // Build a single-layer image around a hostile tar and register its manifest + blob so the
+  // client will fetch, sha-verify, gunzip, and then attempt to APPLY the layer (where the
+  // sanitization must fire). Returns the digest to pull by.
+  async function hostileLayerClient(
+    members: TarEntry[],
+  ): Promise<{ client: OciClient; fixture: Fixture; workDir: string; destDir: string; manifestDigest: string }> {
+    const gz = gzipSync(makeTar(members));
+    const layerDigest = sha256(gz);
+    const manifestBody = singleManifest(gz, layerDigest);
+    const manifestDigest = sha256(manifestBody);
+    const h = await startFixtureAndClient({
+      manifestOverrides: { [manifestDigest]: manifestBody },
+      blobOverrides: { [layerDigest]: gz },
+    });
+    return { ...h, manifestDigest };
+  }
+
+  // Plant a victim OUTSIDE the extract tree: a sibling of the `.tmp-oci-extract-*` dir that
+  // pullPrefix mkdtemps under workDir (= dirname(destDir)). The `usr/local/../../../victim/…`
+  // members below escape extractRoot by exactly one level to land on it — so if any whiteout `rm`
+  // runs, this file disappears. Returns the victim file path.
+  async function plantVictim(workDir: string): Promise<string> {
+    const victim = join(workDir, "victim");
+    await mkdir(victim, { recursive: true });
+    await writeFile(join(victim, "evil"), "PRECIOUS");
+    return join(victim, "evil");
+  }
+
+  it("C1(a): rejects a `.wh.` whiteout that traverses out of the extract tree — no rm runs", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/../../../victim/.wh.evil", type: "0", content: "" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS"); // fail-closed: the out-of-tree rm never ran
+    await expect(access(destDir)).rejects.toThrow(); // no partial install materialized
+  });
+
+  it("C1(b): rejects an absolute-path member (fail-closed even though it misses the prefix)", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/bin/postgres", type: "0", content: "ok" }, // benign in-prefix content
+      { name: "/etc/cron.d/evil", type: "0", content: "pwn" }, // absolute — rejects the whole layer
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("C1(c): rejects an opaque `.wh..wh..opq` whiteout that traverses out of the extract tree", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/../../../victim/.wh..wh..opq", type: "0", content: "" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS"); // an opaque rm would have cleared the dir
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("C1(d): rejects a symlink member under the prefix (would land in destDir pointing outside)", async () => {
+    const { client, workDir, destDir, manifestDigest } = await hostileLayerClient([
+      { name: "usr/local/evil-link", type: "2", linkname: "/etc/passwd" },
+    ]);
+    const victim = await plantVictim(workDir);
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe layer entry/);
+    expect(await readFile(victim, "utf8")).toBe("PRECIOUS");
+    await expect(access(destDir)).rejects.toThrow(); // the out-pointing symlink never reached destDir
+  });
+
+  it("P2: rejects a manifest whose body does not match the requested content-address, before any blob download", async () => {
+    // Serve a valid-but-different manifest (arm) under the amd digest the caller pins.
+    const { fixture, client, destDir } = await startFixtureAndClient({
+      manifestOverrides: { [amdDigest]: armBytes },
+    });
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: amdDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/manifest digest mismatch/);
+    expect(fixture.blobFetches).toEqual([]); // rejected BEFORE any layer download/extraction
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("M1: rejects a manifest that is neither an index nor a layer manifest", async () => {
+    const malformed = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json" }));
+    const malformedDigest = sha256(malformed);
+    const { fixture, client, destDir } = await startFixtureAndClient({
+      manifestOverrides: { [malformedDigest]: malformed },
+    });
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: malformedDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/malformed manifest/);
+    expect(fixture.blobFetches).toEqual([]);
   });
 });

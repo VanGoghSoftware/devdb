@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, posix } from "node:path";
+import { dirname, join, posix, resolve, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -75,31 +75,124 @@ function exists(p: string): Promise<boolean> {
   );
 }
 
+// A manifest fetched by content-address (a `sha256:<hex>` ref — the caller's digest, or an
+// arch-manifest digest picked from an index) MUST hash to that ref over its RAW response bytes.
+// Without this the digest pin is meaningless: a registry (or MITM) could serve a different valid
+// manifest under the requested digest. Tag refs aren't content-addressed, so they're not checked.
+function verifyManifestDigest(body: Buffer, ref: string): void {
+  if (!ref.startsWith("sha256:")) return;
+  const got = `sha256:${createHash("sha256").update(body).digest("hex")}`;
+  if (got !== ref) throw new Error(`manifest digest mismatch for ${ref}: got ${got}`);
+}
+
+// Discriminate an image index (`manifests[]`) from an image manifest (`layers[]`) with a real shape
+// check, and reject a body that is neither — an unchecked `JSON.parse(...) as …` would otherwise
+// surface later as an opaque `TypeError` inside `for (const layer of manifest.layers)`.
+function parseManifestDoc(body: Buffer, repo: string, ref: string): ImageIndex | ImageManifest {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new Error(`malformed manifest for ${repo}@${ref}: not JSON`);
+  }
+  if (typeof doc !== "object" || doc === null) throw new Error(`malformed manifest for ${repo}@${ref}: not an object`);
+  if ("manifests" in doc) {
+    if (!Array.isArray(doc.manifests)) throw new Error(`malformed manifest for ${repo}@${ref}: manifests is not an array`);
+    return doc as ImageIndex;
+  }
+  if (!("layers" in doc) || !Array.isArray(doc.layers)) {
+    throw new Error(`malformed manifest for ${repo}@${ref}: no layers array`);
+  }
+  return doc as ImageManifest;
+}
+
 // One layer, applied overlay-style into extractRoot: list the archive, and if it touches the
 // prefix at all — apply its whiteouts against lower layers' state, extract just the prefix
 // subtree, then drop the `.wh.*` marker files the extract materialized. Layers with no entries
 // under the prefix are skipped entirely (GNU tar exits 2 when asked for absent members).
 async function applyLayer(a: { spool: string; extractRoot: string; prefix: string }): Promise<void> {
-  const listed = await execFileP("tar", ["-tf", a.spool], { maxBuffer: 64 * 1024 * 1024 });
-  const entries = listed.stdout.split("\n").filter((line) => line.length > 0);
-  const underPrefix = entries.filter((e) => e.startsWith(a.prefix));
+  const names = (await execFileP("tar", ["-tf", a.spool], { maxBuffer: 64 * 1024 * 1024 })).stdout
+    .split("\n")
+    .filter((line) => line.length > 0);
+
+  // --- Fail-closed sanitization. Layers are UNTRUSTED: the per-layer sha check only proves the
+  // blob matches the manifest, and a hostile author controls both, so extraction must be safe
+  // against hostile member names on its own. This pass MUST precede the whiteout `rm` and the
+  // `tar -x` below — the whiteout `rm` runs BEFORE tar and so is NOT covered by tar's own
+  // `..`/absolute-path guards; a name like `usr/local/../../etc/cron.d/.wh.x` would otherwise
+  // `rm -rf` an arbitrary absolute path as root in-container. Any hostile member rejects the layer.
+  //
+  // (1) No member ANYWHERE may be absolute or carry a `..` path component. Registry layer changeset
+  //     paths are always relative and `..`-free (OCI image-spec), so either means a hostile author.
+  //     Checked over every member (not just in-prefix ones) so an absolute member is caught even
+  //     though it never matches the `usr/local/` prefix.
+  for (const name of names) {
+    const norm = posix.normalize(name);
+    if (name.startsWith("/") || norm.startsWith("/") || name.split("/").includes("..") || norm.split("/").includes("..")) {
+      throw new Error(`unsafe layer entry: ${name}`);
+    }
+  }
+  const underPrefix = names.filter((e) => e.startsWith(a.prefix));
   if (underPrefix.length === 0) return;
+  // (2) Every in-prefix member must still normalize to a path under the prefix (belt-and-suspenders
+  //     over (1); `posix.normalize` preserves the trailing slash so GNU tar's `usr/local/` dir
+  //     listing passes just as bsdtar's slashless form does).
+  for (const name of underPrefix) {
+    const norm = posix.normalize(name);
+    if (norm.startsWith("/") || norm.split("/").includes("..") || !norm.startsWith(a.prefix)) {
+      throw new Error(`unsafe layer entry: ${name}`);
+    }
+  }
+  // (3) Only regular files ('-') and directories ('d') may live under the prefix. A symlink ('l')
+  //     lands in destDir pointing outside the tree (or a later whiteout `rm` could follow it out);
+  //     a hardlink ('h') or device/fifo/socket has no place in a postgres install. Member types
+  //     come from `tar -tvf` (ls-style mode string; first char is the type), zipped to names by
+  //     index — both listings emit one line per member in archive order.
+  const verbose = (await execFileP("tar", ["-tvf", a.spool], { maxBuffer: 64 * 1024 * 1024 })).stdout
+    .split("\n")
+    .filter((line) => line.length > 0);
+  if (verbose.length !== names.length) {
+    throw new Error(`unsafe layer: tar listing count mismatch (${names.length} names vs ${verbose.length} typed)`);
+  }
+  for (const [i, name] of names.entries()) {
+    if (!name.startsWith(a.prefix)) continue;
+    const type = (verbose[i] ?? "").charAt(0);
+    if (type !== "-" && type !== "d") throw new Error(`unsafe layer entry: ${name} (type "${type || "?"}")`);
+  }
+
+  // Belt-and-suspenders for the whiteout `rm`s below: even though (1)/(2) already reject `..` and
+  // absolute names, assert each resolved target still sits under the extract root before deleting.
+  const extractRootResolved = resolve(a.extractRoot);
+  const assertUnder = (target: string): void => {
+    const t = resolve(target);
+    if (t !== extractRootResolved && !t.startsWith(extractRootResolved + sep)) {
+      throw new Error(`unsafe whiteout target escapes extract root: ${target}`);
+    }
+  };
+
   const whiteouts = underPrefix.filter((e) => posix.basename(e).startsWith(".wh."));
   for (const entry of whiteouts) {
     const dir = join(a.extractRoot, posix.dirname(entry));
     const name = posix.basename(entry);
+    assertUnder(dir);
     if (name === ".wh..wh..opq") {
       // Opaque whiteout: this layer hides ALL lower-layer contents of the dir (dir itself stays).
       for (const child of await readdir(dir).catch(() => [] as string[])) {
-        await rm(join(dir, child), { recursive: true, force: true });
+        const target = join(dir, child);
+        assertUnder(target);
+        await rm(target, { recursive: true, force: true });
       }
     } else {
-      await rm(join(dir, name.slice(".wh.".length)), { recursive: true, force: true });
+      const target = join(dir, name.slice(".wh.".length));
+      assertUnder(target);
+      await rm(target, { recursive: true, force: true });
     }
   }
   await execFileP("tar", ["-xf", a.spool, "-C", a.extractRoot, a.prefix.replace(/\/$/, "")]);
   for (const entry of whiteouts) {
-    await rm(join(a.extractRoot, entry), { recursive: true, force: true });
+    const target = join(a.extractRoot, entry);
+    assertUnder(target);
+    await rm(target, { recursive: true, force: true });
   }
 }
 
@@ -168,7 +261,7 @@ export class OciClient implements OciPuller {
 
   async resolveDigest(repository: string, tag: string): Promise<{ digest: string }> {
     const { body, res } = await this.fetchManifest(repository, tag);
-    const parsed = JSON.parse(body.toString("utf8")) as ImageIndex | ImageManifest;
+    const parsed = parseManifestDoc(body, repository, tag);
     if ("manifests" in parsed) return { digest: this.selectArch(parsed, repository, tag) };
     const header = res.headers.get("docker-content-digest");
     return { digest: header ?? `sha256:${createHash("sha256").update(body).digest("hex")}` };
@@ -182,14 +275,18 @@ export class OciClient implements OciPuller {
     onProgress?: (line: string) => void;
   }): Promise<void> {
     if (await exists(a.destDir)) throw new Error(`destDir already exists: ${a.destDir}`);
-    const first = JSON.parse((await this.fetchManifest(a.repository, a.digest)).body.toString("utf8")) as
-      | ImageIndex
-      | ImageManifest;
+    const firstBody = (await this.fetchManifest(a.repository, a.digest)).body;
+    verifyManifestDigest(firstBody, a.digest); // content-address pin (no-op for a tag ref)
+    const first = parseManifestDoc(firstBody, a.repository, a.digest);
     let manifest: ImageManifest;
     if ("manifests" in first) {
       // Caller handed us an index digest — select this arch's manifest, same as resolveDigest.
       const archDigest = this.selectArch(first, a.repository, a.digest);
-      manifest = JSON.parse((await this.fetchManifest(a.repository, archDigest)).body.toString("utf8")) as ImageManifest;
+      const archBody = (await this.fetchManifest(a.repository, archDigest)).body;
+      verifyManifestDigest(archBody, archDigest); // arch-manifest digest is always content-addressed
+      const archDoc = parseManifestDoc(archBody, a.repository, archDigest);
+      if ("manifests" in archDoc) throw new Error(`unexpected nested index for ${a.repository}@${archDigest}`);
+      manifest = archDoc;
     } else {
       manifest = first;
     }
