@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ActionIcon, Alert, Button, Card, Drawer, Group, Skeleton, Stack, Tabs, Text, TextInput, Title,
 } from "@mantine/core";
@@ -8,7 +8,9 @@ import { StatusChip, ContextChip } from "../tree/chips.js";
 import { InfoTab } from "./InfoTab.js";
 
 export function maskConnstring(conn: string): string {
-  return conn.replace(/^(postgresql:\/\/[^:@/]+:)[^@]*@/, "$1•••@");
+  // Mask the password segment of a URL's `//user:PASSWORD@` userinfo for ANY scheme, so a format
+  // shift (e.g. `postgres://` vs `postgresql://`) can never fail open and leak the password.
+  return conn.replace(/(:\/\/[^:@/]+:)[^@]*@/, "$1•••@");
 }
 
 export function BranchDrawer(a: { branchId: string | null; onClose: () => void }) {
@@ -19,6 +21,12 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [copied, setCopied] = useState(false);
+
+  // Edit state (editing/draft) is component-local, not keyed by branch — without this reset, an
+  // in-progress rename on one branch (e.g. a child) survives a drawer re-target to another branch
+  // (e.g. the root), which would render the TextInput and let Enter fire `rename.mutate(rootId)`,
+  // a forbidden path the daemon 400s. Reset whenever the observed branch identity changes.
+  useEffect(() => { setEditing(false); }, [a.branchId]);
 
   // Manual copy (not Mantine's CopyButton/useClipboard): useClipboard's `copy` calls
   // `navigator.clipboard.writeText(value).then(...)` unconditionally — it requires writeText to
@@ -50,12 +58,16 @@ export function BranchDrawer(a: { branchId: string | null; onClose: () => void }
     <Drawer opened={a.branchId !== null} onClose={a.onClose} position="right" size="lg">
       <Stack gap="sm">
         <Group gap="xs" wrap="nowrap">
-          {editing ? (
+          {editing && b.parentBranchId !== null ? (
             <TextInput
               value={draft}
               onChange={(e) => setDraft(e.currentTarget.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && draft.trim()) {
+                // Root guard belongs here too, not just on the pencil: `editing` state can be
+                // true for a root branch in principle (e.g. a future code path re-enters edit
+                // mode without going through the pencil's onClick), so the actual mutate call —
+                // not just the affordance to open the input — must independently refuse root.
+                if (e.key === "Enter" && draft.trim() && b.parentBranchId !== null) {
                   rename.mutate({ id: b.id, name: draft.trim() }, { onSettled: () => setEditing(false) });
                 }
                 if (e.key === "Escape") setEditing(false);
