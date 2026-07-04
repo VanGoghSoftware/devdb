@@ -1,4 +1,4 @@
-import { Group, Text, UnstyledButton } from "@mantine/core";
+import { Group, Text } from "@mantine/core";
 import type { BranchDto } from "@devdb/shared";
 import { buildTree, railsLayout } from "./model.js";
 import { StatusChip, ContextChip } from "./chips.js";
@@ -35,12 +35,16 @@ export function RailsView(a: {
       </svg>
       <div style={{ flex: 1, minWidth: 0 }}>
         {layout.rows.map((r) => (
-          <UnstyledButton
+          <div
             key={r.branch.id}
             data-branch-row
+            role="button"
+            tabIndex={0}
             onClick={() => a.onSelect(r.branch.id)}
-            w="100%"
-            style={{ height: ROW_H, display: "flex", alignItems: "center" }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") { e.preventDefault(); a.onSelect(r.branch.id); }
+            }}
+            style={{ height: ROW_H, display: "flex", alignItems: "center", width: "100%", cursor: "pointer" }}
           >
             <Group gap="xs" wrap="nowrap" w="100%">
               <Text ff="monospace" fw={600} size="sm" truncate>{r.branch.name}</Text>
@@ -54,7 +58,7 @@ export function RailsView(a: {
                 />
               </div>
             </Group>
-          </UnstyledButton>
+          </div>
         ))}
       </div>
     </Group>
