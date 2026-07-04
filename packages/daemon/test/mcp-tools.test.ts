@@ -140,10 +140,12 @@ describe("MCP read tools", () => {
     // `z.number().int().gte(14)` (packages/shared/src/index.ts) — no upper bound, so a pulled
     // v18 build validates. That means the schema layer can no longer reject 18; only the floor
     // (13 and below, non-integers) is a schema-level reject. Runtime "is this major actually
-    // installed" validation for values like 18 moves to ProjectsService.create() in Task 8
-    // (DevdbError 400 "not installed — installed majors: …", gated on a `builds` dep that does
-    // not exist yet) — see docs/superpowers/plans/2026-07-04-devdb-dynamic-pg-builds.md Task 8.
-    // 18 accepting here is therefore CORRECT for Task 1's world, not a regression.
+    // installed" validation moved to ProjectsService.create() in Task 8 (DevdbError 400 "not
+    // installed — installed majors: …", gated on a `builds` dep) — see
+    // docs/superpowers/plans/2026-07-04-devdb-dynamic-pg-builds.md Task 8. The harness now wires a
+    // real `builds` fake (baked majors 14-17, see helpers/mcp-harness.ts's fakes()) into every
+    // service it constructs, mirroring production (index.ts always wires a real BuildRegistry) —
+    // so 18 now REJECTS here, retiring this describe block's former "accepts 18" assertion.
     describe("pgVersion coverage", () => {
       it.each([14, 15, 16, 17])("accepts pgVersion %d", async (pgVersion) => {
         h = await makeReadToolsHarness();
@@ -152,13 +154,14 @@ describe("MCP read tools", () => {
         expect(firstText(res)).toContain(`pg${pgVersion}`);
       });
 
-      // Task 8 will add coverage asserting pgVersion 18 (and other registry-unknown majors) is
-      // rejected once ProjectsService.create() gains the installedMajors guard.
-      it("accepts pgVersion 18 (registry-availability guard lands in Task 8, not here)", async () => {
+      // Task 8: the installedMajors guard now rejects a schema-valid-but-not-installed major.
+      // Retires this describe block's former "accepts pgVersion 18" assertion (correct for Task
+      // 1's world, where no `builds` dep — and therefore no guard — existed anywhere yet).
+      it("rejects pgVersion 18 with the installed-majors guard (registry-availability guard, Task 8)", async () => {
         h = await makeReadToolsHarness();
         const res = await h.call("create_project", { name: "shop-18", pgVersion: 18 });
-        expect(res.isError).toBeFalsy();
-        expect(firstText(res)).toContain("pg18");
+        expect(res.isError).toBe(true);
+        expect(firstText(res)).toMatch(/not installed — installed majors: 14, 15, 16, 17/);
       });
 
       it("rejects pgVersion 13 with a caller-actionable message", async () => {

@@ -8,6 +8,7 @@ import { DevdbError } from "./errors.js";
 import { slugify } from "./slug.js";
 import type { ProjectsDeps } from "./projects.js";
 import type { LogsService } from "./logs.js";
+import type { BuildsResolverApi } from "./engine-api.js";
 
 export type BranchDetail = BranchRow & {
   endpointStatus: EndpointStatus;
@@ -17,6 +18,11 @@ export type BranchDetail = BranchRow & {
   lastRecordLsn: string | null;
   logicalSizeBytes: number | null;
   ancestorLsn: string | null;
+  // Task 8 (dynamic-pg-builds): version string ("16.10") of the build the running compute was
+  // started from — resolved via computes.runningPgbin(id) -> builds.versionForPgbin(...); null
+  // when stopped, or when the registry can't map the path back to a version (e.g. `builds` dep
+  // absent, or a lookup miss). Threaded straight through to BranchDto by dto.ts's toBranchDto().
+  runningPgVersion: string | null;
 };
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9 /._-]{0,62}$/;
@@ -28,7 +34,12 @@ export class BranchesService {
   // cleanup nicety, not something delete()'s correctness depends on. Optional-chained at the one
   // call site below rather than forcing every existing test/caller to thread a real or fake
   // LogsService through just for this.
-  constructor(private deps: ProjectsDeps & { queue: BranchQueue; logs?: LogsService }) {}
+  //
+  // Task 8: `builds` is OPTIONAL (same rationale as `logs?` — plenty of existing unit tests
+  // construct this service without a BuildRegistry, and runningPgVersion resolution is enrichment,
+  // not something detail()'s core correctness depends on) and narrowed to
+  // `Pick<BuildsResolverApi, "versionForPgbin">` since that's the only method detail() consumes.
+  constructor(private deps: ProjectsDeps & { queue: BranchQueue; logs?: LogsService; builds?: Pick<BuildsResolverApi, "versionForPgbin"> }) {}
 
   byIdOr404(id: string): BranchRow {
     const b = this.deps.state.branches.byId(id);
@@ -144,6 +155,13 @@ export class BranchesService {
       // timeline info is enrichment — a briefly unavailable pageserver must not 500 branch listings
       console.error(`timeline enrichment unavailable for branch ${branch.id} (${branch.name}):`, e.message);
     }
+    // Task 8: two-hop resolution — computes.runningPgbin(id) (the path this branch's compute was
+    // actually launched with, if any) -> builds.versionForPgbin(path) (which registry row that
+    // path resolves to). Null end-to-end whenever EITHER hop misses: no running compute, no
+    // `builds` dep, or a path the registry can't map back to a version — never thrown, since this
+    // is enrichment (same discipline as the timelineInfo try/catch above), not a hard dependency.
+    const runningPgbin = this.deps.computes.runningPgbin(branch.id);
+    const runningPgVersion = runningPgbin ? (this.deps.builds?.versionForPgbin(runningPgbin) ?? null) : null;
     return {
       ...branch,
       endpointStatus: status,
@@ -153,6 +171,7 @@ export class BranchesService {
       lastRecordLsn,
       logicalSizeBytes,
       ancestorLsn,
+      runningPgVersion,
     };
   }
 

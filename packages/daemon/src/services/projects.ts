@@ -1,7 +1,7 @@
 import { DEFAULT_PG_VERSION, type PgVersion } from "@devdb/shared";
 import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
 import type { LogsService } from "./logs.js";
 import type { EventsService } from "./events.js";
 import type { Logger } from "../logging/logger.js";
@@ -38,6 +38,15 @@ export interface ProjectsDeps {
   // edits. Optional so the many existing unit tests that construct services directly without an
   // EventsService keep typechecking unchanged.
   events?: EventsService;
+  // Task 8 (dynamic-pg-builds): OPTIONAL here (same rationale as `events?` above) so ProjectsService
+  // stays backward-compatible when constructed without it (old no-guard behavior — see create()
+  // below) — every existing unit test in this file's suite keeps typechecking unchanged.
+  // EndpointsService's OWN deps type (services/endpoints.ts) intersects this with `builds:
+  // BuildsResolverApi` (no `?`), which narrows it to REQUIRED there — production always wires a
+  // real BuildRegistry, and EndpointsService.startLocked() cannot resolve --pgbin without one.
+  // Narrowed to `Pick<..., "installedMajors">` here since that's the only method create()'s guard
+  // consumes — a caller supplying the full BuildsResolverApi still satisfies this structurally.
+  builds?: Pick<BuildsResolverApi, "installedMajors">;
 }
 
 // oracle: tenant config values src/mgmt/service/project.rs:95-108
@@ -74,6 +83,19 @@ export class ProjectsService {
         `project "${name}" already exists — choose a different name, or use the existing project (call list_projects to see it)`);
     }
     const pgVersion = a.pgVersion ?? DEFAULT_PG_VERSION;
+    // Task 8 (dynamic-pg-builds): a WHITELIST against builds.installedMajors() — rejects ANY major
+    // not currently installed (not a spot-check of one hardcoded "unsupported" value). Gated on
+    // `deps.builds` being present so callers that construct this service without a BuildRegistry
+    // (e.g. plenty of existing unit tests) keep the pre-Task-8 no-guard behavior unchanged.
+    // PgVersionSchema (packages/shared) only floors at 14 — the registry, not the schema, is now
+    // the source of truth for which majors actually exist on this daemon.
+    if (this.deps.builds) {
+      const installed = this.deps.builds.installedMajors();
+      if (!installed.includes(pgVersion)) {
+        throw new DevdbError(400,
+          `Postgres ${pgVersion} is not installed — installed majors: ${installed.join(", ")}. Pull it via POST /api/pg-builds/pull.`);
+      }
+    }
     const projectId = newHexId(); // doubles as tenant id — oracle: project.rs:83-84
 
     await this.deps.storcon.tenantCreate(projectId, TENANT_CONFIG);

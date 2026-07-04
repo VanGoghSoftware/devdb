@@ -10,6 +10,7 @@ const detail: BranchDetail = {
   context: { agent: "claude", purpose: "x" },
   port: 54301, connectionString: "postgresql://postgres:SECRET@localhost:54301/postgres",
   lastRecordLsn: "0/1", logicalSizeBytes: 10, ancestorLsn: null,
+  runningPgVersion: "17.4",
 };
 
 describe("toBranchDto", () => {
@@ -23,5 +24,11 @@ describe("toBranchDto", () => {
   it("does not leak internal-only columns", () => {
     const dto = toBranchDto(detail) as unknown as Record<string, unknown>;
     for (const k of ["stickyPort", "importStatus", "importError"]) expect(k in dto).toBe(false);
+  });
+  // Task 8: toBranchDto now maps BranchDetail.runningPgVersion straight through (replacing the
+  // Task-1 hardcoded-null stopgap) — covered for both a real value and the stopped/unresolved null.
+  it("maps runningPgVersion through from BranchDetail", () => {
+    expect(toBranchDto(detail).runningPgVersion).toBe("17.4");
+    expect(toBranchDto({ ...detail, runningPgVersion: null }).runningPgVersion).toBeNull();
   });
 });

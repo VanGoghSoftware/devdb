@@ -7,7 +7,8 @@ import { EndpointsService } from "../src/services/endpoints.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { PortExhaustedError } from "../src/compute/ports.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import { DevdbError } from "../src/services/errors.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
 import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
@@ -16,8 +17,14 @@ import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 //
 // Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
 // service's deps now require it (ProjectsDeps), for compensation-path logging.
+//
+// Task 8: `computes` gains `runningPgbin`/`runningPgbins` (ComputesApi grew these members, so the
+// tsc gate forces every fake to carry them even where a given test never calls them) and a new
+// `builds: BuildsResolverApi` fake is returned alongside — EndpointsService's deps now require it
+// to resolve --pgbin fresh per start (the whole point of "adopt on restart" being structural).
 function fakes(): {
-  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
+  builds: BuildsResolverApi; logger: Logger;
 } {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
@@ -43,11 +50,19 @@ function fakes(): {
     statusOf: vi.fn((): EndpointStatus => "stopped"),
     portOf: vi.fn(() => null),
     runningPorts: vi.fn(() => []),
+    runningPgbin: vi.fn(() => null),
+    runningPgbins: vi.fn(() => []),
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
+  const builds: BuildsResolverApi = {
+    pgbinFor: vi.fn((major: number) => ({ path: `/b/v${major}/bin/postgres`, version: `${major}.10`, buildId: `dl-${major}-t` })),
+    versionForPgbin: vi.fn(() => null),
+    recordRun: vi.fn(),
+    installedMajors: vi.fn(() => [14, 15, 16, 17]),
+  };
   const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
-  return { storcon, pageserver, safekeeper, computes, logger };
+  return { storcon, pageserver, safekeeper, computes, builds, logger };
 }
 
 async function seeded() {
@@ -351,5 +366,81 @@ describe("EndpointsService", () => {
     vi.mocked(f.computes.portOf).mockReturnValue(54300);
     await expect(endpoints.start(mainBranch.id)).resolves.toBeDefined();
     await expect(endpoints.stop(mainBranch.id)).resolves.toBeDefined();
+  });
+
+  // Task 8: startLocked resolves --pgbin fresh per start via builds.pgbinFor(project's major) —
+  // NOT a pgInstallDir-joined path baked at compute-manager construction time. This is what makes
+  // "adopt on restart" structural (spec §Architecture): the ACTIVE build can change between two
+  // starts of the same branch with no code path needing to know that happened. A successful,
+  // non-override start also raises the run high-water (builds.recordRun) so a later downgrade
+  // attempt is caught — but only AFTER computes.start() has actually resolved (recording a run
+  // that never happened would be worse than not recording one that did).
+  it("startLocked resolves --pgbin via builds.pgbinFor(project major) and records the run high-water", async () => {
+    const { f, mainBranch, endpoints } = await seeded();
+    // seeded()'s project.create({ name: "acme" }) takes no explicit pgVersion, so its main branch
+    // is on DEFAULT_PG_VERSION (17, see @devdb/shared) — pgbinFor's fake return and the recordRun
+    // assertion below both target major 17 to match, not an arbitrary different major.
+    vi.mocked(f.builds.pgbinFor).mockReturnValue({ path: "/b/v17/bin/postgres", version: "17.10", buildId: "dl-17-t" });
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+
+    await endpoints.start(mainBranch.id);
+
+    expect(f.builds.pgbinFor).toHaveBeenCalledWith(17);
+    expect(f.computes.start).toHaveBeenCalledWith(expect.objectContaining({ pgbinPath: "/b/v17/bin/postgres" }));
+    expect(f.builds.recordRun).toHaveBeenCalledTimes(1);
+    expect(f.builds.recordRun).toHaveBeenCalledWith(17, 10);
+  });
+
+  // The validation gate (builds/validate.ts, a later task) calls startWithPgbin() to launch a
+  // CANDIDATE build that isn't active yet — it must NOT touch the run high-water: recording it
+  // would arm the downgrade guard against a build that may still fail its own gate. The override
+  // also skips resolution outright (builds.pgbinFor must never even be consulted), since the
+  // whole point of the override is bypassing the registry's current ACTIVE-build pick.
+  it("startWithPgbin overrides resolution and does NOT recordRun (gate must not raise the high-water)", async () => {
+    const { f, mainBranch, endpoints } = await seeded();
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+
+    await endpoints.startWithPgbin(mainBranch.id, "/tmp/candidate/bin/postgres");
+
+    expect(f.computes.start).toHaveBeenCalledWith(expect.objectContaining({ pgbinPath: "/tmp/candidate/bin/postgres" }));
+    expect(f.builds.recordRun).not.toHaveBeenCalled();
+    expect(f.builds.pgbinFor).not.toHaveBeenCalled();
+  });
+
+  // pgbinFor() is called INSIDE startLocked's existing try (not before it) specifically so its
+  // 409 ("no usable Postgres — pull one or pick an installed major") lands in the SAME single
+  // "failed"-recording catch every other start() failure goes through, rather than an uncaught
+  // throw that skips the endpointStatus="failed" write entirely.
+  it("pgbinFor throwing DevdbError(409) surfaces as the start failure and records endpoint failed", async () => {
+    const { f, state, mainBranch, endpoints } = await seeded();
+    vi.mocked(f.builds.pgbinFor).mockImplementation(() => {
+      throw new DevdbError(409, "no usable Postgres 17 build — pull one via POST /api/pg-builds/pull or pick an installed major");
+    });
+
+    await expect(endpoints.start(mainBranch.id)).rejects.toThrow(/no usable Postgres/);
+
+    expect(f.computes.start).not.toHaveBeenCalled();
+    const row = state.branches.byId(mainBranch.id)!;
+    expect(row.endpointStatus).toBe("failed");
+    expect(row.endpointError).toContain("no usable Postgres");
+  });
+
+  // Task 8: detail()'s runningPgVersion resolves through builds.versionForPgbin(computes.
+  // runningPgbin(id)) — covered end-to-end here (not just in branches-service.test.ts) because
+  // EndpointsService's own return value (BranchDetail via branches.detail()) is what callers of
+  // start()/stop() actually see.
+  it("a successful start's returned detail carries runningPgVersion resolved from the started pgbin", async () => {
+    const { f, mainBranch, endpoints } = await seeded();
+    vi.mocked(f.builds.pgbinFor).mockReturnValue({ path: "/b/v16/bin/postgres", version: "16.10", buildId: "dl-16-t" });
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+    vi.mocked(f.computes.runningPgbin).mockReturnValue("/b/v16/bin/postgres");
+    vi.mocked(f.builds.versionForPgbin).mockReturnValue("16.10");
+
+    const detail = await endpoints.start(mainBranch.id);
+
+    expect(detail.runningPgVersion).toBe("16.10");
   });
 });

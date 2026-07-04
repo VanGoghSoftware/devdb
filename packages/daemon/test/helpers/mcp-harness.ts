@@ -17,7 +17,7 @@ import { registerTools } from "../../src/mcp/tools.js";
 import type { ToolCtx } from "../../src/mcp/server.js";
 import type { Deps } from "../../src/http/api.js";
 import type { EngineRuntime } from "../../src/engine/boot.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../../src/services/engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../../src/services/engine-api.js";
 import type { Logger } from "../../src/logging/logger.js";
 import type { EndpointStatus } from "@devdb/shared";
 
@@ -40,8 +40,16 @@ function testCfg() {
 // MCP tool tests exercise the SAME narrow engine-api.ts interfaces the rest of the daemon's unit
 // suite fakes, not a bespoke ad-hoc mock. No `as any`/`as never`: every method the interfaces
 // declare is present as a vi.fn(), even ones a given test never exercises.
+//
+// Task 8: `computes` gains `runningPgbin`/`runningPgbins` (tsc-forced by ComputesApi) and `builds`
+// joins the bag — production (index.ts) always constructs ProjectsService/BranchesService with a
+// real BuildRegistry, so the harness now mirrors that (rather than the pre-Task-8 "no builds dep
+// at all" shape) — this is what makes create_project's pgVersion-guard tests exercise the SAME
+// reject-unknown-major behavior a real agent hitting the MCP tool would see, not a harness-only
+// backward-compat path that diverges from production.
 export function fakes(): {
-  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
+  builds: BuildsResolverApi; logger: Logger;
 } {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
@@ -67,11 +75,21 @@ export function fakes(): {
     statusOf: vi.fn((): EndpointStatus => "stopped"),
     portOf: vi.fn(() => null),
     runningPorts: vi.fn(() => []),
+    runningPgbin: vi.fn(() => null),
+    runningPgbins: vi.fn(() => []),
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
+  // Baked majors today are 14-17 (docker/BINARIES.md) — matches the guard's real-world default so
+  // the "accepts 14/15/16/17" MCP tests keep passing unchanged and "accepts 18" now REJECTS.
+  const builds: BuildsResolverApi = {
+    pgbinFor: vi.fn((major: number) => ({ path: `/usr/local/share/neon/pg_install/v${major}/bin/postgres`, version: `${major}.0`, buildId: `baked-v${major}` })),
+    versionForPgbin: vi.fn(() => null),
+    recordRun: vi.fn(),
+    installedMajors: vi.fn(() => [14, 15, 16, 17]),
+  };
   const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
-  return { storcon, pageserver, safekeeper, computes, logger };
+  return { storcon, pageserver, safekeeper, computes, builds, logger };
 }
 
 export interface McpToolsHarness {

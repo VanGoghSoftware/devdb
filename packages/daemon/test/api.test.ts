@@ -26,6 +26,7 @@ function fakeBranchDetail(overrides: Partial<BranchDetail> = {}): BranchDetail {
     createdBy: "api", context: null,
     createdAt: "2026-07-03T00:00:00.000Z", updatedAt: "2026-07-03T00:00:00.000Z",
     port: null, connectionString: null, lastRecordLsn: null, logicalSizeBytes: null, ancestorLsn: null,
+    runningPgVersion: null, // Task 8: stopped by default, matching endpointStatus above
     ...overrides,
   };
 }
@@ -114,6 +115,33 @@ describe("buildServer error handling", () => {
     expect(Array.isArray(body.issues)).toBe(true);
     expect(body.issues.length).toBeGreaterThan(0);
     expect(body.issues[0]).toMatch(/name/);
+  });
+
+  // Task 8: REST-path parity for ProjectsService.create()'s major-installed guard — the route
+  // itself has no opinion on pgVersion validity beyond the shared PgVersionSchema (gte(14), no
+  // upper bound post dynamic-pg-builds Task 1); "is this major actually installed" is entirely a
+  // service-layer concern (ProjectsService.create(), gated on its optional `builds` dep — see
+  // projects-service.test.ts's own "create() major guard" tests for full service-level coverage).
+  // This test proves only the HTTP wiring: a DevdbError(400) thrown by projects.create() surfaces
+  // as a 400 with that exact message, the same way every other service-thrown DevdbError already
+  // does through this route layer (see the 409/404 tests elsewhere in this file) — not a
+  // duplicate of the guard's own logic, which belongs to the service, not the route.
+  it("POST /api/projects — 400 when the service rejects an uninstalled pgVersion major", async () => {
+    const cfg = testCfg();
+    const state = openState(":memory:");
+    const projects = fakeProjects();
+    vi.mocked(projects.create).mockRejectedValue(
+      new DevdbError(400, "Postgres 18 is not installed — installed majors: 14, 15, 16, 17. Pull it via POST /api/pg-builds/pull."),
+    );
+    const app = buildServer({
+      cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
+      services: { projects, branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
+    });
+
+    const res = await app.inject({ method: "POST", url: "/api/projects", payload: { name: "shop", pgVersion: 18 } });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/not installed — installed majors: 14, 15, 16, 17/);
   });
 });
 

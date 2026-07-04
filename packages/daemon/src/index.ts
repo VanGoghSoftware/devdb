@@ -20,6 +20,8 @@ import { createLogger } from "./logging/logger.js";
 import { BranchQueue } from "./state/queue.js";
 import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js";
 import { engineDirs } from "./engine/configs.js";
+import { BuildRegistry } from "./compute/builds/registry.js";
+import { detectPostgresVersion } from "./compute/builds/version.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -92,6 +94,21 @@ async function main(): Promise<void> {
       events.publish({ type: "endpoint.status", branchId, projectId: b?.projectId });
     });
     const queue = new BranchQueue();
+
+    // Task 8 (dynamic-pg-builds): minimal prerequisite for the daemon to compile with
+    // EndpointsService/ProjectsService/BranchesService now requiring/accepting a `builds` dep —
+    // the FULL boot order (pg_distrib compose, sweepTmp, Provisioner construction, gate wiring) is
+    // Task 9's job; this is deliberately just enough to seed/adopt/resolve once at boot so
+    // pgbinFor()/installedMajors()/versionForPgbin() return real answers before any service can be
+    // asked to start a compute or create a project.
+    const builds = new BuildRegistry({
+      state, pgInstallDir: cfg.pgInstallDir, pgBuildsDir: cfg.pgBuildsDir,
+      detectVersion: detectPostgresVersion, logger,
+    });
+    await builds.seedBaked();
+    await builds.adoptVolumeBuilds();
+    builds.resolveActives();
+
     // Fix 3: `logs` wired into both ProjectsService and BranchesService (both optional deps) so
     // their delete paths can evict a deleted branch's `branch:<id>:compute` channel.
     // Fix 1 (final review wave): `queue` wired into ProjectsService too — delete()'s per-leaf
@@ -104,9 +121,12 @@ async function main(): Promise<void> {
     // endpoint-status seam actually announces its invalidation hint in production, not just
     // under test (`events?` is optional on ProjectsDeps precisely so this wiring can be threaded
     // here without touching every existing unit test's construction).
-    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger });
-    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger });
-    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, events, logger });
+    // Task 8: `builds` (the BuildRegistry constructed above) wired into all three — REQUIRED by
+    // EndpointsService (resolves --pgbin fresh per start), OPTIONAL-but-present for
+    // ProjectsService (major-installed guard) and BranchesService (runningPgVersion enrichment).
+    const projects = new ProjectsService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds });
+    const branches = new BranchesService({ state, storcon, pageserver, safekeeper, computes, queue, logs, events, logger, builds });
+    const endpoints = new EndpointsService({ state, storcon, pageserver, safekeeper, computes, queue, branches, logs, events, logger, builds });
     const timetravel = new TimeTravelService({ state, storcon, pageserver, safekeeper, computes, queue, branches, endpoints, events, logger });
     const sql = new SqlService({ branches, endpoints });
 
