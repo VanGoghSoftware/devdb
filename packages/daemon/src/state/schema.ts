@@ -49,4 +49,23 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pg_builds (
+  id TEXT PRIMARY KEY,
+  major INTEGER NOT NULL,
+  minor INTEGER,
+  source TEXT NOT NULL,
+  release_tag TEXT NOT NULL,
+  image_digest TEXT NOT NULL,
+  path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'downloading',
+  active INTEGER NOT NULL DEFAULT 0,
+  size_bytes INTEGER,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(major, release_tag)
+);
+CREATE TABLE IF NOT EXISTS pg_majors (
+  major INTEGER PRIMARY KEY,
+  last_run_minor INTEGER NOT NULL
+);
 `;

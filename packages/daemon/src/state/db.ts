@@ -1,12 +1,14 @@
 import Database from "better-sqlite3";
 import { DDL } from "./schema.js";
-import { BranchesRepo, ProjectsRepo, SettingsRepo } from "./repos.js";
+import { BranchesRepo, PgBuildsRepo, PgMajorsRepo, ProjectsRepo, SettingsRepo } from "./repos.js";
 
 export interface StateDb {
   raw: Database.Database;
   projects: ProjectsRepo;
   branches: BranchesRepo;
   settings: SettingsRepo;
+  pgBuilds: PgBuildsRepo;
+  pgMajors: PgMajorsRepo;
 }
 
 // Additive schema evolution: CREATE TABLE IF NOT EXISTS never alters existing
@@ -40,5 +42,7 @@ export function openState(path: string): StateDb {
     projects: new ProjectsRepo(raw),
     branches: new BranchesRepo(raw),
     settings: new SettingsRepo(raw),
+    pgBuilds: new PgBuildsRepo(raw),
+    pgMajors: new PgMajorsRepo(raw),
   };
 }

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { BranchContext, PgVersion } from "@devdb/shared";
+import type { BranchContext, PgBuildStatus, PgVersion } from "@devdb/shared";
 
 export interface ProjectRow {
   id: string; name: string; pgVersion: PgVersion; createdAt: string; updatedAt: string;
@@ -161,5 +161,106 @@ export class SettingsRepo {
     this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(key, value);
+  }
+}
+
+export interface PgBuildRow {
+  id: string; major: number; minor: number | null; source: "baked" | "downloaded";
+  releaseTag: string; imageDigest: string; path: string; status: PgBuildStatus;
+  active: boolean; sizeBytes: number | null; error: string | null; createdAt: string;
+}
+
+function pgBuildRow(r: Record<string, unknown>): PgBuildRow {
+  return {
+    id: r.id as string, major: r.major as number, minor: (r.minor as number | null) ?? null,
+    // Row boundary: source/status are constrained by every write path in this file (the only
+    // writers), same narrowing rationale as branchRow's createdBy above.
+    source: r.source as PgBuildRow["source"], releaseTag: r.release_tag as string,
+    imageDigest: r.image_digest as string, path: r.path as string,
+    status: r.status as PgBuildStatus, active: (r.active as number) === 1,
+    sizeBytes: (r.size_bytes as number | null) ?? null, error: (r.error as string | null) ?? null,
+    createdAt: r.created_at as string,
+  };
+}
+
+export class PgBuildsRepo {
+  constructor(private db: Database.Database) {}
+  insert(a: {
+    id: string; major: number; source: "baked" | "downloaded"; releaseTag: string;
+    imageDigest: string; path: string; status: PgBuildStatus; minor?: number | null; sizeBytes?: number | null;
+  }): PgBuildRow {
+    this.db.prepare(
+      `INSERT INTO pg_builds (id, major, minor, source, release_tag, image_digest, path, status, size_bytes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(a.id, a.major, a.minor ?? null, a.source, a.releaseTag, a.imageDigest, a.path, a.status, a.sizeBytes ?? null);
+    return this.byId(a.id)!;
+  }
+  byId(id: string): PgBuildRow | null {
+    const r = this.db.prepare("SELECT * FROM pg_builds WHERE id = ?").get(id);
+    return r ? pgBuildRow(r as Record<string, unknown>) : null;
+  }
+  byDigest(digest: string): PgBuildRow | null {
+    const r = this.db.prepare("SELECT * FROM pg_builds WHERE image_digest = ? AND image_digest != ''").get(digest);
+    return r ? pgBuildRow(r as Record<string, unknown>) : null;
+  }
+  byMajorAndTag(major: number, tag: string): PgBuildRow | null {
+    const r = this.db.prepare("SELECT * FROM pg_builds WHERE major = ? AND release_tag = ?").get(major, tag);
+    return r ? pgBuildRow(r as Record<string, unknown>) : null;
+  }
+  list(): PgBuildRow[] {
+    return this.db.prepare("SELECT * FROM pg_builds ORDER BY major, created_at").all()
+      .map((r) => pgBuildRow(r as Record<string, unknown>));
+  }
+  listByMajor(major: number): PgBuildRow[] {
+    return this.db.prepare("SELECT * FROM pg_builds WHERE major = ? ORDER BY created_at").all(major)
+      .map((r) => pgBuildRow(r as Record<string, unknown>));
+  }
+  setStatus(id: string, status: PgBuildStatus, error?: string | null): void {
+    this.db.prepare("UPDATE pg_builds SET status = ?, error = ? WHERE id = ?").run(status, error ?? null, id);
+  }
+  setDetected(id: string, a: { minor: number; sizeBytes: number | null }): void {
+    this.db.prepare("UPDATE pg_builds SET minor = ?, size_bytes = ? WHERE id = ?").run(a.minor, a.sizeBytes, id);
+  }
+  updatePath(id: string, path: string): void {
+    this.db.prepare("UPDATE pg_builds SET path = ? WHERE id = ?").run(path, id);
+  }
+  // Transactional: at most one active row per major, ever (spec: "one atomic flip within the major").
+  setActiveExclusive(id: string): void {
+    const tx = this.db.transaction(() => {
+      const row = this.byId(id);
+      if (!row) throw new Error(`pg_build ${id} not found`);
+      this.db.prepare("UPDATE pg_builds SET active = 0 WHERE major = ?").run(row.major);
+      this.db.prepare("UPDATE pg_builds SET active = 1 WHERE id = ?").run(id);
+    });
+    tx();
+  }
+  clearActive(major: number): void {
+    this.db.prepare("UPDATE pg_builds SET active = 0 WHERE major = ?").run(major);
+  }
+  delete(id: string): void {
+    this.db.prepare("DELETE FROM pg_builds WHERE id = ?").run(id);
+  }
+}
+
+export class PgMajorsRepo {
+  constructor(private db: Database.Database) {}
+  lastRunMinor(major: number): number | null {
+    const r = this.db.prepare("SELECT last_run_minor FROM pg_majors WHERE major = ?").get(major) as
+      | { last_run_minor: number } | undefined;
+    return r?.last_run_minor ?? null;
+  }
+  // Raise-only high-water mark: an endpoint START of version major.minor. Never lowers (the
+  // downgrade guard compares against this; only setLastRunMinor — consented rollback — lowers).
+  recordRun(major: number, minor: number): void {
+    this.db.prepare(
+      `INSERT INTO pg_majors (major, last_run_minor) VALUES (?, ?)
+       ON CONFLICT(major) DO UPDATE SET last_run_minor = MAX(last_run_minor, excluded.last_run_minor)`,
+    ).run(major, minor);
+  }
+  setLastRunMinor(major: number, minor: number): void {
+    this.db.prepare(
+      `INSERT INTO pg_majors (major, last_run_minor) VALUES (?, ?)
+       ON CONFLICT(major) DO UPDATE SET last_run_minor = excluded.last_run_minor`,
+    ).run(major, minor);
   }
 }
