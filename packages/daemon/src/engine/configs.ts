@@ -20,11 +20,13 @@ export function engineDirs(cfg: DevdbConfig) {
 // Trust-mode deviation (spec decision #7 detail): neond enables NeonJWT auth on every engine
 // component. DevDB omits ALL of it: engine ports bind to 127.0.0.1 inside the container and
 // upstream neon_local runs this exact stack in trust mode by default.
+// pg_distrib_dir points at the daemon-composed symlink dir (builds/pgdistrib.ts) — baked majors
+// stay baked; downloaded-only majors resolve for walredo.
 export function pageserverToml(cfg: DevdbConfig): string {
   const layers = engineDirs(cfg).pageserverLayers;
   return [
     `availability_zone = "devdb-1"`,
-    `pg_distrib_dir = ${tomlString(cfg.pgInstallDir)}`,
+    `pg_distrib_dir = ${tomlString(cfg.pgDistribDir)}`,
     `broker_endpoint = "http://127.0.0.1:${cfg.engine.brokerPort}/"`,
     `listen_pg_addr = "127.0.0.1:${cfg.engine.pageserverPgPort}"`,
     `listen_http_addr = "127.0.0.1:${cfg.engine.pageserverHttpPort}"`,

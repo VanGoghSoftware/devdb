@@ -14,7 +14,7 @@ const cfg = loadConfig({
 describe("engine configs", () => {
   it("pageserver.toml matches oracle shape in trust mode", () => {
     const toml = pageserverToml(cfg);
-    expect(toml).toContain(`pg_distrib_dir = "/usr/local/share/neon/pg_install"`);
+    expect(toml).toContain(`pg_distrib_dir = "/data/pg_distrib"`);
     expect(toml).toContain(`broker_endpoint = "http://127.0.0.1:50051/"`);
     expect(toml).toContain(`listen_pg_addr = "127.0.0.1:64000"`);
     expect(toml).toContain(`listen_http_addr = "127.0.0.1:9898"`);
@@ -73,7 +73,7 @@ describe("engine configs", () => {
       PG_INSTALL_DIR: '/pg\\install',
     });
     const toml = pageserverToml(weird);
-    expect(toml).toContain('pg_distrib_dir = "/pg\\\\install"');
+    expect(toml).toContain('pg_distrib_dir = "/da\\"ta/pg_distrib"');
     expect(toml).toContain('local_path = "/da\\"ta/pageserver_1"');
   });
 
