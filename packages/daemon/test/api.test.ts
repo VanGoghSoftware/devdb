@@ -1155,9 +1155,10 @@ describe("buildServer pg-builds routes", () => {
     vi.mocked(provisioner.activate).mockImplementation(
       async (id: string, opts?: { consented?: boolean }) => registry.activate(id, opts),
     );
+    const computes = fakeComputes();
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),
-      registry, provisioner, computes: fakeComputes(),
+      registry, provisioner, computes,
       services: { projects: fakeProjects(), branches: fakeBranches(), endpoints: fakeEndpoints(), timetravel: fakeTimetravel(), sql: fakeSql() },
     });
 
@@ -1175,7 +1176,14 @@ describe("buildServer pg-builds routes", () => {
     vi.mocked(provisioner.remove).mockResolvedValue(undefined);
     const deleteRes = await app.inject({ method: "DELETE", url: `/api/pg-builds/${downloadedId}` });
     expect(deleteRes.statusCode).toBe(204);
-    expect(provisioner.remove).toHaveBeenCalledWith(downloadedId, []);
+    // HARD-1 (hardening pass, P2): the route passes the running-pgbins SOURCE — a supplier
+    // remove() invokes inside its mutation lane — never a pre-lane snapshot array. Prove the
+    // supplier is LIVE: it must delegate to computes.runningPgbins() at call time, so an endpoint
+    // that starts while the DELETE is queued behind a laned mutation is visible to the in-use guard.
+    const [removedId, supplier] = vi.mocked(provisioner.remove).mock.calls[0]!;
+    expect(removedId).toBe(downloadedId);
+    vi.mocked(computes.runningPgbins).mockReturnValue(["/data/pg_builds/v17/aaaa/bin/postgres"]);
+    expect(supplier()).toEqual(["/data/pg_builds/v17/aaaa/bin/postgres"]);
   });
 
   // Fastify sets req.body to `undefined` (not `{}`) when a request carries no payload at all —
@@ -1351,8 +1359,8 @@ describe("buildServer pg-builds routes", () => {
     // provisioner.remove(id, ...) must actually reach registry.assertRemovable's real 404 branch
     // (not a mocked resolution) — delegate the fake straight through to the real registry, same
     // as Provisioner.remove itself does before its rm()/delete() side effects.
-    vi.mocked(provisioner.remove).mockImplementation(async (id: string, running: string[]) => {
-      registry.assertRemovable(id, running);
+    vi.mocked(provisioner.remove).mockImplementation(async (id: string, running: () => string[]) => {
+      registry.assertRemovable(id, running());
     });
     const app = buildServer({
       cfg, state, engine: fakeEngine(), logs: fakeLogs(), events: fakeEvents(),

@@ -492,7 +492,11 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   app.delete("/api/pg-builds/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    await deps.provisioner.remove(id, deps.computes.runningPgbins());
+    // HARD-1 (hardening pass, P2): pass the SOURCE, not a snapshot. remove() invokes it inside
+    // its mutation lane, right before assertRemovable, so the in-use guard sees endpoints that
+    // started while this DELETE waited its turn behind an in-flight activate/remove — a pre-lane
+    // runningPgbins() array here went stale during that wait and let the rm through.
+    await deps.provisioner.remove(id, () => deps.computes.runningPgbins());
     return reply.status(204).send();
   });
 

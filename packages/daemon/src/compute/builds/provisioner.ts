@@ -189,9 +189,13 @@ export class Provisioner {
     // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): flipped true the instant
     // registry.activate(id) succeeds (extractFixupAndGate below). activate() unconditionally
     // clears the major's previously-active row before setting the new one — so a failure AFTER
-    // that point (recomposeDistrib throwing, currently the only step left) must re-resolve the
-    // major's active pointer in the outer catch, or the major is left with NO active ready build
-    // (the old one cleared, the new one about to be marked failed) until the next boot.
+    // that point must re-resolve the major's active pointer in the outer catch, or the major is
+    // left with NO active ready build (the old one cleared, the new one about to be marked
+    // failed) until the next boot. HARD-2 (hardening pass) made the one step that used to throw
+    // there — recomposeDistrib — non-throwing at its call site (a post-gate recompose failure
+    // keeps the build; see extractFixupAndGate), and log()/publish() swallow by contract, so the
+    // catch's activatedRef branch is now an unreachable-in-practice BACKSTOP, kept for any
+    // future throwing step added between activation and the end of the lane body.
     const activatedRef: { current: boolean } = { current: false };
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
@@ -247,8 +251,10 @@ export class Provisioner {
       this.log(id, `pull failed: ${firstLine(err)}`);
       deps.logger.error(`pg_build ${id} pull failed`, err);
       this.publish();
-      // Destructive + pointer compensation for a failure PAST the rename (a non-409 activate
-      // malfunction, or recomposeDistrib throwing):
+      // Destructive + pointer compensation for a failure PAST the rename. Post-HARD-2 that means
+      // a non-409 activate() malfunction or a post-rename SQLite/fs throw (including the gate
+      // catch's own rm failing) — a recomposeDistrib failure no longer lands here (swallowed at
+      // its call site in extractFixupAndGate: the build is valid and KEPT). For what still does:
       //  - rm the fully-extracted finalDir (mirrors the gate-failure rm below) so byDigest's
       //    ready-preference (which happily returns this failed row) doesn't let a same-digest
       //    retry through only to have its rename(tmpDir, finalDir) fail ENOTEMPTY;
@@ -276,8 +282,9 @@ export class Provisioner {
       // contract that a failure only ever lands on the row.
       //
       // Deliberately does NOT re-run recomposeDistrib() (as the pre-fix global resolveActives()
-      // also didn't): the recompose we're compensating for just threw, so retrying it here would
-      // most likely throw again. The pg_distrib farm self-heals per activate()'s doc below —
+      // also didn't): a failure that lands here is likely environmental (SQLite/disk), so a
+      // recompose attempt would most likely fail too. The pg_distrib farm self-heals per
+      // activate()'s doc below —
       // composePgDistrib re-derives from the registry on every call and boot recomposes before
       // engine.start(); baked-backed majors are unaffected regardless (baked always wins its slot).
       if (finalDirRef.current !== undefined || activatedRef.current) {
@@ -410,7 +417,7 @@ export class Provisioner {
     await this.runMutation(async () => {
       try {
         this.deps.registry.activate(id);
-        activatedRef.current = true; // from here on, a throw reaching runPipeline's catch must resolveActives()
+        activatedRef.current = true; // a throw reaching runPipeline's catch past this point must re-resolve the pointer
         this.log(id, `activated ${major}.${minor}`);
       } catch (err) {
         if (err instanceof DevdbError && err.statusCode === 409) {
@@ -419,7 +426,30 @@ export class Provisioner {
           throw err;
         }
       }
-      await deps.recomposeDistrib(); // covers the new-major case (no baked slot existed before)
+      // HARD-2 (hardening pass, P2): recomposeDistrib runs strictly AFTER the build is final —
+      // the row reached `ready` (gate passed) and the activation outcome above is committed
+      // (either the pointer flipped, or a downgrade 409 deliberately left it ready-but-inactive;
+      // registry.activate throws its 409s before mutating anything). From here the BUILD can no
+      // longer be wrong; only the pg_distrib farm can — and the farm is the self-healing part
+      // (composePgDistrib re-derives it from the registry on every call, and boot recomposes
+      // before engine.start; see activate()'s Fix #1 note below, which accepts this exact
+      // failure for EXPLICIT activation). Letting the throw reach runPipeline's outer catch used
+      // to DESTROY the valid build: setStatus(failed) + rm finalDir + path-clear + pointer
+      // re-resolve — a transient ENOSPC during the symlink-farm rebuild reverted the major to an
+      // older build, and if an endpoint had started on this build in the activate→recompose
+      // window (pgbinFor is not serialized with this lane), the rm deleted a live compute's
+      // --pgbin dir out from under it. So: swallow HERE, at the one call whose failure is
+      // recoverable-by-design, and log loudly. A non-409 registry.activate() malfunction above
+      // still propagates — that row's fate is genuinely unknown, and the outer catch's
+      // fail + rm + compensate contract remains exactly right for it.
+      try {
+        await deps.recomposeDistrib(); // covers the new-major case (no baked slot existed before)
+      } catch (err) {
+        this.log(id, `pg_distrib recompose failed — build stays ready: ${firstLine(err)}`);
+        deps.logger.error(
+          `pg_build ${id}: pg_distrib recompose failed after ${major}.${minor} passed the gate — `
+          + "build left ready; the farm self-heals on the next recompose or boot", err);
+      }
     });
     this.publish();
   }
@@ -456,6 +486,18 @@ export class Provisioner {
   // must not have a concurrent activate() for the same row observe/flip the row in between (see
   // this class's own runMutation doc comment for the exact race this closes).
   //
+  // HARD-1 (hardening pass, P2): `runningPgbins` is a SUPPLIER invoked INSIDE the lane body,
+  // immediately before assertRemovable — not an array captured by the caller. The DELETE route
+  // used to snapshot computes.runningPgbins() before remove() had even queued; every other fact
+  // assertRemovable consults (active/baked/status) is read live from the row at removal time,
+  // but the in-use check consumed that frozen snapshot — so a build an endpoint started on WHILE
+  // the DELETE waited out an in-flight laned activate/remove was still judged "not in use" and
+  // its dir rm'd out from under the running compute (ENOENT on the live --pgbin). Reading the
+  // supplier inside the lane makes the in-use check exactly as live as the row checks. (Endpoint
+  // starts themselves are still not serialized with this lane — a start landing AFTER the
+  // supplier read but before the rm remains possible; that residual window is the known
+  // pgbinFor-vs-build-lane gap flagged for the post-merge concurrency review, out of scope here.)
+  //
   // FIX-3(b) (final review): the rm runs only when this row is the SOLE claimant of a non-empty
   // path. Rows legitimately share a path — a gate-failed attempt and its successful retry of the
   // same image share a digest and therefore the digest-named dir (state/repos.ts byDigest doc) —
@@ -463,9 +505,9 @@ export class Provisioner {
   // Without this, DELETE of an old failed attempt rm'd the READY, ACTIVE build's dir out from
   // under it (endpoint starts ENOENT until the next boot re-failed it). The ROW is deleted
   // regardless — belt-and-suspenders with FIX-3(a)'s path-clear on every failure rm.
-  async remove(id: string, runningPgbins: string[]): Promise<void> {
+  async remove(id: string, runningPgbins: () => string[]): Promise<void> {
     await this.runMutation(async () => {
-      const row: PgBuildRow = this.deps.registry.assertRemovable(id, runningPgbins);
+      const row: PgBuildRow = this.deps.registry.assertRemovable(id, runningPgbins());
       const siblingClaimsPath = this.deps.state.pgBuilds.list()
         .some((r) => r.id !== id && r.path === row.path);
       if (row.path !== "" && !siblingClaimsPath) {
