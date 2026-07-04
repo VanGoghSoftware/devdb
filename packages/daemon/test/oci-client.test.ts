@@ -576,3 +576,148 @@ describe("OciClient — untrusted-layer & manifest-pin hardening", () => {
     await expect(access(destDir)).rejects.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix round 4: whiteout-symlink-parent containment + digest pinning.
+//   P1 — a whiteout rm/readdir must not follow a symlink PARENT component an earlier layer planted
+//        (the lexical assertUnder never sees an on-disk symlink; the final tree walk runs too late).
+//   P2 — a direct (single) manifest's content-address must be the VERIFIED sha256 of its body, not a
+//        docker-content-digest header a hostile registry can set to a mutable ref; pullPrefix's public
+//        `digest` arg must itself be a sha256.
+//   P3 — every layer descriptor digest must be a sha256 content-address before any blob fetch.
+// ---------------------------------------------------------------------------
+describe("OciClient — whiteout-symlink & digest-pin hardening (round 4)", () => {
+  function twoLayerManifest(gzA: Buffer, gzB: Buffer): { body: Buffer; digest: string } {
+    const body = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        config: { mediaType: "application/vnd.oci.image.config.v1+json", digest: sha256(Buffer.from("cfg")), size: 3 },
+        layers: [
+          { mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: sha256(gzA), size: gzA.length },
+          { mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: sha256(gzB), size: gzB.length },
+        ],
+      }),
+    );
+    return { body, digest: sha256(body) };
+  }
+
+  // A two-layer image whose layers are built AFTER we know workDir, so layer A's symlink can point at
+  // an ABSOLUTE path OUTSIDE extractRoot (the `victim` dir, a sibling of pullPrefix's `.tmp-oci-extract-*`).
+  // `makeLayers(victimDir)` returns the two layers' members; the victim file is planted at victimDir/evil.
+  async function twoLayerVictimSetup(
+    makeLayers: (victimDir: string) => { a: TarEntry[]; b: TarEntry[] },
+  ): Promise<{ client: OciClient; fixture: Fixture; destDir: string; victimFile: string; manifestDigest: string }> {
+    const workDir = await mkdtemp(join(tmpdir(), "devdb-oci-work-"));
+    scratchDirs.push(workDir);
+    const victimDir = join(workDir, "victim");
+    await mkdir(victimDir, { recursive: true });
+    const victimFile = join(victimDir, "evil");
+    await writeFile(victimFile, "PRECIOUS");
+    const { a, b } = makeLayers(victimDir);
+    const gzA = gzipSync(makeTar(a));
+    const gzB = gzipSync(makeTar(b));
+    const { body: manifestBody, digest: manifestDigest } = twoLayerManifest(gzA, gzB);
+    const fixture = await startFixture({
+      manifestOverrides: { [manifestDigest]: manifestBody },
+      blobOverrides: { [sha256(gzA)]: gzA, [sha256(gzB)]: gzB },
+    });
+    const client = new OciClient({ registryBase: fixture.base, arch: "amd64" });
+    return { client, fixture, destDir: join(workDir, "dest"), victimFile, manifestDigest };
+  }
+
+  it("P1(a): rejects a `.wh.` whiteout under a symlinked parent an earlier layer planted — the outside victim survives", async () => {
+    // Layer A plants `usr/local/sneak` as an ABSOLUTE symlink to the outside victim dir; layer B's
+    // whiteout `usr/local/sneak/.wh.evil` would (unpatched) `rm(extractRoot/usr/local/sneak/evil)` and,
+    // following `sneak`, delete the real victimDir/evil OUTSIDE extractRoot.
+    const { client, destDir, victimFile, manifestDigest } = await twoLayerVictimSetup((victimDir) => ({
+      a: [{ name: "usr/local/sneak", type: "2", linkname: victimDir }],
+      b: [{ name: "usr/local/sneak/.wh.evil", type: "0", content: "" }],
+    }));
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe whiteout: symlink parent component/);
+    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS"); // no rm followed the symlink
+    await expect(access(destDir)).rejects.toThrow(); // nothing materialized
+  });
+
+  it("P1(b): rejects an opaque `.wh..wh..opq` whiteout under a symlinked parent — the outside victim survives", async () => {
+    // Same symlink plant; layer B's opaque marker would (unpatched) `readdir(extractRoot/usr/local/sneak)`
+    // — following `sneak` into the outside victim dir — and rm every child (deleting victimDir/evil).
+    const { client, destDir, victimFile, manifestDigest } = await twoLayerVictimSetup((victimDir) => ({
+      a: [{ name: "usr/local/sneak", type: "2", linkname: victimDir }],
+      b: [{ name: "usr/local/sneak/.wh..wh..opq", type: "0", content: "" }],
+    }));
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/unsafe whiteout: symlink parent component/);
+    expect(await readFile(victimFile, "utf8")).toBe("PRECIOUS"); // no readdir/rm followed the symlink
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("P1(c): a benign nested whiteout with only REAL dir parents still applies (no over-rejection)", async () => {
+    // Layer A creates a real dir `usr/local/realdir` with a file; layer B whiteouts that file and adds a
+    // sibling. Every parent component is a real directory, so the whiteout must apply and the pull succeed.
+    const { client, destDir, manifestDigest } = await twoLayerVictimSetup(() => ({
+      a: [
+        { name: "usr/local/bin/postgres", type: "0", content: "ok" },
+        { name: "usr/local/realdir/keep.txt", type: "0", content: "old" },
+      ],
+      b: [
+        { name: "usr/local/realdir/.wh.keep.txt", type: "0", content: "" },
+        { name: "usr/local/realdir/new.txt", type: "0", content: "new" },
+      ],
+    }));
+    await client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" });
+    expect(await readFile(join(destDir, "bin", "postgres"), "utf8")).toBe("ok");
+    expect(await readFile(join(destDir, "realdir", "new.txt"), "utf8")).toBe("new");
+    await expect(access(join(destDir, "realdir", "keep.txt"))).rejects.toThrow(); // whiteout applied
+    await expect(access(join(destDir, "realdir", ".wh.keep.txt"))).rejects.toThrow(); // marker cleaned
+  });
+
+  it("P2: resolveDigest rejects a direct manifest whose docker-content-digest header is a mutable ref (latest)", async () => {
+    // A single-arch manifest served under the tag `latest` with docker-content-digest: latest. resolveDigest
+    // must compute the real sha256 of the body and reject the mismatched header — never return `latest`.
+    const manifestBody = singleManifest(gz1, gz1Digest);
+    const { fixture, client } = await startFixtureAndClient({ manifestOverrides: { latest: manifestBody } });
+    await expect(client.resolveDigest(REPO, "latest")).rejects.toThrow(/docker-content-digest/);
+    expect(fixture.blobFetches).toEqual([]);
+  });
+
+  it("P2: resolveDigest returns the VERIFIED sha256 of a direct manifest (not the header verbatim)", async () => {
+    // Header equals the true digest here — resolveDigest returns that computed sha256 content-address.
+    const manifestBody = singleManifest(gz1, gz1Digest);
+    const manifestDigest = sha256(manifestBody);
+    const { client } = await startFixtureAndClient({ manifestOverrides: { [manifestDigest]: manifestBody } });
+    const { digest } = await client.resolveDigest(REPO, manifestDigest);
+    expect(digest).toBe(manifestDigest);
+  });
+
+  it("P2: pullPrefix rejects a non-sha256 `digest` arg at the boundary — no manifest or blob fetch", async () => {
+    const { fixture, client, destDir } = await startFixtureAndClient({});
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: "latest", destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/sha256 content-address/);
+    expect(fixture.manifestFetches).toEqual([]);
+    expect(fixture.blobFetches).toEqual([]);
+    await expect(access(destDir)).rejects.toThrow();
+  });
+
+  it("P3: rejects a manifest with a non-sha256 layer descriptor digest, before any blob fetch", async () => {
+    const manifestBody = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        config: { mediaType: "application/vnd.oci.image.config.v1+json", digest: sha256(Buffer.from("cfg")), size: 3 },
+        layers: [{ mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: "latest", size: 10 }],
+      }),
+    );
+    const manifestDigest = sha256(manifestBody);
+    const { fixture, client, destDir } = await startFixtureAndClient({ manifestOverrides: { [manifestDigest]: manifestBody } });
+    await expect(
+      client.pullPrefix({ repository: REPO, digest: manifestDigest, destDir, prefix: "usr/local/" }),
+    ).rejects.toThrow(/not a sha256 content-address/);
+    expect(fixture.blobFetches).toEqual([]);
+    await expect(access(destDir)).rejects.toThrow();
+  });
+});

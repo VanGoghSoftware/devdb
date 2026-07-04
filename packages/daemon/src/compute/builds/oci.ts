@@ -171,14 +171,49 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
     }
   };
 
+  // Symlink-safe whiteout deletion. `assertUnder` is PURELY LEXICAL — `resolve()` never touches disk,
+  // so it cannot see that a PARENT path component of a whiteout target is an on-disk symlink an EARLIER
+  // layer planted (layer A: `usr/local/evil -> /outside`; layer B: `usr/local/evil/.wh.foo` or a
+  // `.wh..wh..opq`). The whiteout `rm(target)` / opaque `readdir(dir)` would then FOLLOW `evil` out of
+  // extractRoot and delete/read outside it — BEFORE the final assertSafeExtractedTree walk rejects the
+  // symlink, and with rollback unable to undo the deletion. So before any rm/readdir, walk the parent
+  // chain from extractRoot downward with lstat and require EVERY component to be a real (non-symlink)
+  // directory. Returns:
+  //   true  — whole chain exists and is real dirs: safe to rm/readdir under it.
+  //   false — a component doesn't exist yet: nothing to delete (the old force:true rm / `.catch(()=>[])`
+  //           readdir were no-ops too), so skip this whiteout without over-rejecting.
+  // and THROWS if a component EXISTS but is a symlink or non-directory (the escape vector) — the layer
+  // is rejected before any disk mutation.
+  const parentChainIsRealDir = async (dir: string): Promise<boolean> => {
+    const rel = relative(extractRootResolved, resolve(dir));
+    if (rel === "") return true; // dir IS extractRoot (a real dir we mkdtemp'd); assertUnder ran first
+    let cur = extractRootResolved;
+    for (const part of rel.split(sep)) {
+      cur = join(cur, part);
+      let st;
+      try {
+        st = await lstat(cur);
+      } catch (err) {
+        if (err instanceof Error && "code" in err && err.code === "ENOENT") return false;
+        throw err;
+      }
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        throw new Error(`unsafe whiteout: symlink parent component ${cur}`);
+      }
+    }
+    return true;
+  };
+
   const whiteouts = underPrefix.filter((e) => posix.basename(e).startsWith(".wh."));
   for (const entry of whiteouts) {
     const dir = join(a.extractRoot, posix.dirname(entry));
     const name = posix.basename(entry);
     assertUnder(dir);
+    if (!(await parentChainIsRealDir(dir))) continue; // parent absent → nothing to whiteout (no-op)
     if (name === ".wh..wh..opq") {
-      // Opaque whiteout: this layer hides ALL lower-layer contents of the dir (dir itself stays).
-      for (const child of await readdir(dir).catch(() => [] as string[])) {
+      // Opaque whiteout: this layer hides ALL lower-layer contents of the dir (dir itself stays). `dir`
+      // is now a confirmed real in-tree directory, so this readdir cannot traverse a planted symlink.
+      for (const child of await readdir(dir)) {
         const target = join(dir, child);
         assertUnder(target);
         await rm(target, { recursive: true, force: true });
@@ -190,7 +225,14 @@ async function applyLayer(a: { spool: string; extractRoot: string; prefix: strin
     }
   }
   await execFileP("tar", ["-xf", a.spool, "-C", a.extractRoot, a.prefix.replace(/\/$/, "")]);
+  // Drop the `.wh.*` markers the extract just materialized. Same symlink-safety: confirm each marker's
+  // parent chain is real dirs before rm, so a single-layer `usr/local/evil -> /outside` + in-layer
+  // `usr/local/evil/.wh.foo` variant cannot make this rm follow the symlink either (tar already refuses
+  // to extract THROUGH the symlink, but we do not rely on that here).
   for (const entry of whiteouts) {
+    const markerDir = join(a.extractRoot, posix.dirname(entry));
+    assertUnder(markerDir);
+    if (!(await parentChainIsRealDir(markerDir))) continue;
     const target = join(a.extractRoot, entry);
     assertUnder(target);
     await rm(target, { recursive: true, force: true });
@@ -318,8 +360,16 @@ export class OciClient implements OciPuller {
     const { body, res } = await this.fetchManifest(repository, tag);
     const parsed = parseManifestDoc(body, repository, tag);
     if ("manifests" in parsed) return { digest: this.selectArch(parsed, repository, tag) };
+    // Direct (single-arch) manifest: the content address is the sha256 of THIS body, computed by us —
+    // NEVER the `docker-content-digest` header verbatim. A hostile registry can set that header to a
+    // mutable ref like `latest`; pullPrefix would then fetch-and-trust it since verifyManifestDigest
+    // no-ops for a non-sha ref. Compute the digest ourselves; if the header is present it MUST equal it.
+    const computed = `sha256:${createHash("sha256").update(body).digest("hex")}`;
     const header = res.headers.get("docker-content-digest");
-    return { digest: header ?? `sha256:${createHash("sha256").update(body).digest("hex")}` };
+    if (header !== null && header !== computed) {
+      throw new Error(`docker-content-digest ${header} does not match computed ${computed} for ${repository}@${tag}`);
+    }
+    return { digest: computed };
   }
 
   async pullPrefix(a: {
@@ -329,6 +379,13 @@ export class OciClient implements OciPuller {
     prefix: "usr/local/";
     onProgress?: (line: string) => void;
   }): Promise<void> {
+    // Public boundary: the digest we pull by MUST be a real content-address. A tag/mutable ref would
+    // make verifyManifestDigest a silent no-op (it only checks `sha256:` refs) — fetch-and-trust. Fail
+    // closed here, before any network/fs touch, on anything that isn't sha256:<64hex>. (The index →
+    // arch-descriptor path from selectArch is already sha-gated; this guards the caller's own arg.)
+    if (!SHA256_DIGEST.test(a.digest)) {
+      throw new Error(`pullPrefix requires a sha256 content-address digest, got: ${a.digest}`);
+    }
     if (await exists(a.destDir)) throw new Error(`destDir already exists: ${a.destDir}`);
     const firstBody = (await this.fetchManifest(a.repository, a.digest)).body;
     verifyManifestDigest(firstBody, a.digest); // content-address pin (no-op for a tag ref)
@@ -346,6 +403,13 @@ export class OciClient implements OciPuller {
       manifest = first;
     }
     for (const layer of manifest.layers) {
+      // Every layer descriptor digest must itself be a sha256 content-address BEFORE it is interpolated
+      // into a blob URL and streamed. Otherwise a malformed manifest could point a layer at a mutable
+      // or path-shaped ref and we'd fetch it (the final per-blob hash check comes too late to prevent
+      // the fetch). Fail closed on anything that isn't sha256:<64hex>.
+      if (!SHA256_DIGEST.test(layer.digest)) {
+        throw new Error(`layer descriptor digest is not a sha256 content-address: ${layer.digest}`);
+      }
       // …tar.gzip (Docker) / …tar+gzip (OCI); anything else (e.g. zstd) we cannot gunzip.
       if (!/tar(\.|\+)gzip$/.test(layer.mediaType)) {
         throw new Error(`unsupported layer mediaType ${layer.mediaType} for ${layer.digest}`);
