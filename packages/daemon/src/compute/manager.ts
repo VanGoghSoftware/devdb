@@ -104,6 +104,54 @@ export class ComputeManager {
     return () => { c.listeners = c.listeners.filter((l) => l !== cb); };
   }
 
+  // Abort fence for the stop()-during-start() race at THIS (ComputeManager) level — the sibling of
+  // the ManagedProcess-level guard added in a74b8b1 (process.ts's post-readiness `readState() !==
+  // "starting" || this.child !== child` check), which closes the same race one layer down. start()
+  // reserves its map slot synchronously (computes.set, proc still null) and then crosses several
+  // awaits — allocatePort ×3, mkdir/mkdtemp, writeFile ×2 — BEFORE it constructs entry.proc.
+  // Throughout that pre-proc window a concurrent stop()/stopAll() (stopAll runs on daemon shutdown,
+  // index.ts, iterating computes directly and thus BYPASSING the per-branch queue lane that
+  // otherwise serializes a branch's start/stop) sees entry.proc === null, so it sets
+  // entry.phase="stopping", SKIPS proc.stop() (nothing to stop), deletes the map slot, and releases
+  // the ports. Without re-checking, the suspended start() would sail on when it resumes: spawn
+  // compute_ctl, wait ready, flip entry.phase="running", and return success for an entry no longer
+  // in the map — a live compute invisible to statusOf()/runningPorts(), leaked until container
+  // teardown, on a port stop() may already have re-handed. Called after every awaited setup step
+  // that records a releasable resource on `entry`, and once more before the "running" commit, this
+  // re-asserts the invariant the synchronous reservation established: "this slot is still ours, and
+  // still starting." If a stop() intervened, entry.phase is now "stopping" (or the slot holds a
+  // different entry / no entry after a delete-then-fresh-start), so we throw INTO start()'s existing
+  // catch — whose compensation is already idempotent and exactly right for a partially-torn-down
+  // entry (map delete no-ops on !== entry, port releases are Set.delete, dir removal is force:true,
+  // proc.stop() is a no-op when proc is null or already stopped) — instead of launching or reporting
+  // success. Both identity (=== entry) AND phase are checked, mirroring a74b8b1's child-identity +
+  // state pair: phase is the primary abort signal, identity backstops a delete-then-fresh-start that
+  // reuses the same branch id while this start() was suspended.
+  private assertStillStarting(branch: BranchRow, entry: RunningCompute): void {
+    if (this.computes.get(branch.id) !== entry || entry.phase !== "starting") {
+      throw new Error(`compute start for branch ${branch.name} aborted: stop() intervened during startup`);
+    }
+  }
+
+  // Owner-safe reserved-port release: delete the port from reservedPorts AND null it on the entry in
+  // the same synchronous step. Both start()'s failure `catch` and stop()'s `finally` release the
+  // SAME entry's ports, and — only via a lane-bypassing stopAll() racing a same-branch in-flight
+  // start (the very interleaving assertStillStarting exists for) — both can run compensation on that
+  // one shared entry. If each merely `reservedPorts.delete(entry.port)`, whichever runs SECOND
+  // re-deletes a port the first already freed; and if another branch's start (still admissible until
+  // stopAll snapshotted its keys) reclaimed that exact port in the gap, the stale re-delete silently
+  // evicts the NEW owner's reservation, so a later allocatePort hands the same port out twice. The
+  // entry field is the coordination token: whoever releases first nulls it, the other sees null and
+  // skips. (A plain Set.delete of an already-absent port is harmless on its own — the hazard is
+  // strictly the reclaim-in-between window this null closes.)
+  private releasePort(entry: RunningCompute, which: "port" | "metricsPort" | "internalHttpPort"): void {
+    const p = entry[which];
+    if (p !== null) {
+      this.reservedPorts.delete(p);
+      entry[which] = null;
+    }
+  }
+
   // oracle: src/mgmt/compute/mod.rs:121-289 launch()
   //
   // Review fix (Fix 1): `onLine` is accepted here (not wired in by a caller after start()
@@ -142,12 +190,19 @@ export class ComputeManager {
       // what start()'s catch and stop() use to release the claim.
       const port = await allocatePort(this.cfg.portRange, a.branch.stickyPort, this.reservedPorts, this.probe);
       entry.port = port;
+      // Abort fence (recorded-resource → then check): if a concurrent stop()/stopAll() claimed this
+      // entry while we were suspended in allocatePort, bail into the catch (which now has entry.port
+      // to release). Placed AFTER the assignment so the port we just claimed is never orphaned.
+      this.assertStillStarting(a.branch, entry);
 
       const computesDir = engineDirs(this.cfg).computesDir;
       await mkdir(computesDir, { recursive: true });
       const dir = await mkdtemp(join(computesDir, `compute_${a.branch.timelineId}_`));
       dirCreated = dir;
       entry.dir = dir;
+      // Abort fence: bail before writing config files INTO a dir a concurrent stop() may already be
+      // removing (dirCreated is recorded, so the catch reclaims it either way).
+      this.assertStillStarting(a.branch, entry);
       const hbaPath = join(dir, "pg_hba.conf");
       await writeFile(hbaPath, PG_HBA);
       const configPath = join(dir, "config.json");
@@ -159,6 +214,7 @@ export class ComputeManager {
       }));
       const metricsPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts, this.probe);
       entry.metricsPort = metricsPort;
+      this.assertStillStarting(a.branch, entry); // abort fence: metrics port claimed → then check
       // Without an explicit --internal-http-port, compute_ctl binds its internal HTTP server
       // (remote-extension downloads for the neon extension, local_proxy config) to the default
       // 3081 on every compute: the first compute wins the bind and later concurrent computes
@@ -166,6 +222,13 @@ export class ComputeManager {
       // after the first (verified via /proc/net/tcp in a live devdb:dev container).
       const internalHttpPort = await allocatePort({ min: 40000, max: 40999 }, undefined, this.reservedPorts, this.probe);
       entry.internalHttpPort = internalHttpPort;
+      // Abort fence: the last gate before we SPAWN. A stop() that intervened during any setup await
+      // above already deleted the slot; throwing here avoids launching a compute_ctl that the
+      // already-finished stop() (having seen proc===null) will never signal. Defense-in-depth, not
+      // solely load-bearing: the post-waitReady fence + catch would still prevent the leak if this
+      // were removed — but only after a pointless spawn+kill of a doomed compute. This closes the
+      // common pre-proc window cleanly instead.
+      this.assertStillStarting(a.branch, entry);
 
       // oracle args: src/mgmt/compute/mod.rs:189-208; readiness: :245-252 ("listening on IPv4 address", 50s)
       entry.proc = new ManagedProcess({
@@ -209,6 +272,14 @@ export class ComputeManager {
       // Structural readiness gate (handover §4.3): the needle fires ~80-140ms before apply_spec
       // commits the branch's SCRAM verifier; block until compute_ctl_up{status="running"}.
       await this.waitReady(metricsPort);
+      // Abort fence — CRITICAL: the pre-commit gate. entry.proc.start()/waitReady are the WIDEST
+      // awaits here (readiness takes seconds), so a stop()/stopAll() most plausibly lands during
+      // them. If waitReady RESOLVED "running" (its last poll caught the compute up just before
+      // stop()'s SIGTERM), flipping "running" and returning success here would report a live endpoint
+      // for a slot stop() has already deleted and a proc it has already ordered dead. Throw into the
+      // catch instead (which re-runs proc.stop() idempotently). The a74b8b1 guard covers the sibling
+      // window inside entry.proc.start() itself; this covers ComputeManager's own waitReady gate.
+      this.assertStillStarting(a.branch, entry);
       entry.phase = "running";
       this.notifyStatus(a.branch.id); // phase flip: statusOf(branchId) just became "running"
       return { port };
@@ -239,12 +310,30 @@ export class ComputeManager {
           this.logger.error(`start() cleanup: compute_ctl stop failed for branch ${a.branch.id}`, stopErr);
         }
       }
-      if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
-      this.notifyStatus(a.branch.id); // terminal: statusOf(branchId) is back to "stopped" post-cleanup
-      if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
-      if (entry.port !== null) this.reservedPorts.delete(entry.port);
-      if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
-      if (entry.internalHttpPort !== null) this.reservedPorts.delete(entry.internalHttpPort);
+      // Teardown ownership. When a lane-bypassing stopAll() has taken this entry — deleted it, or set
+      // phase="stopping" and is STILL awaiting its own proc.stop() — AND we had already constructed
+      // proc, defer the map/dir/port teardown to that stop() instead of doing it here. Two reasons:
+      // (a) with proc built, a live compute_ctl still holds the ports and the pgdata dir, and stop()
+      // releases them only in its finally AFTER its proc.stop() confirms the process dead — whereas
+      // OUR proc.stop() above just returned immediately (the first stop() nulled this.child
+      // synchronously, process.ts:220), so releasing here would free a port / rm a dir the still-dying
+      // process holds (premature release → a reclaim could collide with it); (b) it avoids a redundant
+      // double-teardown. Deferral is only SAFE when proc was built: then every resource on entry was
+      // allocated before proc construction — hence before any concurrent stop() could observe
+      // proc!=null and take over — so stop() knows, and will release, all of them. In the pre-proc
+      // window (proc===null) there is no live holder AND stop() may not know about resources we
+      // allocated after it ran, so WE must release them — immediately, which is safe precisely because
+      // nothing is bound (releasePort's null-coordination keeps that release exactly-once vs. stop()).
+      const stopOwnsTeardown = entry.proc !== null
+        && (this.computes.get(a.branch.id) !== entry || entry.phase === "stopping");
+      if (!stopOwnsTeardown) {
+        if (this.computes.get(a.branch.id) === entry) this.computes.delete(a.branch.id);
+        this.notifyStatus(a.branch.id); // terminal: statusOf(branchId) is back to "stopped" post-cleanup
+        if (dirCreated) await this.removeComputeDir(dirCreated, "start() failure cleanup");
+        this.releasePort(entry, "port");
+        this.releasePort(entry, "metricsPort");
+        this.releasePort(entry, "internalHttpPort");
+      }
       throw e;
     }
   }
@@ -390,9 +479,13 @@ export class ComputeManager {
     } finally {
       if (this.computes.get(branchId) === entry) this.computes.delete(branchId);
       if (entry.dir) await this.removeComputeDir(entry.dir, "stop()");
-      if (entry.port !== null) this.reservedPorts.delete(entry.port);
-      if (entry.metricsPort !== null) this.reservedPorts.delete(entry.metricsPort);
-      if (entry.internalHttpPort !== null) this.reservedPorts.delete(entry.internalHttpPort);
+      // Owner-safe (delete + null via releasePort): a same-branch start() suspended mid-setup — only
+      // reachable when a lane-bypassing stopAll() runs this stop() alongside it — will hit its own
+      // releasePort next; nulling here means whichever runs second skips rather than re-deleting (and
+      // possibly evicting a fresh start that reclaimed the port in between).
+      this.releasePort(entry, "port");
+      this.releasePort(entry, "metricsPort");
+      this.releasePort(entry, "internalHttpPort");
       this.notifyStatus(branchId); // terminal: entry removed, statusOf(branchId) is back to "stopped"
     }
   }
