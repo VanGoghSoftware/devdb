@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
 import { DevdbError } from "../src/services/errors.js";
-import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
+import { buildByMajorAndTag, cleanupDirs, fakeInstallDir, fakeVolumeBuild, fakeVolumeBuildNamed, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
 const dirs = trackedDirs();
 // Thin local adapter over the shared scaffoldBuildDirs(): this file's call sites only ever
@@ -105,10 +105,10 @@ describe("BuildRegistry", () => {
     await registry.seedBaked();
     await registry.adoptVolumeBuilds();
     registry.resolveActives(); // active = 16.12 (t3)
-    expect(() => registry.assertRemovable(state.pgBuilds.byMajorAndTag(16, "t3")!.id, [])).toThrow(/active/);
+    expect(() => registry.assertRemovable(buildByMajorAndTag(state,16, "t3")!.id, [])).toThrow(/active/);
     expect(() => registry.assertRemovable("baked-v16", [])).toThrow(/baked/);
     expect(() => registry.assertRemovable(
-      state.pgBuilds.byMajorAndTag(16, "t2")!.id,
+      buildByMajorAndTag(state,16, "t2")!.id,
       [join(b2, "bin", "postgres")],
     )).toThrow(/running endpoint/);
     // keep active (t3) + newest previous (t2) → only t1 is GC-eligible
@@ -148,7 +148,7 @@ describe("BuildRegistry", () => {
     const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 }, [dl]: { major: 16, minor: 10 } } });
     await registry.seedBaked();
     await registry.adoptVolumeBuilds();
-    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
+    const row = buildByMajorAndTag(state,16, "t1")!;
     expect(row.status).toBe("ready");
 
     await rm(join(dl, "bin", "postgres"), { force: true }); // dir + build.json survive; only the binary vanishes
@@ -170,21 +170,73 @@ describe("BuildRegistry", () => {
     expect(registry.pgbinFor(16).buildId).toBe("baked-v16"); // baked wins the tie
   });
 
-  it("adoptVolumeBuilds derives the row id from the marker's digest (dl-{major}-{digest16}) — the dir name is not identity", async () => {
+  // FIX-6: adoptVolumeBuilds validates a marker's shape + on-disk consistency (dir==shortDigest,
+  // major==vN) and adopts the DETECTED binary version, rejecting any disagreement — a marker is
+  // never trusted to name the version (previously a raw cast let a forged marker surface a
+  // wrong-version ready+active build that dodged the downgrade guard).
+  it("adopts a consistent marker at the DETECTED version; id = dl-{major}-{digest16}", async () => {
     const { install, builds } = await scaffold();
     const digest = "sha256:" + "c".repeat(64);
-    // Deliberately NOT digest-named: identity must come from the marker, not the dir basename.
-    const dir = await fakeVolumeBuild(builds, 17, "renamed-by-hand",
-      { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
-    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    // marker CLAIMS minor 5; the binary detects 6 — the DETECTED version is adopted, not the marker's.
+    const dir = await fakeVolumeBuild(builds, 17, "latest", { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 17, minor: 6 } } });
     await registry.adoptVolumeBuilds();
 
     const row = state.pgBuilds.byId(`dl-17-${"c".repeat(16)}`);
     expect(row).toMatchObject({
-      major: 17, minor: 5, source: "downloaded", releaseTag: "latest",
+      major: 17, minor: 6, source: "downloaded", releaseTag: "latest",
       imageDigest: digest, path: dir, status: "ready",
     });
-    expect(state.pgBuilds.list()).toHaveLength(1); // and nothing keyed off the dir name
+    expect(state.pgBuilds.list()).toHaveLength(1);
+  });
+
+  it("REJECTS a marker whose dir basename != shortDigest(digest) (renamed/tampered install)", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "c".repeat(64);
+    const dir = await fakeVolumeBuildNamed(builds, 17, "renamed-by-hand", { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 17, minor: 5 } } });
+    await registry.adoptVolumeBuilds();
+    expect(state.pgBuilds.list()).toHaveLength(0);
+  });
+
+  it("REJECTS a marker whose major disagrees with the vN dir", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "e".repeat(64);
+    const dir = await fakeVolumeBuild(builds, 17, "latest", { digest, tag: "latest", major: 16, minor: 5, extractedAt: "x" }); // major 16 under v17
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 16, minor: 5 } } });
+    await registry.adoptVolumeBuilds();
+    expect(state.pgBuilds.list()).toHaveLength(0);
+  });
+
+  it("REJECTS a build whose binary major disagrees with a consistent marker (forged 17.99)", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "f".repeat(64);
+    const dir = await fakeVolumeBuild(builds, 17, "latest", { digest, tag: "latest", major: 17, minor: 99, extractedAt: "x" });
+    // dir + marker are self-consistent (v17, digest matches), but the BINARY really detects major 16.
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 16, minor: 5 } } });
+    await registry.adoptVolumeBuilds();
+    expect(state.pgBuilds.list()).toHaveLength(0);
+    expect(state.pgBuilds.list().some((r) => r.minor === 99)).toBe(false); // the forged 17.99 never surfaces
+  });
+
+  it("REJECTS a shape-invalid marker (missing major) instead of inserting an undefined-major row", async () => {
+    const { install, builds } = await scaffold();
+    const digest = "sha256:" + "a".repeat(64);
+    // digest is valid and matches the dir, but `major` is missing — a raw cast would insert major=undefined.
+    const dir = await fakeVolumeBuildNamed(builds, 17, "a".repeat(16), { digest, tag: "latest", minor: 5, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 17, minor: 5 } } });
+    await registry.adoptVolumeBuilds();
+    expect(state.pgBuilds.list()).toHaveLength(0);
+  });
+
+  it("seedBaked skips a mislabeled baked dir whose binary major != the vN dir name", async () => {
+    const { install, builds } = await scaffold();
+    const v17 = await fakeInstallDir(install, "v17");
+    // The v17 dir's binary really reports major 16 (a packaging error) — must NOT seed a baked-v17 row.
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v17]: { major: 16, minor: 3 } } });
+    await registry.seedBaked();
+    expect(state.pgBuilds.byId("baked-v17")).toBeNull();
+    expect(state.pgBuilds.list()).toHaveLength(0);
   });
 
   it("adoptVolumeBuilds skips a dir already claimed by an existing (pull-created, UUID-id) row — no duplicate rows across boots", async () => {
@@ -413,17 +465,17 @@ describe("BuildRegistry", () => {
   it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {
     const { install, builds } = await scaffold();
     const v16 = await fakeInstallDir(install, "v16");
-    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 } } });
+    // Create the downloaded dir up front so its DETECTED version is wired before adoptVolumeBuilds
+    // (FIX-6 re-detects on adoption). digest "sha256:2" → dir "2"; binary detects 16.10.
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:2", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 }, [dl]: { major: 16, minor: 10 } } });
     await registry.seedBaked();
     state.pgMajors.recordRun(16, 10); // last-run high-water is AHEAD of the only ready build
     registry.resolveActives(); // resolves to baked 16.9 < lastRunMinor(16)=10 → degraded
     expect(registry.degradedMajors()).toEqual([16]);
 
-    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:2", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
-    await registry.adoptVolumeBuilds();
-    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
-    state.pgBuilds.setStatus(row.id, "ready"); // pretend the pull-and-extract just completed
-    void dl;
+    await registry.adoptVolumeBuilds(); // adopts the downloaded 16.10 (detected), ready but not active
+    const row = buildByMajorAndTag(state, 16, "t1")!;
 
     const activated = registry.activate(row.id); // minor 10 >= lastRunMinor 10 — NOT a downgrade, no consent needed
     expect(activated.active).toBe(true);

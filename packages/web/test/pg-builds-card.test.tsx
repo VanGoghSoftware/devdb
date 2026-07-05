@@ -5,7 +5,10 @@ import { renderApp } from "./render.js";
 import { PgBuildsCard } from "../src/settings/PgBuildsCard.js";
 
 vi.mock("../src/api/client.js", () => ({
-  ApiError: class extends Error {},
+  // Match the real ApiError shape (status + message) so the downgrade-409 path is exercisable.
+  ApiError: class ApiError extends Error {
+    constructor(public status: number, message: string) { super(message); }
+  },
   api: {
     status: vi.fn(),
     projects: {}, branches: {},
@@ -18,7 +21,7 @@ vi.mock("../src/api/client.js", () => ({
     },
   },
 }));
-import { api } from "../src/api/client.js";
+import { api, ApiError } from "../src/api/client.js";
 import type { PgBuildDto, StatusDto } from "@devdb/shared";
 
 // FULLY-typed fixtures (repo rule: no `as any`/`as never`, tests included).
@@ -227,5 +230,112 @@ describe("PgBuildsCard", () => {
     const parent = disabledDelete!.parentElement;
     expect(parent).not.toBeNull();
     expect(parent!.className).not.toMatch(/mantine-Group-root/);
+  });
+
+  // #8: the card derived its major sections from status.pgBuilds (ready majors only) — an in-flight
+  // NEW-major pull has a row in usePgBuilds() but no status.pgBuilds entry yet, so it was invisible.
+  // Union both sources (same class ec0027a fixed for the MCP list tool).
+  it("renders a section for an in-flight NEW major present only in the builds list (not yet in status.pgBuilds)", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      ...builds,
+      build({ id: "b18-dl", major: 18, minor: null, version: null, status: "downloading", active: false, inUse: false, releaseTag: "9999" }),
+    ]);
+    renderApp(<PgBuildsCard />);
+    expect(await screen.findByText("PG 18")).toBeInTheDocument();
+  });
+
+  // #8: the update-available badge rendered only the component-local Check result and ignored the
+  // server's persisted status.pgBuilds[m].updateAvailable — so it vanished on reload. Fall back to it.
+  it("shows the update-available badge from the server's persisted status field, without a local Check", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      ...baseStatus,
+      pgBuilds: {
+        ...baseStatus.pgBuilds,
+        "16": { ...baseStatus.pgBuilds["16"]!, updateAvailable: "16.11" },
+      },
+    });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    expect(await screen.findByText(/update available/i)).toBeInTheDocument();
+  });
+
+  // #7: the local heuristic flags a downgrade vs the ACTIVE minor, but the daemon guards against the
+  // last-run HIGH-WATER. In a degraded major (active < high-water), a target the heuristic thinks is
+  // safe still 409s — the UI had no consent path. Catch the 409-downgrade and confirm-retry.
+  // major 16 here is DEGRADED: active 16.8, but 16.10 already ran (high-water). Activating 16.9 is
+  // NOT a local downgrade (9 >= 8) so it goes out un-consented; the daemon 409s (9 < 10).
+  const degradedMajor16 = {
+    ...baseStatus,
+    pgBuilds: { ...baseStatus.pgBuilds, "16": { activeVersion: "16.8", source: "downloaded" as const, degradedDowngrade: true, updateAvailable: null } },
+  };
+  const degradedBuilds16: PgBuildDto[] = [
+    build({ id: "b16-8", major: 16, minor: 8, version: "16.8", active: true, inUse: true, releaseTag: "16.8" }),
+    build({ id: "b16-9", major: 16, minor: 9, version: "16.9", active: false, inUse: false, releaseTag: "16.9" }),
+  ];
+
+  it("consent-retries an Activate the daemon 409s as a downgrade (the degraded case the local heuristic misses)", async () => {
+    vi.mocked(api.status).mockResolvedValue(degradedMajor16);
+    vi.mocked(api.pgBuilds.list).mockResolvedValue(degradedBuilds16);
+    vi.mocked(api.pgBuilds.activate)
+      .mockRejectedValueOnce(new ApiError(409, "activating 16.9 would downgrade below the last-run 16.10 — pass consented:true"))
+      .mockResolvedValue(build({ id: "b16-9", major: 16, minor: 9, active: true }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const activateButtons = await screen.findAllByRole("button", { name: /^activate$/i });
+    await userEvent.click(activateButtons[0]!); // b16-9: minor 9 >= active 8, so NOT a local downgrade
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.activate).mock.calls.at(-1)).toEqual(["b16-9", true]));
+    expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(2);
+  });
+
+  it("does NOT retry the Activate when the user declines the downgrade confirm", async () => {
+    vi.mocked(api.status).mockResolvedValue(degradedMajor16);
+    vi.mocked(api.pgBuilds.list).mockResolvedValue(degradedBuilds16);
+    vi.mocked(api.pgBuilds.activate).mockRejectedValueOnce(new ApiError(409, "would downgrade below the last-run 16.10"));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const activateButtons = await screen.findAllByRole("button", { name: /^activate$/i });
+    await userEvent.click(activateButtons[0]!);
+
+    // Anchor on the confirm firing FIRST (proves the 409 onError ran and the user declined) so the
+    // count assertion can't pass on an early poll before a (buggy) retry would have been issued.
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1); // and no consented retry followed
+  });
+
+  // #9: failed rows accumulated unbounded — the only action was Retry (which on a dedup no-op mints
+  // another failed row). FIX-3/FIX-4 made empty-path/ shared-dir delete safe, so a failed row can now
+  // offer Delete for cleanup.
+  it("a failed row offers Delete (safe post-FIX-3/4) and calls remove with the row id", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b16-bad", major: 16, minor: null, version: null, status: "failed", active: false, inUse: false, error: "gate failed", releaseTag: "9999" }),
+    ]);
+    vi.mocked(api.pgBuilds.remove).mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const deleteBtn = await screen.findByRole("button", { name: /^delete$/i }); // only the failed row has one here
+    await userEvent.click(deleteBtn);
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.remove).mock.calls.at(-1)?.[0]).toEqual("b16-bad"));
+  });
+
+  // #9 follow-up (review): a BAKED row can go failed (seedBaked re-probe / vanished dir), but the
+  // daemon 409s any baked delete and Retry would pull the "baked" tag — so a failed baked row must
+  // show the error only, no Retry/Delete.
+  it("a failed BAKED row shows the error but offers no Retry/Delete", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b17-baked", major: 17, minor: 5, version: "17.5", source: "baked", releaseTag: "baked", imageDigest: "", status: "failed", active: false, inUse: false, error: "baked build dir missing at boot" }),
+    ]);
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 17");
+    expect(screen.getByText(/baked build dir missing/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^delete$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
   });
 });

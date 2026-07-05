@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
-import { api, type RestoreBody } from "./client.js";
+import { api, ApiError, type RestoreBody } from "./client.js";
 import { keys } from "./keys.js";
 import { mapEventToKeys, startEvents, type EventsStatus } from "./events.js";
 
@@ -26,6 +26,9 @@ export function usePgBuilds() {
 }
 
 function onError(e: unknown): void {
+  // A 409 whose message names a downgrade is a consent PROMPT — the caller (PgBuildsCard's Activate)
+  // catches it, confirms, and retries with consented:true — not a terminal failure, so don't toast it.
+  if (e instanceof ApiError && e.status === 409 && /downgrade/i.test(e.message)) return;
   notifications.show({ color: "red", title: "Request failed", message: e instanceof Error ? e.message : String(e) });
 }
 

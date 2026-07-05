@@ -14,6 +14,19 @@ export function shortDigest(digest: string): string {
   return digest.replace(/^sha256:/, "").slice(0, 16);
 }
 
+// FIX-6: validate a build.json marker's SHAPE before trusting any field — a raw cast would let a
+// malformed-but-parseable marker insert undefined major/minor. Callers additionally check the marker
+// against its on-disk location (dir==shortDigest, major==vN) and re-detect the binary version.
+function parseMarker(raw: string): BuildMarker {
+  const m = JSON.parse(raw) as Record<string, unknown>;
+  if (typeof m.digest !== "string" || !/^sha256:[0-9a-f]+$/.test(m.digest)) throw new Error("marker.digest is not a sha256 hex digest");
+  if (typeof m.tag !== "string") throw new Error("marker.tag is not a string");
+  if (typeof m.major !== "number" || !Number.isInteger(m.major)) throw new Error("marker.major is not an integer");
+  if (typeof m.minor !== "number" || !Number.isInteger(m.minor)) throw new Error("marker.minor is not an integer");
+  if (typeof m.extractedAt !== "string") throw new Error("marker.extractedAt is not a string");
+  return { digest: m.digest, tag: m.tag, major: m.major, minor: m.minor, extractedAt: m.extractedAt };
+}
+
 function versionString(row: PgBuildRow): string {
   return `${row.major}.${row.minor}`;
 }
@@ -62,7 +75,10 @@ export class BuildRegistry {
       const existing = this.deps.state.pgBuilds.byId(id);
       if (existing) {
         try {
-          const { minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
+          const { major, minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
+          // FIX-6 symmetry: a baked dir whose binary now reports a DIFFERENT major than its vN dir
+          // name is a mislabeled/swapped install — fail it rather than keep the stale (dir) major.
+          if (major !== Number(m[1])) throw new Error(`baked binary major ${major} != dir v${m[1] ?? "?"}`);
           if (existing.minor !== minor) this.deps.state.pgBuilds.updateMinor(id, minor);
           if (existing.status !== "ready") this.deps.state.pgBuilds.setStatus(id, "ready");
         } catch (e) {
@@ -72,6 +88,13 @@ export class BuildRegistry {
         continue;
       }
       const { major, minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
+      // Same major==vN guard as the existing-row re-probe above: refuse to register a mislabeled
+      // baked dir (binary major != its vN dir name) as a wrong-major ready build. Skip + log rather
+      // than seed garbage — symmetric with adoptVolumeBuilds' skip-on-mismatch.
+      if (major !== Number(m[1])) {
+        this.deps.logger.error(`baked build at ${path} reports major ${major} but sits in dir v${m[1] ?? "?"} — not seeding`);
+        continue;
+      }
       this.deps.state.pgBuilds.insert({
         id, major, minor, source: "baked", releaseTag: "baked", imageDigest: "", path, status: "ready",
       });
@@ -82,15 +105,17 @@ export class BuildRegistry {
     }
   }
 
-  // Re-inserts registry rows from build.json markers under pgBuildsDir/v*/<shortDigest>/
-  // (skipping .tmp-* — in-progress installs). Markers are self-describing (digest/tag/major/
-  // minor), so identity comes from the marker's DIGEST, never from the dir name — this recovers
-  // registry state even from a lost SQLite. A dir already tracked by an existing row (a
-  // pull-created row keeps its UUID id, not the dl- form) is skipped by a path claim check:
-  // without it every boot would re-adopt pulled dirs as duplicate rows sharing one path, and a
-  // later GC/remove of the duplicate would rm the live build's directory. Rows whose backing dir
-  // has vanished since the last adopt are marked failed via a presence check on bin/postgres
-  // (not a re-hash — the atomic-rename install discipline is what makes presence trustworthy).
+  // Re-inserts registry rows from build.json markers under pgBuildsDir/v*/<shortDigest>/ (skipping
+  // .tmp-* — in-progress installs). FIX-6: the marker is SHAPE-validated (parseMarker) and checked
+  // for CONSISTENCY against its on-disk location — the dir basename must equal shortDigest(digest)
+  // AND the marker's major must equal the vN dir — then the binary version is RE-DETECTED and the
+  // DETECTED major/minor adopted (a marker is never trusted to name the version; symmetric with
+  // seedBaked). Any shape/consistency/version disagreement skips the dir with a logged reason rather
+  // than surfacing a wrong-version ready build. A dir already tracked by an existing row (a
+  // pull-created row keeps its UUID id, not the dl- form) is skipped by a path claim check: without
+  // it every boot would re-adopt pulled dirs as duplicate rows sharing one path, and a later
+  // GC/remove of the duplicate would rm the live build's directory. Rows whose backing dir has
+  // vanished since the last adopt are marked failed via a presence check on bin/postgres.
   async adoptVolumeBuilds(): Promise<void> {
     const claimedPaths = new Set(this.deps.state.pgBuilds.list().map((r) => r.path));
     const majors = await readdir(this.deps.pgBuildsDir).catch(() => [] as string[]);
@@ -102,12 +127,20 @@ export class BuildRegistry {
         const path = join(this.deps.pgBuildsDir, vdir, entry);
         if (claimedPaths.has(path)) continue;
         try {
-          const marker = JSON.parse(await readFile(join(path, "build.json"), "utf8")) as BuildMarker;
+          const marker = parseMarker(await readFile(join(path, "build.json"), "utf8"));
+          // Consistency with the on-disk location: the dir basename IS the content-address, and the
+          // marker's major IS the vN dir. A disagreement means a corrupt/renamed/tampered install.
+          if (shortDigest(marker.digest) !== entry) throw new Error(`marker digest ${shortDigest(marker.digest)} != dir ${entry}`);
+          if (marker.major !== Number(vdir.slice(1))) throw new Error(`marker major ${marker.major} != dir ${vdir}`);
           const id = `dl-${marker.major}-${shortDigest(marker.digest)}`;
           if (this.deps.state.pgBuilds.byId(id)) continue;
-          await access(join(path, "bin", "postgres"));
+          // Re-detect from the BINARY (this postgres --version subsumes the old access() probe) and
+          // adopt the DETECTED version. A binary whose major disagrees with its marker is not trusted
+          // — reject rather than surface a wrong-version ready+active build.
+          const detected = await this.deps.detectVersion(join(path, "bin", "postgres"));
+          if (detected.major !== marker.major) throw new Error(`binary major ${detected.major} != marker major ${marker.major}`);
           this.deps.state.pgBuilds.insert({
-            id, major: marker.major, minor: marker.minor, source: "downloaded",
+            id, major: detected.major, minor: detected.minor, source: "downloaded",
             releaseTag: marker.tag, imageDigest: marker.digest, path, status: "ready",
           });
         } catch (e) {

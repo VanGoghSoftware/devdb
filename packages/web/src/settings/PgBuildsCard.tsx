@@ -4,6 +4,14 @@ import type { PgBuildDto } from "@devdb/shared";
 import {
   useActivatePgBuild, useCheckPgUpdates, useDeletePgBuild, usePgBuilds, usePullPgBuild, useStatus,
 } from "../api/hooks.js";
+import { ApiError } from "../api/client.js";
+
+// #7: the daemon's activate guard rejects a downgrade below the last-run HIGH-WATER — not the active
+// minor the card can see — so a 409 whose message names a downgrade is the server asking for consent.
+// Surface it as a confirm-retry instead of a dead-end toast (the local isDowngrade heuristic below
+// only catches downgrades vs the ACTIVE minor, missing the degraded-major case active < high-water).
+const isDowngradeConflict = (e: unknown): e is ApiError =>
+  e instanceof ApiError && e.status === 409 && /downgrade/i.test(e.message);
 
 // One row of the installed-builds list under a major. Downloaded/baked "ready" rows get inline
 // Activate/Delete; in-flight rows show a spinner; failed rows show the error + a retry.
@@ -26,13 +34,33 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
     return (
       <Group justify="space-between" wrap="nowrap">
         <Text size="sm" c="dimmed">{row.error ?? "pull failed"}</Text>
-        <Button
-          size="compact-xs"
-          loading={pull.isPending}
-          onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
-        >
-          Retry pull
-        </Button>
+        {/* A baked row can go failed (seedBaked re-probe / vanished dir), but neither action applies:
+            the daemon 409s any baked delete, and Retry would pull the "baked" tag. Show the error only
+            — the remediation is restoring the image. */}
+        {row.source !== "baked" && (
+          <Group gap="xs">
+            <Button
+              size="compact-xs"
+              loading={pull.isPending}
+              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
+            >
+              Retry pull
+            </Button>
+            {/* #9: failed rows accumulate (Retry on a dedup no-op mints another). Deleting them is
+                safe now that FIX-3/FIX-4 made empty-path / shared-dir removal non-destructive. */}
+            <Button
+              size="compact-xs"
+              color="red"
+              variant="light"
+              loading={del.isPending}
+              onClick={() => {
+                if (window.confirm(`Delete this failed build record for PG ${row.major}? This cannot be undone.`)) del.mutate(row.id);
+              }}
+            >
+              Delete
+            </Button>
+          </Group>
+        )}
       </Group>
     );
   }
@@ -63,14 +91,16 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
             variant="light"
             loading={activate.isPending}
             onClick={() => {
-              if (
-                !isDowngrade ||
-                window.confirm(
-                  `Activating ${row.version} is a downgrade below ${a.activeMinor !== null ? `${row.major}.${a.activeMinor}` : ""}. The neon extension's catalog upgrades forward-only. Continue?`,
-                )
-              ) {
-                activate.mutate({ id: row.id, consented: isDowngrade ? true : undefined });
-              }
+              const localMsg = `Activating ${row.version} is a downgrade below ${a.activeMinor !== null ? `${row.major}.${a.activeMinor}` : ""}. The neon extension's catalog upgrades forward-only. Continue?`;
+              const doActivate = (consented?: boolean): void =>
+                activate.mutate(
+                  { id: row.id, consented },
+                  // #7: a degraded major (active < last-run high-water) 409s a target the local
+                  // heuristic waved through — offer the consent path with the daemon's own message.
+                  { onError: (e) => { if (isDowngradeConflict(e) && window.confirm(`${e.message}\n\nActivate anyway?`)) doActivate(true); } },
+                );
+              if (isDowngrade) { if (window.confirm(localMsg)) doActivate(true); } // known-local downgrade: confirm up front, skip a round-trip
+              else doActivate(undefined);
             }}
           >
             Activate
@@ -163,7 +193,12 @@ export function PgBuildsCard() {
   const [checkResult, setCheckResult] = useState<Record<string, { tag: string; isNew: boolean }>>({});
 
   if (!status) return null;
-  const majors = Object.keys(status.pgBuilds).map(Number).sort((x, y) => x - y);
+  // #8: union the ready majors (status.pgBuilds) with every major that has ANY build row
+  // (usePgBuilds) — an in-flight/failed NEW-major pull has a row but no status.pgBuilds entry yet.
+  const majors = [...new Set([
+    ...Object.keys(status.pgBuilds).map(Number),
+    ...(builds ?? []).map((b) => b.major),
+  ])].sort((x, y) => x - y);
 
   return (
     <Card withBorder>
@@ -180,17 +215,17 @@ export function PgBuildsCard() {
       </Group>
       <Stack gap="md" mt="xs">
         {majors.map((major) => {
-          const majorStatus = status.pgBuilds[String(major)]!;
+          const majorStatus = status.pgBuilds[String(major)]; // undefined for a major present only via an in-flight build row
           const majorBuilds = (builds ?? []).filter((b) => b.major === major);
           const checked = checkResult[String(major)];
           return (
             <MajorSection
               key={major}
               major={major}
-              activeVersion={majorStatus.activeVersion}
-              source={majorStatus.source}
-              degradedDowngrade={majorStatus.degradedDowngrade}
-              updateAvailable={checked?.isNew ? checked.tag : null}
+              activeVersion={majorStatus?.activeVersion ?? null}
+              source={majorStatus?.source ?? null}
+              degradedDowngrade={majorStatus?.degradedDowngrade ?? false}
+              updateAvailable={checked?.isNew ? checked.tag : (majorStatus?.updateAvailable ?? null)}
               builds={majorBuilds}
             />
           );

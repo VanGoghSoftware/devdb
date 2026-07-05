@@ -1333,6 +1333,54 @@ describe("MCP read tools", () => {
         expect(body).toMatch(/16\.10/);
         expect(h.pgBuildFakes.provisioner.activate).not.toHaveBeenCalled();
       });
+
+      // #11: content-addressed storage means two ready rows can share one major.minor (a same-minor
+      // rebuild at a new digest). Activating by version alone silently picked the oldest; require an
+      // explicit build id to disambiguate.
+      it("is ambiguous when two ready builds share a version — refuses without an id and lists them", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "dl-17-aaaa", major: 17, minor: 5, source: "downloaded", releaseTag: "9999", imageDigest: "sha256:" + "a".repeat(64), status: "ready", active: true }),
+          fakeRow({ id: "dl-17-bbbb", major: 17, minor: 5, source: "downloaded", releaseTag: "9999", imageDigest: "sha256:" + "b".repeat(64), status: "ready", active: false }),
+        ]);
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate);
+
+        const res = await h.call("activate_pg_build", { major: 17, version: "17.5" });
+
+        expect(res.isError).toBe(true);
+        const body = firstText(res);
+        expect(body.toLowerCase()).toMatch(/ambiguous/);
+        expect(body).toContain("dl-17-aaaa");
+        expect(body).toContain("dl-17-bbbb");
+        expect(activateSpy).not.toHaveBeenCalled();
+      });
+
+      it("activates the exact ready row when an id disambiguates two same-version builds", async () => {
+        h = await makeReadToolsHarness();
+        const chosen = fakeRow({ id: "dl-17-bbbb", major: 17, minor: 5, source: "downloaded", releaseTag: "9999", imageDigest: "sha256:" + "b".repeat(64), status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "dl-17-aaaa", major: 17, minor: 5, source: "downloaded", releaseTag: "9999", imageDigest: "sha256:" + "a".repeat(64), status: "ready", active: true }),
+          chosen,
+        ]);
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...chosen, active: true });
+
+        const res = await h.call("activate_pg_build", { major: 17, version: "17.5", id: "dl-17-bbbb" });
+
+        expect(res.isError).toBeFalsy();
+        expect(activateSpy).toHaveBeenCalledWith("dl-17-bbbb");
+      });
+
+      it("ignores the optional id path when a single ready build matches (unchanged single-row behavior)", async () => {
+        h = await makeReadToolsHarness();
+        const row = fakeRow({ id: "dl-17-only", major: 17, minor: 6, source: "downloaded", releaseTag: "9124", imageDigest: "sha256:" + "c".repeat(64), status: "ready", active: false });
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([row]);
+        const activateSpy = vi.mocked(h.pgBuildFakes.provisioner.activate).mockResolvedValue({ ...row, active: true });
+
+        const res = await h.call("activate_pg_build", { major: 17, version: "17.6" });
+
+        expect(res.isError).toBeFalsy();
+        expect(activateSpy).toHaveBeenCalledWith("dl-17-only");
+      });
     });
   });
 });

@@ -1,6 +1,9 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { StateDb } from "../../src/state/db.js";
+import type { PgBuildRow } from "../../src/state/repos.js";
+import { shortDigest } from "../../src/compute/builds/registry.js";
 
 // Shared scaffold helpers for pg_builds-related tests (BuildRegistry, Provisioner). Extracted from
 // pg-build-registry.test.ts (Task 4) so Task 7's provisioner.test.ts doesn't duplicate them.
@@ -30,10 +33,22 @@ export async function fakeInstallDir(base: string, name: string): Promise<string
   return d;
 }
 
-// A volume-adopted downloaded build dir `<builds>/v<major>/<tag>/` with `bin/postgres` +
-// `build.json` marker already in place (as BuildRegistry.adoptVolumeBuilds expects to find it).
-export async function fakeVolumeBuild(builds: string, major: number, tag: string, marker: object): Promise<string> {
-  const d = join(builds, `v${major}`, tag);
+export interface VolumeMarker { digest: string; tag: string; major: number; minor: number; extractedAt: string }
+
+// A volume-adopted downloaded build dir with `bin/postgres` + `build.json` in place. Production names
+// these dirs by CONTENT ADDRESS — `v{major}/{shortDigest(marker.digest)}` — and FIX-6's
+// adoptVolumeBuilds enforces it (the dir basename must equal shortDigest of the marker's digest), so
+// the dir is DERIVED from the marker here, not from a caller-chosen name. `tag` is retained only for
+// call-site readability (callers pass it == marker.tag); it no longer influences the dir. For a
+// deliberately-INCONSISTENT dir (which FIX-6 must reject), use fakeVolumeBuildNamed.
+export async function fakeVolumeBuild(builds: string, major: number, tag: string, marker: VolumeMarker): Promise<string> {
+  return fakeVolumeBuildNamed(builds, major, shortDigest(marker.digest), marker);
+}
+
+// Like fakeVolumeBuild but with an EXPLICIT dir basename — for negatives that need the dir to
+// disagree with shortDigest(marker.digest), or a malformed marker (marker: object accepts any shape).
+export async function fakeVolumeBuildNamed(builds: string, major: number, dirName: string, marker: object): Promise<string> {
+  const d = join(builds, `v${major}`, dirName);
   await mkdir(join(d, "bin"), { recursive: true });
   await writeFile(join(d, "bin", "postgres"), "#!/bin/sh\n");
   await writeFile(join(d, "build.json"), JSON.stringify(marker));
@@ -51,4 +66,11 @@ export function trackedDirs(): string[] {
 
 export async function cleanupDirs(dirs: string[]): Promise<void> {
   await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+}
+
+// Test-only lookup by (major, releaseTag). Production code never addresses a build this way — tags
+// are metadata, ids/digests are identity (content-addressed storage can legitimately hold several
+// rows at one (major, tag)) — so this convenience lives here, not on PgBuildsRepo (#12).
+export function buildByMajorAndTag(state: StateDb, major: number, tag: string): PgBuildRow | null {
+  return state.pgBuilds.list().find((r) => r.major === major && r.releaseTag === tag) ?? null;
 }

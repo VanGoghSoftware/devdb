@@ -209,7 +209,7 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     expect(secondRow.error).toBeTruthy();
   }, 420_000);
 
-  it("volume build survives re-up; fake-17.99 marker adopts + records high-water; deleting it flags the downgrade", async () => {
+  it("volume build survives re-up; a forged marker is rejected (FIX-6); an injected high-water flags the downgrade", async () => {
     if (!mainId) throw new Error("test 3 depends on test 1's project (suite is order-dependent)");
 
     // --- Re-up survival: rows/markers re-adopted at boot.
@@ -224,12 +224,12 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     expect(m.activeVersion).toBe(bakedVersion);
     expect(m.degradedDowngrade).toBe(false);
 
-    // --- Fake a 17.99 via the marker. The brief's plain `sed` on build.json is not sufficient
-    // on its own: the pull-created row (persisted in /data's SQLite across the re-up) still
-    // CLAIMS the dir path, and adoptVolumeBuilds re-reads markers only for UNCLAIMED dirs. The
-    // `mv` un-claims it — the stale row gets failed by the missing-binary sweep, and the sed'd
-    // marker is re-adopted as a fresh dl- row. Marker-adoption trusting the marker (id and minor
-    // both come from build.json, never from the dir name) is exactly the surface under test.
+    // --- FIX-6: adoptVolumeBuilds now validates a marker against its on-disk location (dir basename
+    // == shortDigest(digest), major == vN) and adopts the DETECTED binary version. Forging a high
+    // minor by mv-ing the dir to a non-content-address name and sed-ing build.json to minor:99 is
+    // exactly what it must REJECT: the dir `fake99-${short}` != shortDigest, and the binary detects
+    // 17.5 regardless. The mv un-claims the original dir, so its persisted row is failed by the
+    // missing-binary sweep — major 17 falls back to baked 17.5 and the forged 17.99 never surfaces.
     const short = seededDigest.replace(/^sha256:/, "").slice(0, 16);
     const dir = `/data/pg_builds/v17/${short}`;
     const dir99 = `/data/pg_builds/v17/fake99-${short}`;
@@ -237,21 +237,22 @@ describe("dynamic pg builds (hermetic e2e)", () => {
       `mv ${dir} ${dir99} && sed -i 's/"minor":${bakedMinor}/"minor":99/' ${dir99}/build.json`]);
     await dev.restart({ timeout: 60_000 });
     await waitHealthy();
+    expect((await listBuilds()).some((r) => r.status === "ready" && r.version === "17.99")).toBe(false); // forged 17.99 rejected
     m = await major17();
-    expect(m.activeVersion).toBe("17.99");
-    expect(m.source).toBe("downloaded");
-    expect(m.degradedDowngrade).toBe(false); // 99 sits ABOVE the recorded high-water — nothing degraded yet
+    expect(m.activeVersion).toBe(bakedVersion); // fell back to baked 17.5
+    expect(m.source).toBe("baked");
+    expect(m.degradedDowngrade).toBe(false); // 17.5 is not below the recorded high-water (17.5 from test 1)
 
-    // recordRun: a real (non-gate) endpoint start on the active fake-17.99 build raises the
-    // major's high-water to 99 — the same binary bits as 17.5, so the compute genuinely serves.
-    const branch = await api<{ runningPgVersion: string | null }>(
-      dev, "POST", `/api/branches/${mainId}/endpoint/start`);
-    expect(branch.runningPgVersion).toBe("17.99");
-    await api(dev, "POST", `/api/branches/${mainId}/endpoint/stop`);
-
-    // --- Delete the 17.99 build out from under the registry → next boot resolves baked 17.5,
-    // BELOW the 17.99 high-water: the never-silent-downgrade guard must flag it (spec decision
-    // 10) while still serving the baked fallback.
+    // --- Downgrade guard via a LEGIT high-water injection (the forged-build path can no longer set
+    // one). Write pg_majors.last_run_minor=99 straight into the daemon's SQLite via the better-sqlite3
+    // that ships in the image (no sqlite3 CLI in the runtime; resolve it from the daemon package dir).
+    // busy_timeout covers the daemon's WAL writer; the restart re-reads it at boot.
+    await execa("docker", ["exec", "-w", "/app/packages/daemon", dev.container.getId(), "node", "-e",
+      "const D=require('better-sqlite3');const db=new D('/data/state.db');db.pragma('busy_timeout=5000');" +
+      "db.prepare(\"INSERT INTO pg_majors (major,last_run_minor) VALUES (17,99) ON CONFLICT(major) DO UPDATE SET last_run_minor=99\").run();db.close();"]);
+    // Remove the rejected forged dir so only baked 17.5 remains resolvable, then re-derive at boot:
+    // baked 17.5 sits BELOW the injected high-water 99, so the never-silent-downgrade guard must flag
+    // it (spec decision 10) while still serving the baked fallback.
     await execa("docker", ["exec", dev.container.getId(), "rm", "-rf", dir99]);
     await dev.restart({ timeout: 60_000 });
     await waitHealthy();

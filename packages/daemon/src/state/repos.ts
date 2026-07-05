@@ -209,10 +209,6 @@ export class PgBuildsRepo {
     ).get(digest);
     return r ? pgBuildRow(r as Record<string, unknown>) : null;
   }
-  byMajorAndTag(major: number, tag: string): PgBuildRow | null {
-    const r = this.db.prepare("SELECT * FROM pg_builds WHERE major = ? AND release_tag = ?").get(major, tag);
-    return r ? pgBuildRow(r as Record<string, unknown>) : null;
-  }
   list(): PgBuildRow[] {
     return this.db.prepare("SELECT * FROM pg_builds ORDER BY major, created_at").all()
       .map((r) => pgBuildRow(r as Record<string, unknown>));
