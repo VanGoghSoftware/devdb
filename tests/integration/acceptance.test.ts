@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startDevdb, type Devdb } from "./helpers/container.js";
+import { isTransientConnError, retryOnTransient } from "./helpers/retry.js";
 
 describe("phase-1 acceptance (spec v1 items 1-4, REST edition)", () => {
   let dev: Devdb;
@@ -47,9 +48,18 @@ describe("phase-1 acceptance (spec v1 items 1-4, REST edition)", () => {
     const mainInTree = tree.find((b: { id: string }) => b.id === mainId);
     expect(mainInTree.parentBranchId).toBeNull();
 
-    // 4. reset brings the branch back to parent state
+    // 4. reset brings the branch back to parent state.
+    // reset auto-stops+restarts the branch's compute (TimeTravelService.swapOntoNewTimeline); this
+    // first post-reset read opens a fresh pg connection (server-side, via /api/sql) to the
+    // just-restarted compute, which can race its startup under load. /api/sql surfaces such a drop
+    // as a 500 whose body carries the pg signature, so retry on a transient teardown. The SELECT is
+    // idempotent (safe to retry); the earlier write/DELETE sql() calls above stay unwrapped.
     const reset = await (await fetch(`${dev.base}/api/branches/${br.id}/reset`, { method: "POST" })).json();
-    expect((await sql("SELECT count(*)::int AS n FROM notes", reset.id)).rows[0].n).toBe(1);
+    const afterReset = await retryOnTransient(
+      () => sql("SELECT count(*)::int AS n FROM notes", reset.id),
+      isTransientConnError,
+    );
+    expect(afterReset.rows[0].n).toBe(1);
 
     // Cheap addition: the swapped-in branch's endpoint came back up clean after reset — no
     // stranded error from the stop/restart TimeTravelService.resetToParent does around the swap
