@@ -79,6 +79,30 @@ describe("PgBuildsRepo", () => {
     s.pgBuilds.insert({ id: "r2", major: 17, source: "downloaded", releaseTag: "latest", imageDigest: "sha256:abc", path: "/d/v17/abc2", status: "ready" });
     expect(s.pgBuilds.byDigest("sha256:abc")?.id).toBe("r2");
   });
+
+  // T2 (deferred-Minor regression guard): setActiveExclusive is transactional, but only success
+  // paths were asserted. Pin the strand-invariant — a FAILED switch must leave the prior active
+  // pointer intact (a reorder that cleared active=0 before validating the target, or a dropped tx,
+  // would strand the major with zero active rows).
+  it("setActiveExclusive never strands the active pointer: a throw on an unknown id leaves the prior active row intact", () => {
+    const s = mem();
+    s.pgBuilds.insert({ id: "a", major: 17, minor: 5, source: "downloaded", releaseTag: "t", imageDigest: "sha256:aa", path: "/p/a", status: "ready" });
+    s.pgBuilds.insert({ id: "b", major: 17, minor: 6, source: "downloaded", releaseTag: "t", imageDigest: "sha256:bb", path: "/p/b", status: "ready" });
+    s.pgBuilds.setActiveExclusive("a");
+    expect(() => s.pgBuilds.setActiveExclusive("nope")).toThrow(/not found/);
+    expect(s.pgBuilds.listByMajor(17).filter((r) => r.active).map((r) => r.id)).toEqual(["a"]);
+  });
+
+  // T2 (deferred-Minor regression guard): byDigest's `AND image_digest != ''` excludes baked rows
+  // (which store digest ''), so a bare byDigest('') can never dedup-match a baked build. Dropping
+  // that guard would fail no other test.
+  it("byDigest excludes baked rows: querying '' never matches a baked build", () => {
+    const s = mem();
+    s.pgBuilds.insert({ id: "baked-v17", major: 17, minor: 5, source: "baked", releaseTag: "baked", imageDigest: "", path: "/i/v17", status: "ready" });
+    expect(s.pgBuilds.byDigest("")).toBeNull();
+    s.pgBuilds.insert({ id: "dl", major: 17, minor: 5, source: "downloaded", releaseTag: "t", imageDigest: "sha256:cc", path: "/p/cc", status: "ready" });
+    expect(s.pgBuilds.byDigest("sha256:cc")?.id).toBe("dl"); // positive control
+  });
 });
 
 describe("PgMajorsRepo", () => {
