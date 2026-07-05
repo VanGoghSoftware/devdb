@@ -698,4 +698,209 @@ describe("ComputeManager", () => {
     expect(manager.runningPgbin(branch.id)).toBeNull();
     expect(manager.runningPgbins()).toEqual([]);
   });
+
+  // ── stop()-during-start() race at the ComputeManager level (sibling to a74b8b1's
+  // ManagedProcess-level guard) ───────────────────────────────────────────────────────────────
+  // start() reserves its map slot synchronously (computes.set, proc still null) and then crosses
+  // several awaits — allocatePort ×3, mkdir/mkdtemp, writeFile ×2 — BEFORE it constructs entry.proc.
+  // A concurrent stopAll() (daemon shutdown, index.ts — it iterates computes directly, BYPASSING the
+  // per-branch queue lane that otherwise serializes a branch's start/stop) landing in that pre-proc
+  // window sees proc===null, so it sets phase="stopping", SKIPS proc.stop() (no proc to stop),
+  // deletes the map slot, and releases the ports. Pre-fix, the suspended start() re-checked nothing
+  // on resume: it sailed on to spawn compute_ctl, waitReady, flip "running", and RETURN SUCCESS for
+  // an entry no longer in the map — a live compute invisible to statusOf()/runningPorts(), leaked
+  // until the container is torn down, on a port stop() may already have re-handed. RED evidence
+  // (pre-fix): startPromise RESOLVES {port} and ManagedProcess WAS constructed (a spawned, unstopped,
+  // orphaned compute).
+  it("start() aborts (rejects, launches nothing) when stopAll() claims the entry during a pre-proc await", async () => {
+    // Single endpoint-port range so the restart at the end proves the aborted start RELEASED its
+    // port (a leak would make the reclaim throw PortExhaustedError). The deferred probe parks the
+    // FIRST allocatePort at `await probe(candidate)` — candidate already claimed into reservedPorts
+    // (reserve-then-probe, see ports.ts) but not yet recorded on entry, proc still null — modeling
+    // start() caught mid-setup. Later probes grant immediately so stopAll and the restart never
+    // touch a real socket.
+    let releaseProbe!: () => void;
+    const probeGate = new Promise<void>((r) => { releaseProbe = r; });
+    let probeCalls = 0;
+    const probe: PortProbe = vi.fn(async () => {
+      probeCalls += 1;
+      if (probeCalls === 1) await probeGate;
+      return true;
+    });
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54321-54321" });
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, probe);
+    const branch = fakeBranch();
+
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" });
+    // Park at the first probe: setup is in flight, entry.proc not yet constructed.
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1));
+    expect(ManagedProcessMock).not.toHaveBeenCalled();
+    expect(manager.statusOf(branch.id)).toBe("starting");
+
+    // Shutdown: stopAll() claims the proc-less entry (phase→stopping, no proc.stop(), slot deleted).
+    await manager.stopAll();
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+
+    // Resume the parked allocation. The fixed start() must ABORT into its catch, not sail on.
+    releaseProbe();
+    await expect(startPromise).rejects.toThrow(/stop\(\) intervened during startup/);
+
+    // Nothing was launched (no orphaned compute_ctl), and the port was released.
+    expect(ManagedProcessMock).not.toHaveBeenCalled();
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(
+      manager.start({ branch, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).resolves.toEqual({ port: 54321 });
+  });
+
+  // The other half of the same race: stopAll() arrives AFTER entry.proc is constructed and
+  // proc.start() has resolved, while start() is parked at the structural readiness gate
+  // (await this.waitReady). Here stop() DOES see a proc and stops it — but if waitReady then
+  // resolves "running" (its last poll caught the compute up microseconds before SIGTERM landed),
+  // pre-fix start() flips entry.phase="running" and RETURNS SUCCESS for the torn-down entry. The
+  // pre-"running" fence must reject instead. (a74b8b1 guards ManagedProcess.start()'s OWN readiness
+  // needle; this is the SEPARATE ComputeManager-level waitReady gate one layer up.) RED evidence
+  // (pre-fix): startPromise RESOLVES {port}.
+  it("start() aborts if stopAll() claims the entry after proc.start() while waitReady is still pending", async () => {
+    startMock.mockResolvedValueOnce(undefined); // needle fired: proc.start() resolves
+    let releaseReady!: () => void;
+    const readyGate = new Promise<void>((r) => { releaseReady = r; });
+    const deferredWaitReady = vi.fn(() => readyGate);
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54322-54322" });
+    const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady, undefined, fakeProbe());
+    const branch = fakeBranch();
+
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" });
+    // Park at waitReady: proc constructed, proc.start() resolved, readiness not yet committed.
+    await vi.waitFor(() => expect(deferredWaitReady).toHaveBeenCalledTimes(1));
+    expect(ManagedProcessMock).toHaveBeenCalledTimes(1);
+
+    // Shutdown mid-readiness: stopAll() stops the proc (proc !== null now), deletes the slot,
+    // releases the ports.
+    await manager.stopAll();
+    expect(stopMock).toHaveBeenCalled();          // the constructed proc WAS ordered to stop
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+
+    // waitReady resolves "running" after the teardown. start() must NOT resurrect the entry to
+    // "running" nor report success.
+    releaseReady();
+    await expect(startPromise).rejects.toThrow(/stop\(\) intervened during startup/);
+    expect(manager.statusOf(branch.id)).toBe("stopped");
+
+    // Port released → branch restartable on the same single port.
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(
+      manager.start({ branch, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).resolves.toEqual({ port: 54322 });
+  });
+
+  // Regression for the review-broker P3: the aborted start's compensation must be OWNER-SAFE for a
+  // port stopAll() already released and ANOTHER branch has since reclaimed. Interleaving: branch A's
+  // start() records entry.port=P and parks at its metrics allocation; stopAll() frees P and deletes
+  // A's slot; branch B (admitted after stopAll's key snapshot) reclaims the freed P and fully starts
+  // on it; A then resumes, trips a later fence, and enters its catch. Pre-hardening that catch did a
+  // blind `reservedPorts.delete(P)` — evicting B's LIVE reservation, so a THIRD start is wrongly
+  // handed the same P (a duplicate allocation: two computes on one port). The releasePort fix nulls
+  // each port on the entry as it's freed (in BOTH stop() and the catch), so the second releaser sees
+  // null and skips. RED evidence (pre-fix): branch C's start RESOLVES { port: 54321 } (== B's port).
+  it("an aborted start does not evict a port that stopAll() freed and another branch already reclaimed", async () => {
+    let releaseMetricsProbe!: () => void;
+    const metricsGate = new Promise<void>((r) => { releaseMetricsProbe = r; });
+    let probeCalls = 0;
+    // Park ONLY A's metrics allocation (probe call #2): by then A's endpoint port (call #1) is
+    // granted and recorded on entry, so stopAll() below frees a port A is holding, not one still
+    // mid-claim. Every other probe (B's three, plus A's eventual metrics on resume) grants at once.
+    const probe: PortProbe = vi.fn(async () => {
+      probeCalls += 1;
+      if (probeCalls === 2) await metricsGate;
+      return true;
+    });
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54321-54321" }); // single endpoint port — the contested P
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, probe);
+    const branchA = fakeBranch();
+    const branchB = fakeBranch();
+    const branchC = fakeBranch();
+
+    // A parks at its metrics allocation with entry.port=54321 already recorded.
+    const startA = manager.start({ branch: branchA, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" });
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(2));
+
+    // Shutdown teardown of A frees 54321 and deletes A's slot (A's proc was never constructed).
+    await manager.stopAll();
+    expect(manager.statusOf(branchA.id)).toBe("stopped");
+
+    // B is admitted after the snapshot, reclaims the freed 54321, and fully starts on it.
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(
+      manager.start({ branch: branchB, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).resolves.toEqual({ port: 54321 });
+    expect(manager.portOf(branchB.id)).toBe(54321);
+
+    // A resumes and aborts. Its catch must NOT touch 54321 (now B's).
+    releaseMetricsProbe();
+    await expect(startA).rejects.toThrow(/stop\(\) intervened during startup/);
+
+    // Proof B's reservation survived: a third start on the same single-port range is REFUSED (54321
+    // still reserved by B), not handed the same port a second time.
+    await expect(
+      manager.start({ branch: branchC, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).rejects.toThrow(/no free port/i);
+    expect(manager.portOf(branchB.id)).toBe(54321); // B still holds it, undisturbed
+  });
+
+  // Regression for the rescan P3: on the post-waitReady abort path, start()'s catch must NOT release
+  // the port / remove the dir while a concurrent stopAll() is STILL killing compute_ctl. The real
+  // ManagedProcess.stop() nulls this.child synchronously (process.ts:220), so the catch's SECOND
+  // stop() returns at once even though stopAll()'s FIRST stop() is still awaiting the process to
+  // actually exit — so a blind catch cleanup would free a port / rm a pgdata dir the dying process
+  // still holds. The fix defers teardown to the owning stop() when proc was constructed and stop()
+  // took the entry. RED evidence (pre-fix): a fresh start on the single-port range SUCCEEDS while
+  // stopAll() is still in flight (premature release), and statusOf() is "stopped" (the catch wrongly
+  // deleted the entry the in-flight stop still owns).
+  it("post-waitReady abort defers port/dir teardown to a stopAll() still killing the process", async () => {
+    startMock.mockResolvedValueOnce(undefined); // A's proc.start() resolves (needle fired)
+    // stopAll()'s stop() awaits the FIRST proc.stop() (models compute_ctl taking seconds to die);
+    // the catch's SECOND proc.stop() resolves at once, as the real class does once child is nulled.
+    let releaseFirstStop!: () => void;
+    const firstStopGate = new Promise<void>((r) => { releaseFirstStop = r; });
+    stopMock.mockImplementationOnce(() => firstStopGate).mockImplementation(async () => {});
+    let releaseReady!: () => void;
+    const readyGate = new Promise<void>((r) => { releaseReady = r; });
+    const deferredWaitReady = vi.fn(() => readyGate);
+    const cfg = freshCfg({ DEVDB_PORT_RANGE: "54323-54323" });
+    const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady, undefined, fakeProbe());
+    const branchA = fakeBranch();
+    const branchB = fakeBranch();
+
+    const startA = manager.start({ branch: branchA, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" });
+    await vi.waitFor(() => expect(deferredWaitReady).toHaveBeenCalledTimes(1)); // A parked at waitReady, proc built
+
+    // stopAll() begins tearing A down but SUSPENDS awaiting the first proc.stop() (compute_ctl dying).
+    const stopAllPromise = manager.stopAll();
+    await vi.waitFor(() => expect(stopMock).toHaveBeenCalledTimes(1));
+
+    // waitReady wins the race against SIGTERM and resolves — A resumes, trips the fence, aborts.
+    releaseReady();
+    await expect(startA).rejects.toThrow(/stop\(\) intervened during startup/);
+
+    // stopAll() is STILL in flight (compute_ctl not yet dead), and it — not the aborted start — owns
+    // A's teardown: the entry is still present as "stopping", and 54323 must NOT have been freed. A
+    // fresh start on the single-port range is refused until stopAll() settles.
+    expect(manager.statusOf(branchA.id)).toBe("stopping");
+    await expect(
+      manager.start({ branch: branchB, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).rejects.toThrow(/no free port/i);
+
+    // compute_ctl finally dies → stopAll()'s stop() runs its finally, releasing the port AFTER death.
+    releaseFirstStop();
+    await stopAllPromise;
+    expect(manager.statusOf(branchA.id)).toBe("stopped");
+
+    // Now the port is free and a fresh start binds it.
+    startMock.mockResolvedValueOnce(undefined);
+    await expect(
+      manager.start({ branch: branchB, pgVersion: 17, pgbinPath: "/data/pg_builds/v17/x/bin/postgres" }),
+    ).resolves.toEqual({ port: 54323 });
+  });
 });
