@@ -146,6 +146,33 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("combobox", { name: /postgresql version/i })).toHaveValue("PG 17");
   });
 
+  // T14 (deferred-Minor regression guard): the complement of the test above — when the loaded
+  // majors do NOT include DEFAULT_PG_VERSION, effectivePg must clamp to the highest available major
+  // for BOTH the Select value and the submitted pgVersion (never pass the Select a value absent from
+  // its own data, and never create a project on an uninstalled default).
+  it("clamps the PG picker to the highest installed major when DEFAULT_PG_VERSION isn't among the loaded builds", async () => {
+    const majors = SUPPORTED_PG_VERSIONS.filter((v) => v !== DEFAULT_PG_VERSION);
+    const highest = Math.max(...majors);
+    vi.mocked(api.status).mockResolvedValue({
+      ...status,
+      pgBuilds: Object.fromEntries(
+        majors.map((v) => [String(v), { activeVersion: `${v}.0`, source: "baked" as const, degradedDowngrade: false, updateAvailable: null }]),
+      ),
+    });
+    vi.mocked(api.projects.create).mockResolvedValue({ project: projects[0]!, mainBranch });
+    renderApp(<DashboardPage />);
+    await userEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    await userEvent.type(await screen.findByLabelText(/name/i), "clamped");
+
+    // Value clamped to the highest loaded major — DEFAULT_PG_VERSION is not even offered.
+    expect(screen.getByRole("combobox", { name: /postgresql version/i })).toHaveValue(`PG ${highest}`);
+
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    await waitFor(() =>
+      expect(vi.mocked(api.projects.create).mock.calls.at(-1)?.[0]).toEqual({ name: "clamped", pgVersion: highest }),
+    );
+  });
+
   it("falls back to the baked SUPPORTED_PG_VERSIONS list while status is still loading", async () => {
     // Never resolves within the test — mirrors the "loading" state (`useStatus().data` undefined).
     vi.mocked(api.status).mockReturnValue(new Promise(() => {}));
