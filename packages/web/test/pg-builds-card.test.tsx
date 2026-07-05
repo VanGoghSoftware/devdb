@@ -304,4 +304,21 @@ describe("PgBuildsCard", () => {
 
     await waitFor(() => expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1)); // no consented retry
   });
+
+  // #9: failed rows accumulated unbounded — the only action was Retry (which on a dedup no-op mints
+  // another failed row). FIX-3/FIX-4 made empty-path/ shared-dir delete safe, so a failed row can now
+  // offer Delete for cleanup.
+  it("a failed row offers Delete (safe post-FIX-3/4) and calls remove with the row id", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b16-bad", major: 16, minor: null, version: null, status: "failed", active: false, inUse: false, error: "gate failed", releaseTag: "9999" }),
+    ]);
+    vi.mocked(api.pgBuilds.remove).mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const deleteBtn = await screen.findByRole("button", { name: /^delete$/i }); // only the failed row has one here
+    await userEvent.click(deleteBtn);
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.remove).mock.calls.at(-1)?.[0]).toEqual("b16-bad"));
+  });
 });
