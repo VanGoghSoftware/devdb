@@ -228,4 +228,31 @@ describe("PgBuildsCard", () => {
     expect(parent).not.toBeNull();
     expect(parent!.className).not.toMatch(/mantine-Group-root/);
   });
+
+  // #8: the card derived its major sections from status.pgBuilds (ready majors only) — an in-flight
+  // NEW-major pull has a row in usePgBuilds() but no status.pgBuilds entry yet, so it was invisible.
+  // Union both sources (same class ec0027a fixed for the MCP list tool).
+  it("renders a section for an in-flight NEW major present only in the builds list (not yet in status.pgBuilds)", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      ...builds,
+      build({ id: "b18-dl", major: 18, minor: null, version: null, status: "downloading", active: false, inUse: false, releaseTag: "9999" }),
+    ]);
+    renderApp(<PgBuildsCard />);
+    expect(await screen.findByText("PG 18")).toBeInTheDocument();
+  });
+
+  // #8: the update-available badge rendered only the component-local Check result and ignored the
+  // server's persisted status.pgBuilds[m].updateAvailable — so it vanished on reload. Fall back to it.
+  it("shows the update-available badge from the server's persisted status field, without a local Check", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      ...baseStatus,
+      pgBuilds: {
+        ...baseStatus.pgBuilds,
+        "16": { ...baseStatus.pgBuilds["16"]!, updateAvailable: "16.11" },
+      },
+    });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    expect(await screen.findByText(/update available/i)).toBeInTheDocument();
+  });
 });

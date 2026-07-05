@@ -163,7 +163,12 @@ export function PgBuildsCard() {
   const [checkResult, setCheckResult] = useState<Record<string, { tag: string; isNew: boolean }>>({});
 
   if (!status) return null;
-  const majors = Object.keys(status.pgBuilds).map(Number).sort((x, y) => x - y);
+  // #8: union the ready majors (status.pgBuilds) with every major that has ANY build row
+  // (usePgBuilds) — an in-flight/failed NEW-major pull has a row but no status.pgBuilds entry yet.
+  const majors = [...new Set([
+    ...Object.keys(status.pgBuilds).map(Number),
+    ...(builds ?? []).map((b) => b.major),
+  ])].sort((x, y) => x - y);
 
   return (
     <Card withBorder>
@@ -180,17 +185,17 @@ export function PgBuildsCard() {
       </Group>
       <Stack gap="md" mt="xs">
         {majors.map((major) => {
-          const majorStatus = status.pgBuilds[String(major)]!;
+          const majorStatus = status.pgBuilds[String(major)]; // undefined for a major present only via an in-flight build row
           const majorBuilds = (builds ?? []).filter((b) => b.major === major);
           const checked = checkResult[String(major)];
           return (
             <MajorSection
               key={major}
               major={major}
-              activeVersion={majorStatus.activeVersion}
-              source={majorStatus.source}
-              degradedDowngrade={majorStatus.degradedDowngrade}
-              updateAvailable={checked?.isNew ? checked.tag : null}
+              activeVersion={majorStatus?.activeVersion ?? null}
+              source={majorStatus?.source ?? null}
+              degradedDowngrade={majorStatus?.degradedDowngrade ?? false}
+              updateAvailable={checked?.isNew ? checked.tag : (majorStatus?.updateAvailable ?? null)}
               builds={majorBuilds}
             />
           );
