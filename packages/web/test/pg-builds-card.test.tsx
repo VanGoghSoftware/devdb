@@ -295,14 +295,17 @@ describe("PgBuildsCard", () => {
     vi.mocked(api.status).mockResolvedValue(degradedMajor16);
     vi.mocked(api.pgBuilds.list).mockResolvedValue(degradedBuilds16);
     vi.mocked(api.pgBuilds.activate).mockRejectedValueOnce(new ApiError(409, "would downgrade below the last-run 16.10"));
-    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     renderApp(<PgBuildsCard />);
     await screen.findByText("PG 16");
     const activateButtons = await screen.findAllByRole("button", { name: /^activate$/i });
     await userEvent.click(activateButtons[0]!);
 
-    await waitFor(() => expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1)); // no consented retry
+    // Anchor on the confirm firing FIRST (proves the 409 onError ran and the user declined) so the
+    // count assertion can't pass on an early poll before a (buggy) retry would have been issued.
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1); // and no consented retry followed
   });
 
   // #9: failed rows accumulated unbounded — the only action was Retry (which on a dedup no-op mints
