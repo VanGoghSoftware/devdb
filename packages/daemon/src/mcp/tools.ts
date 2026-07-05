@@ -562,13 +562,33 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     );
   }));
 
-  const ActivatePgBuildShape = { major: PgVersionSchema, version: z.string().regex(/^\d+\.\d+$/) };
+  const ActivatePgBuildShape = { major: PgVersionSchema, version: z.string().regex(/^\d+\.\d+$/), id: z.string().optional() };
   server.registerTool("activate_pg_build", {
-    description: "Make a specific ready build the active one for its major. Refuses downgrades below the last-run minor — an agent cannot silently roll a branch back; downgrading requires human consent via the web UI or REST.",
+    description: "Make a specific ready build the active one for its major. Refuses downgrades below the last-run minor — an agent cannot silently roll a branch back; downgrading requires human consent via the web UI or REST. Pass the build id to disambiguate when two ready builds share a major.minor (a same-minor rebuild at a new digest).",
     inputSchema: ActivatePgBuildShape,
-  }, guard("activate_pg_build", deps, async ({ major, version }: z.infer<z.ZodObject<typeof ActivatePgBuildShape>>) => {
+  }, guard("activate_pg_build", deps, async ({ major, version, id }: z.infer<z.ZodObject<typeof ActivatePgBuildShape>>) => {
     const candidates = deps.registry.list().filter((r) => r.major === major);
-    const target = candidates.find((r) => r.status === "ready" && versionString(r) === version);
+    const ready = candidates.filter((r) => r.status === "ready" && versionString(r) === version);
+    // #11: content-addressed storage means two ready rows can legitimately share one major.minor (a
+    // same-minor rebuild at a new digest). find() would silently pick the oldest — instead require an
+    // explicit build id to disambiguate rather than guess which rebuild the agent meant.
+    let target: PgBuildRow | undefined;
+    if (id !== undefined) {
+      target = ready.find((r) => r.id === id);
+      if (!target) {
+        return errorResult(
+          `no ready build ${version} for PG ${major} with id ${id}` +
+          (ready.length > 0 ? ` — ready ids at ${version}: ${ready.map((r) => r.id).join(", ")}` : ` — none ready at ${version}`),
+        );
+      }
+    } else if (ready.length > 1) {
+      return errorResult(
+        `ambiguous: ${ready.length} ready builds at ${version} for PG ${major} — re-call with id to pick one: ` +
+        ready.map((r) => `${r.id} (digest ${r.imageDigest.replace(/^sha256:/, "").slice(0, 12)})`).join(", "),
+      );
+    } else {
+      target = ready[0];
+    }
     if (!target) {
       const available = candidates.filter((r) => r.status === "ready").map(versionString);
       return errorResult(
