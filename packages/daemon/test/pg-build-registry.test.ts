@@ -229,6 +229,16 @@ describe("BuildRegistry", () => {
     expect(state.pgBuilds.list()).toHaveLength(0);
   });
 
+  it("seedBaked skips a mislabeled baked dir whose binary major != the vN dir name", async () => {
+    const { install, builds } = await scaffold();
+    const v17 = await fakeInstallDir(install, "v17");
+    // The v17 dir's binary really reports major 16 (a packaging error) — must NOT seed a baked-v17 row.
+    const { state, registry } = makeRegistry({ install, builds, versions: { [v17]: { major: 16, minor: 3 } } });
+    await registry.seedBaked();
+    expect(state.pgBuilds.byId("baked-v17")).toBeNull();
+    expect(state.pgBuilds.list()).toHaveLength(0);
+  });
+
   it("adoptVolumeBuilds skips a dir already claimed by an existing (pull-created, UUID-id) row — no duplicate rows across boots", async () => {
     const { install, builds } = await scaffold();
     const digest = "sha256:" + "d".repeat(64);

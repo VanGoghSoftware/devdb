@@ -321,4 +321,18 @@ describe("PgBuildsCard", () => {
     await userEvent.click(deleteBtn);
     await waitFor(() => expect(vi.mocked(api.pgBuilds.remove).mock.calls.at(-1)?.[0]).toEqual("b16-bad"));
   });
+
+  // #9 follow-up (review): a BAKED row can go failed (seedBaked re-probe / vanished dir), but the
+  // daemon 409s any baked delete and Retry would pull the "baked" tag — so a failed baked row must
+  // show the error only, no Retry/Delete.
+  it("a failed BAKED row shows the error but offers no Retry/Delete", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b17-baked", major: 17, minor: 5, version: "17.5", source: "baked", releaseTag: "baked", imageDigest: "", status: "failed", active: false, inUse: false, error: "baked build dir missing at boot" }),
+    ]);
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 17");
+    expect(screen.getByText(/baked build dir missing/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^delete$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
 });

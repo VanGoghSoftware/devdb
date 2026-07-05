@@ -88,6 +88,13 @@ export class BuildRegistry {
         continue;
       }
       const { major, minor } = await this.deps.detectVersion(join(path, "bin", "postgres"));
+      // Same major==vN guard as the existing-row re-probe above: refuse to register a mislabeled
+      // baked dir (binary major != its vN dir name) as a wrong-major ready build. Skip + log rather
+      // than seed garbage — symmetric with adoptVolumeBuilds' skip-on-mismatch.
+      if (major !== Number(m[1])) {
+        this.deps.logger.error(`baked build at ${path} reports major ${major} but sits in dir v${m[1] ?? "?"} — not seeding`);
+        continue;
+      }
       this.deps.state.pgBuilds.insert({
         id, major, minor, source: "baked", releaseTag: "baked", imageDigest: "", path, status: "ready",
       });

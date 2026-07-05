@@ -34,28 +34,33 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
     return (
       <Group justify="space-between" wrap="nowrap">
         <Text size="sm" c="dimmed">{row.error ?? "pull failed"}</Text>
-        <Group gap="xs">
-          <Button
-            size="compact-xs"
-            loading={pull.isPending}
-            onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
-          >
-            Retry pull
-          </Button>
-          {/* #9: failed rows accumulate (Retry on a dedup no-op mints another). Deleting them is
-              safe now that FIX-3/FIX-4 made empty-path / shared-dir removal non-destructive. */}
-          <Button
-            size="compact-xs"
-            color="red"
-            variant="light"
-            loading={del.isPending}
-            onClick={() => {
-              if (window.confirm(`Delete this failed build record for PG ${row.major}? This cannot be undone.`)) del.mutate(row.id);
-            }}
-          >
-            Delete
-          </Button>
-        </Group>
+        {/* A baked row can go failed (seedBaked re-probe / vanished dir), but neither action applies:
+            the daemon 409s any baked delete, and Retry would pull the "baked" tag. Show the error only
+            — the remediation is restoring the image. */}
+        {row.source !== "baked" && (
+          <Group gap="xs">
+            <Button
+              size="compact-xs"
+              loading={pull.isPending}
+              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
+            >
+              Retry pull
+            </Button>
+            {/* #9: failed rows accumulate (Retry on a dedup no-op mints another). Deleting them is
+                safe now that FIX-3/FIX-4 made empty-path / shared-dir removal non-destructive. */}
+            <Button
+              size="compact-xs"
+              color="red"
+              variant="light"
+              loading={del.isPending}
+              onClick={() => {
+                if (window.confirm(`Delete this failed build record for PG ${row.major}? This cannot be undone.`)) del.mutate(row.id);
+              }}
+            >
+              Delete
+            </Button>
+          </Group>
+        )}
       </Group>
     );
   }
