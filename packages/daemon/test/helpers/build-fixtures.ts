@@ -1,6 +1,8 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { StateDb } from "../../src/state/db.js";
+import type { PgBuildRow } from "../../src/state/repos.js";
 
 // Shared scaffold helpers for pg_builds-related tests (BuildRegistry, Provisioner). Extracted from
 // pg-build-registry.test.ts (Task 4) so Task 7's provisioner.test.ts doesn't duplicate them.
@@ -51,4 +53,11 @@ export function trackedDirs(): string[] {
 
 export async function cleanupDirs(dirs: string[]): Promise<void> {
   await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+}
+
+// Test-only lookup by (major, releaseTag). Production code never addresses a build this way — tags
+// are metadata, ids/digests are identity (content-addressed storage can legitimately hold several
+// rows at one (major, tag)) — so this convenience lives here, not on PgBuildsRepo (#12).
+export function buildByMajorAndTag(state: StateDb, major: number, tag: string): PgBuildRow | null {
+  return state.pgBuilds.list().find((r) => r.major === major && r.releaseTag === tag) ?? null;
 }

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
 import { BuildRegistry } from "../src/compute/builds/registry.js";
 import { DevdbError } from "../src/services/errors.js";
-import { cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
+import { buildByMajorAndTag, cleanupDirs, fakeInstallDir, fakeVolumeBuild, noopLogger, scaffoldBuildDirs, trackedDirs } from "./helpers/build-fixtures.js";
 
 const dirs = trackedDirs();
 // Thin local adapter over the shared scaffoldBuildDirs(): this file's call sites only ever
@@ -105,10 +105,10 @@ describe("BuildRegistry", () => {
     await registry.seedBaked();
     await registry.adoptVolumeBuilds();
     registry.resolveActives(); // active = 16.12 (t3)
-    expect(() => registry.assertRemovable(state.pgBuilds.byMajorAndTag(16, "t3")!.id, [])).toThrow(/active/);
+    expect(() => registry.assertRemovable(buildByMajorAndTag(state,16, "t3")!.id, [])).toThrow(/active/);
     expect(() => registry.assertRemovable("baked-v16", [])).toThrow(/baked/);
     expect(() => registry.assertRemovable(
-      state.pgBuilds.byMajorAndTag(16, "t2")!.id,
+      buildByMajorAndTag(state,16, "t2")!.id,
       [join(b2, "bin", "postgres")],
     )).toThrow(/running endpoint/);
     // keep active (t3) + newest previous (t2) → only t1 is GC-eligible
@@ -148,7 +148,7 @@ describe("BuildRegistry", () => {
     const { state, registry } = makeRegistry({ install, builds, versions: { [v16]: { major: 16, minor: 9 }, [dl]: { major: 16, minor: 10 } } });
     await registry.seedBaked();
     await registry.adoptVolumeBuilds();
-    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
+    const row = buildByMajorAndTag(state,16, "t1")!;
     expect(row.status).toBe("ready");
 
     await rm(join(dl, "bin", "postgres"), { force: true }); // dir + build.json survive; only the binary vanishes
@@ -421,7 +421,7 @@ describe("BuildRegistry", () => {
 
     const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:2", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
     await registry.adoptVolumeBuilds();
-    const row = state.pgBuilds.byMajorAndTag(16, "t1")!;
+    const row = buildByMajorAndTag(state,16, "t1")!;
     state.pgBuilds.setStatus(row.id, "ready"); // pretend the pull-and-extract just completed
     void dl;
 

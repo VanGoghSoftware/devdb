@@ -36,10 +36,9 @@ describe("PgBuildsRepo", () => {
     expect(row).toMatchObject({ minor: 5, sizeBytes: 1234, status: "failed", error: "gate: compute never became ready" });
   });
 
-  it("byMajorAndTag + byDigest find rows; delete removes", () => {
+  it("byDigest finds rows; delete removes", () => {
     const s = mem();
     s.pgBuilds.insert({ id: "b1", major: 16, source: "downloaded", releaseTag: "9124", imageDigest: "sha256:z", path: "/p", status: "ready" });
-    expect(s.pgBuilds.byMajorAndTag(16, "9124")?.id).toBe("b1");
     expect(s.pgBuilds.byDigest("sha256:z")?.id).toBe("b1");
     s.pgBuilds.delete("b1");
     expect(s.pgBuilds.byId("b1")).toBeNull();
