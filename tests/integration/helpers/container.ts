@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { execa } from "execa";
 import { GenericContainer, Wait, type StartedNetwork, type StartedTestContainer } from "testcontainers";
 
@@ -38,6 +39,24 @@ export async function buildImage(): Promise<void> {
 // run — the very next restart of that container came back fully consistent). Devdb.restart()
 // below therefore retries exactly once on that timeout signature; every other failure, including
 // any resurrection of the old race message, surfaces immediately.
+//
+// The START path (GenericContainer.start()) hits the identical fixed-10s poll — via the same
+// inspectContainerUntilPortsExposed() — and under real load (a full 14-file suite run, each file
+// its own concurrent Vitest worker starting a container) it isn't rare: one run hit it on 4 of 14
+// files. Unlike restart(), a failed start() throws with NO StartedTestContainer handle ever
+// returned to the caller — read testcontainers@12.0.4's generic-container.js:
+// GenericContainer.start() -> startContainer(): `client.container.create()` (container created),
+// `client.container.start()` (container now RUNNING), then
+// `inspectContainerUntilPortsExposed()` throws — all with no try/catch in between and no cleanup
+// on the way out. The container testcontainers just created is left running in Docker,
+// unreachable from JS (no handle to call .stop() on): a naive start() retry would leak one
+// devdb:dev container per failed attempt. Ryuk (the session reaper) doesn't help here either —
+// it's a process-exit/reconnection-timeout safety net, not an immediate per-attempt catch.
+// startDevdb() below therefore gives each attempt a unique name (withName(), so concurrent files'
+// retries can never collide on "name already in use") and on a BIND_TIMEOUT_SIGNATURE catch shells
+// out to `docker rm -f <that name>` before retrying — precise (only ever removes the container
+// this specific call just created) and safe to call even if the container was never created,
+// since `docker rm -f` on a nonexistent name still resolves (exitCode 0), it doesn't reject.
 const BIND_TIMEOUT_SIGNATURE = "waiting for container ports to be bound";
 
 // Tripwire, not a wait: after a successful start()/restart() on testcontainers >=11.4, every
@@ -64,6 +83,22 @@ export interface Devdb {
   stop(): Promise<void>;
 }
 
+// Bounded attempts for the start()-path retry (see T16 epilogue above). restart() retries once
+// because its own stress run hit the timeout in ~1/60 restarts and a mid-retry failure there only
+// costs one restart cycle. The start() path is both more failure-prone under load in practice (4
+// concurrent timeouts in one 14-file suite run, i.e. a load-dependent — not rare — condition) and
+// far more expensive to lose: a start() failure fails an entire test file's beforeAll, not one
+// operation. 3 total attempts (2 retries) buys real headroom against that higher, load-correlated
+// failure rate while still failing loudly if Docker is persistently unable to publish ports at all.
+const START_MAX_ATTEMPTS = 3;
+
+async function removeOrphanedContainer(name: string): Promise<void> {
+  // Unconditional and best-effort: `docker rm -f` on a name that was never created (or already
+  // removed) still resolves with exitCode 0 rather than rejecting, so there's no need to first
+  // check whether this specific attempt actually got as far as `container create`.
+  await execa("docker", ["rm", "-f", name], { reject: false });
+}
+
 export async function startDevdb(
   env: Record<string, string> = {},
   opts: { network?: StartedNetwork } = {},
@@ -71,17 +106,41 @@ export async function startDevdb(
   await buildImage();
   const endpointPorts = Array.from({ length: 10 }, (_, i) => 54300 + i);
   const exposedPorts = [4400, ...endpointPorts];
-  const unstarted = new GenericContainer(IMAGE)
-    .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
-    .withExposedPorts(...exposedPorts)
-    .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
-    .withStartupTimeout(240_000);
-  // Task 15 (dynamic-pg-builds), additive: pg-builds.test.ts puts the daemon on a shared
-  // user-defined network with its hermetic fixture registry (network alias `pgregistry`) so the
-  // daemon's OCI client can dial it by name. Callers that omit `opts` keep the default bridge
-  // network and the exact pre-existing behavior.
-  if (opts.network) unstarted.withNetwork(opts.network);
-  const container = await unstarted.start();
+
+  const buildUnstarted = (name: string) => {
+    const unstarted = new GenericContainer(IMAGE)
+      .withName(name)
+      .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
+      .withExposedPorts(...exposedPorts)
+      .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
+      .withStartupTimeout(240_000);
+    // Task 15 (dynamic-pg-builds), additive: pg-builds.test.ts puts the daemon on a shared
+    // user-defined network with its hermetic fixture registry (network alias `pgregistry`) so the
+    // daemon's OCI client can dial it by name. Callers that omit `opts` keep the default bridge
+    // network and the exact pre-existing behavior.
+    if (opts.network) unstarted.withNetwork(opts.network);
+    return unstarted;
+  };
+
+  let container: StartedTestContainer | undefined;
+  for (let attempt = 1; attempt <= START_MAX_ATTEMPTS; attempt++) {
+    // Unique per attempt: concurrent suite files each start their own devdb:dev container, so a
+    // fixed/shared name would collide on retry across files ("name already in use") — see T16
+    // epilogue above.
+    const name = `devdb-test-${randomUUID()}`;
+    try {
+      container = await buildUnstarted(name).start();
+      break;
+    } catch (e) {
+      if (!(e instanceof Error) || !e.message.includes(BIND_TIMEOUT_SIGNATURE)) throw e;
+      // testcontainers' start() creates and starts the container BEFORE the port-poll that just
+      // threw, and does not clean up on that failure (see T16 epilogue above) — reclaim it before
+      // the next attempt so retries don't leak devdb:dev containers under repeated timeouts.
+      await removeOrphanedContainer(name);
+      if (attempt === START_MAX_ATTEMPTS) throw e;
+    }
+  }
+  if (!container) throw new Error("startDevdb: unreachable — loop exited without starting or throwing");
   assertAllPortsBound(container, exposedPorts);
 
   return {
