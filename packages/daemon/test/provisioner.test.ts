@@ -241,6 +241,39 @@ describe("Provisioner", () => {
     await expect(access(join(builds, "v17", "latest"))).rejects.toThrow();
   });
 
+  it("incompatible build (detectVersion load-failure) → failed row, staging dir reclaimed, path cleared", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+    const { state, provisioner } = makeProvisioner({
+      install, builds, oci,
+      // What version.ts surfaces when the dynamic linker can't resolve the pulled binary's libs
+      // (a build linked against a different OS base than this runtime). It THROWS — unlike the
+      // detected-major MISMATCH above, which returns after cleaning up — so it takes the pipeline's
+      // outer-catch path, which must still reclaim the pre-rename staging dir and drop the claim.
+      detectVersion: async (pgbin) => {
+        throw new Error(
+          `${pgbin} is incompatible with this runtime image (missing shared library libssl.so.1.1) — the build targets a different OS base than this container`,
+        );
+      },
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    expect(row.error).toMatch(/incompatible with this runtime image/);
+    expect(row.error).toMatch(/libssl\.so\.1\.1/);
+    // The fully-extracted ~200 MB staging dir must NOT be left behind for the next-boot sweep.
+    await expect(access(join(builds, "v17", `.tmp-${SHORT_A}`))).rejects.toThrow();
+    // And the row must drop its claim on the now-deleted staging path (so a same-digest retry, or
+    // a later DELETE of this failed row, can't collide with / rm a live dir — mirrors the gate path).
+    expect(row.path).toBe("");
+  });
+
   it("preflight disk: statfsFree below floor → failed before resolveDigest", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);

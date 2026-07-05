@@ -197,6 +197,11 @@ export class Provisioner {
     // catch's activatedRef branch is now an unreachable-in-practice BACKSTOP, kept for any
     // future throwing step added between activation and the end of the lane body.
     const activatedRef: { current: boolean } = { current: false };
+    // Reclaim-tracking for the PRE-rename staging dir (assigned once its path is known, below).
+    // Any throw before extractFixupAndGate renames it into finalDir leaves this fully-extracted
+    // ~200 MB dir behind — finalDirRef stays undefined so the post-rename compensation skips it,
+    // and sweepTmp only reclaims it at the NEXT boot. The outer catch rm's it when set.
+    let stagingDir: string | undefined;
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
       // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
@@ -227,6 +232,7 @@ export class Provisioner {
 
       // Row now enters the real pipeline: digest + content-addressed extraction path are known.
       const tmpDir = join(deps.cfg.pgBuildsDir, `v${major}`, `.tmp-${shortDigest(digest)}`);
+      stagingDir = tmpDir;
       state.pgBuilds.setDigestPath(id, { imageDigest: digest, path: tmpDir });
       this.publish();
 
@@ -251,6 +257,21 @@ export class Provisioner {
       this.log(id, `pull failed: ${firstLine(err)}`);
       deps.logger.error(`pg_build ${id} pull failed`, err);
       this.publish();
+
+      // Graceful-failure hygiene: reclaim the PRE-rename staging dir. A throw before
+      // extractFixupAndGate renamed stagingDir → finalDir (an incompatible-base build failing
+      // `postgres --version` at the dynamic-linker stage, or a writeFile/du/rename throw) leaves
+      // the fully-extracted ~200 MB dir orphaned — finalDirRef is still undefined so the
+      // compensation below skips it, and sweepTmp only reclaims it at the next boot. rm it now and
+      // drop the row's claim on that path. Un-laned like the detected-major-mismatch cleanup: a
+      // .tmp- dir is never an activate/remove target (those act only on ready/finalDir rows) and
+      // this row is already failed. finalDirRef set ⇒ the rename succeeded ⇒ the laned finalDir
+      // path below owns cleanup instead (the two branches are mutually exclusive).
+      if (stagingDir !== undefined && finalDirRef.current === undefined) {
+        await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+        if (state.pgBuilds.byId(id)?.path === stagingDir) state.pgBuilds.updatePath(id, "");
+      }
+
       // Destructive + pointer compensation for a failure PAST the rename. Post-HARD-2 that means
       // a non-409 activate() malfunction or a post-rename SQLite/fs throw (including the gate
       // catch's own rm failing) — a recomposeDistrib failure no longer lands here (swallowed at
