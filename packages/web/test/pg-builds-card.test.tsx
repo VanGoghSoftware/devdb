@@ -5,7 +5,10 @@ import { renderApp } from "./render.js";
 import { PgBuildsCard } from "../src/settings/PgBuildsCard.js";
 
 vi.mock("../src/api/client.js", () => ({
-  ApiError: class extends Error {},
+  // Match the real ApiError shape (status + message) so the downgrade-409 path is exercisable.
+  ApiError: class ApiError extends Error {
+    constructor(public status: number, message: string) { super(message); }
+  },
   api: {
     status: vi.fn(),
     projects: {}, branches: {},
@@ -18,7 +21,7 @@ vi.mock("../src/api/client.js", () => ({
     },
   },
 }));
-import { api } from "../src/api/client.js";
+import { api, ApiError } from "../src/api/client.js";
 import type { PgBuildDto, StatusDto } from "@devdb/shared";
 
 // FULLY-typed fixtures (repo rule: no `as any`/`as never`, tests included).
@@ -254,5 +257,51 @@ describe("PgBuildsCard", () => {
     renderApp(<PgBuildsCard />);
     await screen.findByText("PG 16");
     expect(await screen.findByText(/update available/i)).toBeInTheDocument();
+  });
+
+  // #7: the local heuristic flags a downgrade vs the ACTIVE minor, but the daemon guards against the
+  // last-run HIGH-WATER. In a degraded major (active < high-water), a target the heuristic thinks is
+  // safe still 409s — the UI had no consent path. Catch the 409-downgrade and confirm-retry.
+  // major 16 here is DEGRADED: active 16.8, but 16.10 already ran (high-water). Activating 16.9 is
+  // NOT a local downgrade (9 >= 8) so it goes out un-consented; the daemon 409s (9 < 10).
+  const degradedMajor16 = {
+    ...baseStatus,
+    pgBuilds: { ...baseStatus.pgBuilds, "16": { activeVersion: "16.8", source: "downloaded" as const, degradedDowngrade: true, updateAvailable: null } },
+  };
+  const degradedBuilds16: PgBuildDto[] = [
+    build({ id: "b16-8", major: 16, minor: 8, version: "16.8", active: true, inUse: true, releaseTag: "16.8" }),
+    build({ id: "b16-9", major: 16, minor: 9, version: "16.9", active: false, inUse: false, releaseTag: "16.9" }),
+  ];
+
+  it("consent-retries an Activate the daemon 409s as a downgrade (the degraded case the local heuristic misses)", async () => {
+    vi.mocked(api.status).mockResolvedValue(degradedMajor16);
+    vi.mocked(api.pgBuilds.list).mockResolvedValue(degradedBuilds16);
+    vi.mocked(api.pgBuilds.activate)
+      .mockRejectedValueOnce(new ApiError(409, "activating 16.9 would downgrade below the last-run 16.10 — pass consented:true"))
+      .mockResolvedValue(build({ id: "b16-9", major: 16, minor: 9, active: true }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const activateButtons = await screen.findAllByRole("button", { name: /^activate$/i });
+    await userEvent.click(activateButtons[0]!); // b16-9: minor 9 >= active 8, so NOT a local downgrade
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.activate).mock.calls.at(-1)).toEqual(["b16-9", true]));
+    expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(2);
+  });
+
+  it("does NOT retry the Activate when the user declines the downgrade confirm", async () => {
+    vi.mocked(api.status).mockResolvedValue(degradedMajor16);
+    vi.mocked(api.pgBuilds.list).mockResolvedValue(degradedBuilds16);
+    vi.mocked(api.pgBuilds.activate).mockRejectedValueOnce(new ApiError(409, "would downgrade below the last-run 16.10"));
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    const activateButtons = await screen.findAllByRole("button", { name: /^activate$/i });
+    await userEvent.click(activateButtons[0]!);
+
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1)); // no consented retry
   });
 });

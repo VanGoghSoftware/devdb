@@ -4,6 +4,14 @@ import type { PgBuildDto } from "@devdb/shared";
 import {
   useActivatePgBuild, useCheckPgUpdates, useDeletePgBuild, usePgBuilds, usePullPgBuild, useStatus,
 } from "../api/hooks.js";
+import { ApiError } from "../api/client.js";
+
+// #7: the daemon's activate guard rejects a downgrade below the last-run HIGH-WATER — not the active
+// minor the card can see — so a 409 whose message names a downgrade is the server asking for consent.
+// Surface it as a confirm-retry instead of a dead-end toast (the local isDowngrade heuristic below
+// only catches downgrades vs the ACTIVE minor, missing the degraded-major case active < high-water).
+const isDowngradeConflict = (e: unknown): e is ApiError =>
+  e instanceof ApiError && e.status === 409 && /downgrade/i.test(e.message);
 
 // One row of the installed-builds list under a major. Downloaded/baked "ready" rows get inline
 // Activate/Delete; in-flight rows show a spinner; failed rows show the error + a retry.
@@ -63,14 +71,16 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
             variant="light"
             loading={activate.isPending}
             onClick={() => {
-              if (
-                !isDowngrade ||
-                window.confirm(
-                  `Activating ${row.version} is a downgrade below ${a.activeMinor !== null ? `${row.major}.${a.activeMinor}` : ""}. The neon extension's catalog upgrades forward-only. Continue?`,
-                )
-              ) {
-                activate.mutate({ id: row.id, consented: isDowngrade ? true : undefined });
-              }
+              const localMsg = `Activating ${row.version} is a downgrade below ${a.activeMinor !== null ? `${row.major}.${a.activeMinor}` : ""}. The neon extension's catalog upgrades forward-only. Continue?`;
+              const doActivate = (consented?: boolean): void =>
+                activate.mutate(
+                  { id: row.id, consented },
+                  // #7: a degraded major (active < last-run high-water) 409s a target the local
+                  // heuristic waved through — offer the consent path with the daemon's own message.
+                  { onError: (e) => { if (isDowngradeConflict(e) && window.confirm(`${e.message}\n\nActivate anyway?`)) doActivate(true); } },
+                );
+              if (isDowngrade) { if (window.confirm(localMsg)) doActivate(true); } // known-local downgrade: confirm up front, skip a round-trip
+              else doActivate(undefined);
             }}
           >
             Activate
