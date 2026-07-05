@@ -29,6 +29,18 @@ describe("classifyPgVersionError", () => {
     expect(msg).not.toMatch(/missing shared library/); // no lib name to name
   });
 
+  it("classifies a versioned-symbol / GLIBC base mismatch (no missing-soname wording)", () => {
+    const raw = `Command failed: ${pgbin} --version\n${pgbin}: /lib/aarch64-linux-gnu/libc.so.6: version \`GLIBC_2.38' not found (required by ${pgbin})`;
+    const msg = classifyPgVersionError(pgbin, raw);
+    expect(msg).toMatch(/incompatible with this runtime image/);
+    expect(msg).toMatch(/different OS base/);
+  });
+
+  it("classifies a symbol lookup error (undefined versioned symbol)", () => {
+    const raw = `Command failed: ${pgbin} --version\n${pgbin}: symbol lookup error: ${pgbin}: undefined symbol: SSL_CTX_new, version OPENSSL_3.0.0`;
+    expect(classifyPgVersionError(pgbin, raw)).toMatch(/incompatible with this runtime image/);
+  });
+
   it("leaves an unrelated --version failure as the raw passthrough (not misclassified)", () => {
     const raw = "Command failed: … exited with code 1";
     const msg = classifyPgVersionError(pgbin, raw);

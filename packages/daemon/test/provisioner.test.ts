@@ -274,6 +274,32 @@ describe("Provisioner", () => {
     expect(row.path).toBe("");
   });
 
+  it("staging rm failure KEEPS the row's path claim (recoverable via DELETE, not falsely cleared)", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci } = fakeOci();
+    const { state, provisioner } = makeProvisioner({
+      install, builds, oci,
+      detectVersion: async (pgbin) => {
+        throw new Error(`${pgbin} is incompatible with this runtime image (missing shared library libssl.so.1.1) — the build targets a different OS base than this container`);
+      },
+    });
+    // Make ONLY the staging-dir rm reject; every other rm (none on this path) stays real. A false
+    // "success" would clear the path even though the .tmp- dir is still on disk — the P4 regression.
+    rmMock.mockImplementation((p: Parameters<typeof realFs.rm>[0], opts: Parameters<typeof realFs.rm>[1]) =>
+      String(p).includes(".tmp-") ? Promise.reject(new Error("EBUSY: simulated rm failure")) : realFs.rm(p, opts));
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    // rm failed ⇒ the row must KEEP its claim on the staging path so a later DELETE can reclaim it.
+    expect(row.path).toBe(join(builds, "v17", `.tmp-${SHORT_A}`));
+  });
+
   it("preflight disk: statfsFree below floor → failed before resolveDigest", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);

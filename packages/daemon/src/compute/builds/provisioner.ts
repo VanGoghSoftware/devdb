@@ -268,8 +268,17 @@ export class Provisioner {
       // this row is already failed. finalDirRef set ⇒ the rename succeeded ⇒ the laned finalDir
       // path below owns cleanup instead (the two branches are mutually exclusive).
       if (stagingDir !== undefined && finalDirRef.current === undefined) {
-        await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
-        if (state.pgBuilds.byId(id)?.path === stagingDir) state.pgBuilds.updatePath(id, "");
+        try {
+          await rm(stagingDir, { recursive: true, force: true });
+          if (state.pgBuilds.byId(id)?.path === stagingDir) state.pgBuilds.updatePath(id, "");
+        } catch (rmErr) {
+          // rm failed (rare — the daemon owns /data). KEEP the row's path claim: remove() rm's
+          // row.path, so DELETE can still reclaim the dir, and sweepTmp is the boot backstop.
+          // Clearing it here would leave the .tmp- dir on disk AND unowned, and (since the digest
+          // names the dir) block a same-digest retry on pullPrefix's "destDir already exists".
+          // Clear-path-only-on-successful-rm mirrors registry.failInterrupted.
+          deps.logger.error(`pg_build ${id}: could not reclaim staging dir ${stagingDir}`, rmErr);
+        }
       }
 
       // Destructive + pointer compensation for a failure PAST the rename. Post-HARD-2 that means

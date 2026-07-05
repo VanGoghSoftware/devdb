@@ -9,7 +9,15 @@ import { execFile } from "node:child_process";
 // ("… error while loading shared libraries: libssl.so.1.1: cannot open shared object …") is
 // already in `rawMessage` — no separate stderr capture needed.
 export function classifyPgVersionError(pgbinPath: string, rawMessage: string): string {
-  if (/error while loading shared libraries|cannot open shared object/i.test(rawMessage)) {
+  // A build linked against a different OS base trips the dynamic linker in one of a few shapes:
+  // a missing shared OBJECT ("error while loading shared libraries: libssl.so.1.1: cannot open
+  // shared object"), or a versioned SYMBOL/lib the runtime's own libs don't provide ("version
+  // `GLIBC_2.34' not found", "symbol lookup error", "… OPENSSL_3 not found"). Classify all of
+  // them; leave a non-loader failure (bad exit, unparseable output) as a raw passthrough.
+  const loaderFailure =
+    /error while loading shared libraries|cannot open shared object|symbol lookup error/i.test(rawMessage) ||
+    /\b(?:GLIBC|GLIBCXX|CXXABI|OPENSSL|LIBSSL|LIBCRYPTO)_[0-9.]+'?\s+not found/i.test(rawMessage);
+  if (loaderFailure) {
     const lib = /([\w.+-]+\.so(?:\.\d+)*): cannot open shared object/i.exec(rawMessage)?.[1];
     return `${pgbinPath} is incompatible with this runtime image` +
       (lib !== undefined ? ` (missing shared library ${lib})` : "") +
