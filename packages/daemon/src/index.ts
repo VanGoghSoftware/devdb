@@ -88,7 +88,7 @@ async function main(): Promise<void> {
     // was orphaned by a crash mid-pull — fail it (terminal + deletable) instead of leaving it
     // stuck forever behind assertRemovable's in-flight 409. Must precede resolveActives so an
     // orphan can never be an active-resolution candidate by way of a later status transition.
-    const failedInFlight = registry.failInterrupted();
+    const failedInFlight = await registry.failInterrupted();
     if (failedInFlight > 0) {
       console.error(`boot: failed ${failedInFlight} pg_build pull(s) interrupted by restart — delete via DELETE /api/pg-builds/{id}`);
     }

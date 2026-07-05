@@ -1,4 +1,5 @@
 import { rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
@@ -21,7 +22,17 @@ function makeRegistry(a: { install: string; builds: string; versions: Record<str
   const registry = new BuildRegistry({
     state, pgInstallDir: a.install, pgBuildsDir: a.builds, logger: noopLogger,
     detectVersion: async (pgbin) => {
-      const hit = Object.entries(a.versions).find(([prefix]) => pgbin.startsWith(prefix));
+      // Mirror real detectPostgresVersion (version.ts: execFile(pgbin, ["--version"])) on the one
+      // dimension these tests need: a pgbin whose FILE no longer exists must throw, exactly like a
+      // real execFile ENOENT would — a boot-robustness FIX-2 caller (adoptVolumeBuilds' presence
+      // sweep) now calls detectVersion where a bare access() presence probe used to run, and
+      // several existing "dir vanished" tests rely on that failure mode reaching this fake.
+      if (!existsSync(pgbin)) throw new Error(`ENOENT (fake): ${pgbin}`);
+      // Real detectPostgresVersion execs the EXACT pgbin path (version.ts) — a call on anything but
+      // <dir>/bin/postgres would ENOENT/EACCES. Match the exact binary path (not a loose prefix) so
+      // a caller that accidentally passes row.path (the dir) instead of join(row.path,"bin","postgres")
+      // is caught here (no fake version) rather than silently "detecting" a version for a non-binary.
+      const hit = Object.entries(a.versions).find(([prefix]) => pgbin === join(prefix, "bin", "postgres"));
       if (!hit) throw new Error(`no fake version for ${pgbin}`);
       return hit[1];
     },
@@ -158,6 +169,47 @@ describe("BuildRegistry", () => {
     expect(state.pgBuilds.byId(row.id)!.status).toBe("failed");
   });
 
+  // Boot-robustness FIX 2: the trailing presence sweep for previously-adopted rows used to only
+  // access()-probe bin/postgres — it never re-detected the VERSION, so an in-place binary swap
+  // (same dir + marker, different binary version) kept the row's STALE recorded minor, which could
+  // dodge the never-silent-downgrade guard. The sweep must RE-DETECT and reject on drift, mirroring
+  // the unclaimed-adoption path's reject-on-mismatch (registry.ts:141).
+  it("re-scan fails an already-claimed ready row whose binary was swapped in place (version drift)", async () => {
+    const { install, builds } = await scaffold();
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:3", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
+    const versions: Record<string, { major: number; minor: number }> = { [dl]: { major: 16, minor: 10 } };
+    const { state, registry } = makeRegistry({ install, builds, versions });
+    await registry.adoptVolumeBuilds();
+    const row = buildByMajorAndTag(state, 16, "t1")!;
+    expect(row).toMatchObject({ status: "ready", minor: 10 });
+
+    // Simulate an in-place binary swap: same dir + marker, but the binary now detects a DIFFERENT
+    // version (dir untouched on disk — only the fake detectVersion's view of it changes).
+    versions[dl] = { major: 16, minor: 99 };
+
+    await registry.adoptVolumeBuilds(); // re-scan, as a fresh boot would
+
+    const after = state.pgBuilds.byId(row.id)!;
+    expect(after.status).toBe("failed");
+    expect(after.error).toMatch(/drift/);
+    expect(after.error).toMatch(/detected 16\.99/);
+    expect(after.error).toMatch(/recorded 16\.10/);
+  });
+
+  it("re-scan control: matching version on re-scan leaves an already-claimed ready row alone", async () => {
+    const { install, builds } = await scaffold();
+    const dl = await fakeVolumeBuild(builds, 16, "t1", { digest: "sha256:4", tag: "t1", major: 16, minor: 10, extractedAt: "x" });
+    const versions: Record<string, { major: number; minor: number }> = { [dl]: { major: 16, minor: 10 } };
+    const { state, registry } = makeRegistry({ install, builds, versions });
+    await registry.adoptVolumeBuilds();
+    const row = buildByMajorAndTag(state, 16, "t1")!;
+    expect(row.status).toBe("ready");
+
+    await registry.adoptVolumeBuilds(); // re-scan with no change to the binary
+
+    expect(state.pgBuilds.byId(row.id)).toMatchObject({ status: "ready", minor: 10 });
+  });
+
   it("baked wins a genuine tie at EQUAL minor against a downloaded build for the same major", async () => {
     const { install, builds } = await scaffold();
     const v16 = await fakeInstallDir(install, "v16");
@@ -244,7 +296,10 @@ describe("BuildRegistry", () => {
     const digest = "sha256:" + "d".repeat(64);
     const dir = await fakeVolumeBuild(builds, 17, "d".repeat(16),
       { digest, tag: "latest", major: 17, minor: 5, extractedAt: "x" });
-    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    // Boot-robustness FIX 2: the trailing presence sweep now re-detects this row's version too
+    // (it's source:"downloaded", status:"ready") — supply a matching entry so the sweep sees the
+    // same 17.5 the row already records, same as a real binary reporting its expected version.
+    const { state, registry } = makeRegistry({ install, builds, versions: { [dir]: { major: 17, minor: 5 } } });
     // A pull-created row keeps its UUID id (never the dl- form) but owns the same dir.
     state.pgBuilds.insert({
       id: "3b9a4c1e-uuid-of-the-pull", major: 17, minor: 5, source: "downloaded",
@@ -451,7 +506,7 @@ describe("BuildRegistry", () => {
       imageDigest: "sha256:" + "9".repeat(64), path: join(builds, "v16", "9".repeat(16)), status: "ready",
     });
 
-    const count = registry.failInterrupted();
+    const count = await registry.failInterrupted();
 
     expect(count).toBe(2);
     expect(state.pgBuilds.byId("orphan-dl")).toMatchObject({ status: "failed", error: "interrupted by restart" });
@@ -460,6 +515,73 @@ describe("BuildRegistry", () => {
     // Previously these 409'd "pull in flight" forever; now they are removable.
     expect(registry.assertRemovable("orphan-dl", []).id).toBe("orphan-dl");
     expect(registry.assertRemovable("orphan-val", []).id).toBe("orphan-val");
+  });
+
+  // Boot-robustness FIX 1: an interrupted (crash-mid-download/validate) build was never validated
+  // — worthless — so its leftover finalDir is safe to reclaim, not just orphan. Previously
+  // failInterrupted kept the row's path "so a DELETE can reclaim the dir" — but that leaves the
+  // dir SQUATTING on the content-addressed path until the user manually DELETEs the failed row,
+  // and a same-digest re-pull's rename(tmp → finalDir) then fails ENOTEMPTY in the meantime.
+  it("failInterrupted reclaims the leftover finalDir of an interrupted build (no manual DELETE needed)", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    const dir = await fakeVolumeBuild(builds, 17, "t1",
+      { digest: "sha256:" + "1".repeat(64), tag: "t1", major: 17, minor: 5, extractedAt: "x" });
+    state.pgBuilds.insert({
+      id: "crashed-validating", major: 17, source: "downloaded", releaseTag: "t1",
+      imageDigest: "sha256:" + "1".repeat(64), path: dir, status: "validating",
+    });
+
+    const count = await registry.failInterrupted();
+
+    expect(count).toBe(1);
+    const row = state.pgBuilds.byId("crashed-validating")!;
+    expect(row.status).toBe("failed");
+    expect(existsSync(dir)).toBe(false); // dir reclaimed, not left squatting
+    expect(row.path).toBe(""); // path cleared — mirrors the post-failure-rm invariant elsewhere
+  });
+
+  it("failInterrupted's dir reclaim respects a sibling still claiming the same path", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    const digest = "sha256:" + "2".repeat(64);
+    const dir = await fakeVolumeBuild(builds, 17, "t1", { digest, tag: "t1", major: 17, minor: 5, extractedAt: "x" });
+    // Two rows share one path — a gate-failed/crashed attempt sits alongside a ready sibling that
+    // still claims the SAME digest-named dir (see state/repos.ts byDigest doc / provisioner FIX-3(b)).
+    state.pgBuilds.insert({
+      id: "ready-sibling", major: 17, source: "downloaded", releaseTag: "t1",
+      imageDigest: digest, path: dir, status: "ready",
+    });
+    state.pgBuilds.insert({
+      id: "crashed-sibling", major: 17, source: "downloaded", releaseTag: "t1",
+      imageDigest: digest, path: dir, status: "validating",
+    });
+
+    const count = await registry.failInterrupted();
+
+    expect(count).toBe(1);
+    expect(state.pgBuilds.byId("crashed-sibling")).toMatchObject({ status: "failed", path: dir }); // path kept: still claimed
+    expect(state.pgBuilds.byId("ready-sibling")?.status).toBe("ready"); // untouched
+    expect(existsSync(dir)).toBe(true); // ready sibling still claims it — dir survives
+  });
+
+  it("failInterrupted reclaims a dir shared by TWO interrupted rows (neither is the other's surviving claimant)", async () => {
+    const { install, builds } = await scaffold();
+    const { state, registry } = makeRegistry({ install, builds, versions: {} });
+    const digest = "sha256:" + "3".repeat(64);
+    const dir = await fakeVolumeBuild(builds, 17, "t1", { digest, tag: "t1", major: 17, minor: 5, extractedAt: "x" });
+    // Both rows are interrupted — no ready survivor. The old "any other row claims the path" guard
+    // would make each preserve the dir for the other (leaving it squatting → ENOTEMPTY persists);
+    // only a SURVIVING (non-interrupted) claimant should keep it.
+    state.pgBuilds.insert({ id: "crashed-a", major: 17, source: "downloaded", releaseTag: "t1", imageDigest: digest, path: dir, status: "validating" });
+    state.pgBuilds.insert({ id: "crashed-b", major: 17, source: "downloaded", releaseTag: "t1", imageDigest: digest, path: dir, status: "downloading" });
+
+    const count = await registry.failInterrupted();
+
+    expect(count).toBe(2);
+    expect(state.pgBuilds.byId("crashed-a")).toMatchObject({ status: "failed", path: "" });
+    expect(state.pgBuilds.byId("crashed-b")).toMatchObject({ status: "failed", path: "" });
+    expect(existsSync(dir)).toBe(false); // no surviving claimant → dir reclaimed
   });
 
   it("activate() to a non-downgrade build clears the degraded flag without a reboot", async () => {

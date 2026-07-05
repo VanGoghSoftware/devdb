@@ -1,4 +1,4 @@
-import { readdir, rm, readFile, access } from "node:fs/promises";
+import { readdir, rm, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DevdbError } from "../../services/errors.js";
 import type { StateDb } from "../../state/db.js";
@@ -115,7 +115,8 @@ export class BuildRegistry {
   // pull-created row keeps its UUID id, not the dl- form) is skipped by a path claim check: without
   // it every boot would re-adopt pulled dirs as duplicate rows sharing one path, and a later
   // GC/remove of the duplicate would rm the live build's directory. Rows whose backing dir has
-  // vanished since the last adopt are marked failed via a presence check on bin/postgres.
+  // vanished since the last adopt, or whose binary re-detects at a version other than recorded
+  // (an in-place swap/tamper), are marked failed via a re-detect-and-verify sweep on bin/postgres.
   async adoptVolumeBuilds(): Promise<void> {
     const claimedPaths = new Set(this.deps.state.pgBuilds.list().map((r) => r.path));
     const majors = await readdir(this.deps.pgBuildsDir).catch(() => [] as string[]);
@@ -148,14 +149,25 @@ export class BuildRegistry {
         }
       }
     }
-    // Fail any previously-adopted downloaded ready row whose bin/postgres is no longer accessible
-    // — whether the whole tag dir vanished (dir gone ⇒ postgres necessarily gone) or just the
-    // binary was removed while the dir + build.json survived. A direct access() probe subsumes
-    // both cases, so there's no separate "did we see the dir on this scan" bookkeeping to keep.
+    // Fail any previously-adopted downloaded ready row whose bin/postgres is no longer present, OR
+    // re-detects at a DIFFERENT version than recorded — whether the whole tag dir vanished (dir
+    // gone ⇒ postgres necessarily gone), just the binary was removed while the dir + build.json
+    // survived, or the binary was swapped in place (same dir + marker, different version).
+    //
+    // Boot-robustness FIX 2: this used to be a bare access() presence probe — it never re-detected
+    // the version, so an in-place binary swap kept the row's STALE recorded minor, which could
+    // dodge the never-silent-downgrade guard. detectVersion(...) subsumes the old presence probe
+    // (it throws if the binary is missing, same as access() did) AND re-detects the version, so
+    // any disagreement is caught here too — mirroring the unclaimed-adoption path's
+    // reject-on-mismatch above (never trust a binary whose version no longer matches the row).
     for (const row of this.deps.state.pgBuilds.list()) {
       if (row.source !== "downloaded" || row.status !== "ready") continue;
       try {
-        await access(join(row.path, "bin", "postgres"));
+        const detected = await this.deps.detectVersion(join(row.path, "bin", "postgres"));
+        if (detected.major !== row.major || detected.minor !== row.minor) {
+          this.deps.state.pgBuilds.setStatus(row.id, "failed",
+            `build binary version drift at boot: detected ${detected.major}.${detected.minor}, recorded ${row.major}.${row.minor}`);
+        }
       } catch {
         this.deps.state.pgBuilds.setStatus(row.id, "failed", "build binary missing at boot");
       }
@@ -166,15 +178,43 @@ export class BuildRegistry {
   // every row still in an in-flight status (downloading/validating). No pull survives a daemon
   // restart (the pipeline is in-process and fire-and-forget), so at boot any such row is
   // definitionally orphaned by a crash mid-pull. Left alone it would be stuck forever AND
-  // un-removable — assertRemovable 409s in-flight rows — forcing a state.db wipe. Failing it
-  // makes it terminal + deletable; its path (if any) is kept so a DELETE can reclaim the dir
-  // (remove()'s shared-path sibling check protects a same-digest retry's dir). Returns the count.
-  failInterrupted(): number {
+  // un-removable — assertRemovable 409s in-flight rows — forcing a state.db wipe. Failing it makes
+  // it terminal + deletable.
+  //
+  // Boot-robustness FIX 1: a row failed here was interrupted mid-download/validate — it was NEVER
+  // validated, so it is worthless, and its leftover finalDir is safe to reclaim immediately rather
+  // than leaving it squatting on the content-addressed path until a user manually DELETEs the row.
+  // Left in place, that leftover dir made a same-digest re-pull's rename(tmp → finalDir) fail
+  // ENOTEMPTY. Reclaim mirrors remove()'s sibling guard, but the claimant must be a SURVIVING row —
+  // one NOT itself being failed by this pass. A ready same-digest sibling legitimately shares a
+  // digest-named dir (state/repos.ts byDigest doc / provisioner FIX-3(b)) and must keep it; another
+  // interrupted row sharing the path is worthless too and no reason to preserve the dir (else two
+  // interrupted rows on one dir each see the other as a claimant and neither reclaims). The path is
+  // cleared via updatePath ONLY on a successful rm — on rm failure the claim is KEPT so a DELETE can
+  // still reclaim the (still-present) dir (a failed row with a path is removable) rather than
+  // stranding it un-owned. NOTE: a later boot's failInterrupted only re-scans in-flight rows, so it
+  // does NOT auto-retry a now-failed row — DELETE is the recovery for that rare case (rm --force on
+  // the node-owned /data volume near-never fails; auto-retrying failed rows was judged not worth its
+  // fragility for that edge).
+  async failInterrupted(): Promise<number> {
     let count = 0;
-    for (const row of this.deps.state.pgBuilds.list()) {
-      if (row.status !== "downloading" && row.status !== "validating") continue;
+    const rows = this.deps.state.pgBuilds.list();
+    const interruptedIds = new Set(
+      rows.filter((r) => r.status === "downloading" || r.status === "validating").map((r) => r.id),
+    );
+    for (const row of rows) {
+      if (!interruptedIds.has(row.id)) continue;
       this.deps.state.pgBuilds.setStatus(row.id, "failed", "interrupted by restart");
       count += 1;
+      const survivingClaimant = rows.some((r) => !interruptedIds.has(r.id) && r.path === row.path);
+      if (row.path !== "" && !survivingClaimant) {
+        try {
+          await rm(row.path, { recursive: true, force: true });
+          this.deps.state.pgBuilds.updatePath(row.id, "");
+        } catch (e) {
+          this.deps.logger.error(`failInterrupted: could not reclaim ${row.path} for ${row.id}`, e);
+        }
+      }
     }
     return count;
   }
