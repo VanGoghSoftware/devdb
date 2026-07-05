@@ -493,10 +493,18 @@ export class Provisioner {
   // but the in-use check consumed that frozen snapshot — so a build an endpoint started on WHILE
   // the DELETE waited out an in-flight laned activate/remove was still judged "not in use" and
   // its dir rm'd out from under the running compute (ENOENT on the live --pgbin). Reading the
-  // supplier inside the lane makes the in-use check exactly as live as the row checks. (Endpoint
-  // starts themselves are still not serialized with this lane — a start landing AFTER the
-  // supplier read but before the rm remains possible; that residual window is the known
-  // pgbinFor-vs-build-lane gap flagged for the post-merge concurrency review, out of scope here.)
+  // supplier inside the lane makes the in-use check exactly as live as the row checks. Endpoint
+  // starts are NOT serialized with this lane, yet the endpoint-vs-build-lane rm race is CLOSED
+  // (post-merge concurrency review, 2026-07-05 — controller analysis + review-broker adversarial
+  // scan found no reachable interleaving): a start "landing after the supplier read but before the
+  // rm" cannot land on THIS row, because remove() only reaches here for a NON-active build
+  // (assertRemovable rejects the active one), pgbinFor() only ever returns the ACTIVE build, and
+  // the pgbinFor→computes.start→runningPgbins span is synchronous (no yield) — so any endpoint that
+  // ever committed to this build had it in runningPgbins() before it could go non-active and thus
+  // removable. The closure rests on that span staying synchronous: documented load-bearing at
+  // endpoints.startLocked() + ComputeManager.start(), pinned by endpoints-service.test.ts (the
+  // startLocked no-await span) + manager.test.ts (the ComputeManager reservation). Not a
+  // lane-coupling or a build-dir refcount — neither is needed.
   //
   // FIX-3(b) (final review): the rm runs only when this row is the SOLE claimant of a non-empty
   // path. Rows legitimately share a path — a gate-failed attempt and its successful retry of the

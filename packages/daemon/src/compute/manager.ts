@@ -174,6 +174,10 @@ export class ComputeManager {
     // for the same branch sees this entry immediately instead of racing past the check above.
     // pgbinPath is set in this SAME tick (not assigned later) so a concurrent runningPgbin() call
     // can never observe a reserved-but-pgbinPath-less entry.
+    // LOAD-BEARING beyond start-dedup: this synchronous set is also what keeps the endpoint-vs-
+    // build-lane rm race closed — a build a compute is starting on is "in use" (runningPgbins →
+    // provisioner.assertRemovable) before any yield lets remove() rm its --pgbin dir. Do not move
+    // the reservation after an await. Pinned by "publishes pgbinPath into runningPgbins() SYNCHRONOUSLY".
     const entry: RunningCompute = {
       proc: null, port: null, metricsPort: null, internalHttpPort: null, dir: null, listeners: [], phase: "starting",
       pgbinPath: a.pgbinPath,

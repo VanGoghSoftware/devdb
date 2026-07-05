@@ -88,6 +88,18 @@ export class EndpointsService {
       // SAME single "failed"-recording catch every other start() failure goes through below.
       const resolved = opts?.pgbinPath ? null : this.deps.builds.pgbinFor(project.pgVersion);
       const pgbinPath = opts?.pgbinPath ?? resolved!.path;
+      // CONCURRENCY INVARIANT — load-bearing: do NOT insert an `await` between pgbinFor() above and
+      // computes.start() below, and keep pgbinFor() synchronous. This start must make the chosen
+      // build visible to runningPgbins() in the SAME synchronous tick it commits to it: computes.
+      // start() reserves the map entry carrying this pgbinPath synchronously before its own first
+      // await (manager.ts), and pgbinFor() only ever returns the ACTIVE build — so a build a compute
+      // is starting on is already "in use" (assertRemovable's runningPgbins check) before any yield
+      // point lets a concurrent provisioner.remove() rm its --pgbin dir. That synchronous span is
+      // what keeps the endpoint-vs-build-lane rm race closed (verified not-reachable 2026-07-05:
+      // controller analysis + review-broker adversarial scan); a yield inserted here re-opens it.
+      // This startLocked no-await half is pinned by endpoints-service.test.ts "startLocked calls
+      // computes.start() synchronously after pgbinFor()"; the ComputeManager reservation half by
+      // manager.test.ts "publishes pgbinPath into runningPgbins() SYNCHRONOUSLY".
       // Fix 1: `onLine` is passed straight into computes.start() rather than subscribed after
       // the fact via a separate computes.onLine() call once start() resolves. ComputeManager
       // registers this listener at map-reservation time — before its own first await — so

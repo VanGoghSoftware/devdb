@@ -392,6 +392,37 @@ describe("EndpointsService", () => {
     expect(f.builds.recordRun).toHaveBeenCalledWith(17, 10);
   });
 
+  // CONCURRENCY INVARIANT — endpoint↔build-lane rm guard, the startLocked half (the ComputeManager
+  // half is pinned by manager.test.ts "publishes pgbinPath into runningPgbins() SYNCHRONOUSLY").
+  // startLocked() must call computes.start() in the SAME synchronous tick as builds.pgbinFor() —
+  // no `await` between them — so the chosen build is handed to ComputeManager (which reserves it
+  // into runningPgbins synchronously) before any yield lets a concurrent provisioner.remove() rm
+  // its --pgbin dir. Mechanism: pgbinFor's fake schedules a microtask that fires at the FIRST yield
+  // after pgbinFor returns; in the no-await path computes.start() has already run by then, so no
+  // violation. An `await` inserted between pgbinFor and computes.start delays computes.start past
+  // that microtask → the flag is still false when it fires → test fails. (Verified closed
+  // 2026-07-05: controller analysis + review broker; this pins it against a silent re-opening.)
+  it("startLocked calls computes.start() synchronously after pgbinFor() — no await between (endpoint↔build-lane rm guard)", async () => {
+    const { f, mainBranch, endpoints } = await seeded();
+    let computesStartCalled = false;
+    let violated = false;
+    vi.mocked(f.builds.pgbinFor).mockImplementation(() => {
+      // Fires at startLocked's first post-pgbinFor yield. If an await sneaks in before
+      // computes.start(), computesStartCalled is still false here → violated.
+      queueMicrotask(() => { if (!computesStartCalled) violated = true; });
+      return { path: "/b/v17/bin/postgres", version: "17.10", buildId: "dl-17-t" };
+    });
+    vi.mocked(f.computes.start).mockImplementation(async () => { computesStartCalled = true; return { port: 54300 }; });
+    vi.mocked(f.computes.statusOf).mockReturnValueOnce("stopped").mockReturnValue("running");
+    vi.mocked(f.computes.portOf).mockReturnValue(54300);
+
+    await endpoints.start(mainBranch.id);
+
+    expect(f.builds.pgbinFor).toHaveBeenCalled();
+    expect(f.computes.start).toHaveBeenCalled();
+    expect(violated).toBe(false);
+  });
+
   // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): recordRun is a raise-only
   // high-water write with the same SQLite-fault fallibility as any other persist. Before this fix
   // it ran OUTSIDE the inner try/catch that guards the "running" persist — so a throwing recordRun

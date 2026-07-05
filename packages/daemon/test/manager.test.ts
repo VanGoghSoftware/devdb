@@ -699,6 +699,38 @@ describe("ComputeManager", () => {
     expect(manager.runningPgbins()).toEqual([]);
   });
 
+  it("start() publishes pgbinPath into runningPgbins() SYNCHRONOUSLY, before its first await — load-bearing for the endpoint↔build-lane rm guard", async () => {
+    // Override allocatePort per-call + the mocked proc start (docker-devdb-1 holds the default port
+    // range — see the allocatePort mock note atop this file), so this test never binds a real
+    // socket; it exercises only the synchronous map reservation.
+    startMock.mockResolvedValueOnce(undefined);
+    allocatePortMock
+      .mockResolvedValueOnce(54300)  // main compute port
+      .mockResolvedValueOnce(40100)  // metrics port
+      .mockResolvedValueOnce(40101); // internal-http port
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
+    const branch = fakeBranch();
+    const pgbinPath = "/data/pg_builds/v16/9124/bin/postgres";
+
+    // Invoke start() but do NOT await it: the reservation must be visible in the SAME synchronous
+    // tick. This pins the invariant that keeps the endpoint-vs-build-lane rm race closed (verified
+    // not-reachable 2026-07-05, controller analysis + review broker): endpoints.startLocked()
+    // resolves builds.pgbinFor() and calls computes.start() with NO await in between, and start()
+    // does `computes.set(entry{pgbinPath})` synchronously before its first await — so a build a
+    // compute is starting on is already "in use" (runningPgbins → assertRemovable's in-use check)
+    // before any yield point lets a concurrent provisioner.remove() rm its --pgbin dir. If a
+    // future refactor moves the reservation after start()'s first await, THIS test fails loudly.
+    // (The other half — startLocked calling computes.start with NO await after pgbinFor — is pinned
+    // separately by endpoints-service.test.ts "startLocked calls computes.start() synchronously".)
+    const starting = manager.start({ branch, pgVersion: 16, pgbinPath });
+    expect(manager.runningPgbins()).toContain(pgbinPath);
+    expect(manager.runningPgbin(branch.id)).toBe(pgbinPath);
+
+    await starting;
+    await manager.stop(branch.id);
+  });
+
   // ── stop()-during-start() race at the ComputeManager level (sibling to a74b8b1's
   // ManagedProcess-level guard) ───────────────────────────────────────────────────────────────
   // start() reserves its map slot synchronously (computes.set, proc still null) and then crosses
