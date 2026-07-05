@@ -163,6 +163,48 @@ describe("ManagedProcess", () => {
     expect(p.state).toBe("stopped");
   });
 
+  it("readiness resolving after stop() does not clobber the stopped state", async () => {
+    // The sibling test above covers the interleaving where the child DIES on stop()'s SIGTERM and
+    // readiness REJECTS (the guarded catch path). This one covers the other half: the child
+    // SURVIVES the signal and the needle appears strictly AFTER stop() has already claimed
+    // "stopped" and nulled child/pid. Hermetic by causality, not timing: the child prints the
+    // needle ONLY from its SIGTERM handler, and stop() is the only SIGTERM sender — so readiness
+    // cannot resolve until stop()'s state mutations are done. The "armed" sentinel gates stop()
+    // so SIGTERM can never land before the handler is installed (which would kill the child and
+    // re-create the sibling test's interleaving instead of this one).
+    const states: string[] = [];
+    let armed!: () => void;
+    const handlerInstalled = new Promise<void>((res) => {
+      armed = res;
+    });
+    const p = new ManagedProcess({
+      name: "late-ready", bin: node,
+      args: ["-e", "process.on('SIGTERM', () => console.log('READY')); console.log('armed'); setInterval(()=>{},1000)"],
+      readyNeedle: "READY", readyTimeoutMs: 5000,
+      onLine: (line) => { if (line.includes("armed")) armed(); },
+      onStateChange: (s) => states.push(s),
+    });
+    // Settlement is captured (never re-thrown) so the later rejection can't trip vitest's
+    // unhandled-rejection detection while we're still awaiting stop().
+    const outcome = p.start().then(() => null, (e: unknown) => e);
+    await handlerInstalled;
+    await p.stop(1000);
+    // Interleaving witness: the needle WAS seen, i.e. readiness resolved (the child survived
+    // SIGTERM long enough to print it). If this fails, the run degenerated into the sibling
+    // test's child-died interleaving and proves nothing about the success path.
+    expect(p.recentLines(50)).toContain("READY");
+    // BUG (pre-fix): the readiness success path unconditionally setState("running"), yielding
+    // ["starting", "stopped", "running"] and a self-contradictory running-with-null-pid object.
+    expect(states).toEqual(["starting", "stopped"]);
+    expect(p.state).toBe("stopped");
+    expect(p.pid).toBeNull();
+    // start() must reject (mirroring the child-died interleaving's contract), not report success
+    // for a process that was stopped mid-start.
+    const settled = await outcome;
+    expect(settled).toBeInstanceOf(Error);
+    expect(String(settled)).toMatch(/stop/i);
+  });
+
   it("onStateChange fires on every distinct transition, and observer throws are swallowed", async () => {
     const states: string[] = [];
     const p = new ManagedProcess({

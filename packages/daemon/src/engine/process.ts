@@ -168,6 +168,26 @@ export class ManagedProcess {
 
     try {
       await readiness;
+      // stop() may have claimed the transition ("stopped") while we were suspended at `await
+      // readiness` — the needle can appear strictly AFTER stop() has run when the child survives
+      // SIGTERM long enough to print it (real reachability: ComputeManager.stopAll() on daemon
+      // shutdown bypasses the branch lane and races in-flight compute starts, whose readiness
+      // takes seconds). Unconditionally claiming "running" here would leave a self-contradictory
+      // object — state === "running" with child/pid already nulled by stop() — and report success
+      // for a process that was ordered dead. Throwing routes into the catch below, whose existing
+      // unwind discipline is exactly right for this interleaving: its state guard preserves
+      // "stopped" (no "failed" clobber either), its `this.child === child` fence no-ops (stop()
+      // already cleared the fields), and its kill-if-alive SIGKILLs the surviving child NOW
+      // instead of leaving it to hold its ports until stop()'s own escalation deadline. readState()
+      // rather than the `state` getter for the same TS-narrowing reason documented in the catch.
+      // Fence on child identity too, not just the state token: after a stop() a fresh start() is
+      // admissible (state flips back to "starting"), so state alone could let THIS start's stale
+      // late-needle observe a NEXT start's "starting" and wrongly claim "running". No construction
+      // site reuses a ManagedProcess instance per start today, but `this.child === child` keeps the
+      // guard robust if one ever does (mirrors the catch's own child fence below).
+      if (this.readState() !== "starting" || this.child !== child) {
+        throw new Error(`${this.opts.name}: stop() intervened during startup; discarding late readiness`);
+      }
       this.setState("running");
     } catch (e) {
       // stop() may have claimed the transition ("stopped") while we were starting — don't clobber
