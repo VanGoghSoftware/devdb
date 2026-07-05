@@ -25,19 +25,34 @@ import type { EndpointsService } from "./endpoints.js";
 export class SqlService {
   constructor(private deps: { branches: BranchesService; endpoints: EndpointsService }) {}
 
+  // Fix 2 (task-9 gate integration): `opts.noAutoStart` exists for exactly one caller — the
+  // build-validation gate (compute/builds/validate.ts). The default path below auto-starts via
+  // ensureRunning, which shares startLocked's crash recovery: a FAILED compute is stopped and
+  // restarted with the currently-ACTIVE build's pgbin (builds.pgbinFor), NOT whatever pgbin the
+  // caller originally launched. For POST /api/sql that recovery is the feature; for the gate it
+  // would silently swap a crashed CANDIDATE for the old active build mid-validation — and a
+  // same-major version() probe still passes, so a broken build would be marked ready. With
+  // noAutoStart the endpoint's CURRENT state is read as-is (BranchDetail.connectionString/port
+  // are non-null only while the compute is actually running) and a non-running endpoint is a
+  // hard error: the gate FAILS, which is the correct outcome for a crashed candidate.
   async run(
     branchId: string,
     query: string,
+    opts?: { noAutoStart?: boolean },
   ): Promise<{ rows: unknown[]; rowCount: number; fields: string[]; truncated: boolean }> {
     if (!query.trim()) throw new DevdbError(400, "empty query");
     // ensureRunning is queued and idempotent (EndpointsService.ensureRunning shares startLocked's
     // queued body with start() — see endpoints.ts) — safe to call on every SQL request regardless
     // of whether the endpoint is already up; a no-op statusOf() check inside the lane short-
     // circuits back to the current BranchDetail when it's already "running".
-    const detail = await this.deps.endpoints.ensureRunning(branchId);
+    const detail = opts?.noAutoStart
+      ? await this.deps.branches.detail(this.deps.branches.byIdOr404(branchId))
+      : await this.deps.endpoints.ensureRunning(branchId);
     const port = detail.port;
     if (!detail.connectionString || !port) {
-      throw new DevdbError(502, `endpoint for "${detail.name}" is not running`);
+      throw new DevdbError(502, opts?.noAutoStart
+        ? `endpoint for "${detail.name}" is not running — noAutoStart refuses to start one (a crashed compute must surface as a failure, not be silently restarted on a different build)`
+        : `endpoint for "${detail.name}" is not running`);
     }
     const client = new pg.Client({
       host: "127.0.0.1", port, user: "postgres",

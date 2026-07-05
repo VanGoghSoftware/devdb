@@ -1,5 +1,5 @@
-import type { BranchDto, ProjectDto } from "@devdb/shared";
-import type { ProjectRow } from "../state/repos.js";
+import type { BranchDto, PgBuildDto, ProjectDto } from "@devdb/shared";
+import type { PgBuildRow, ProjectRow } from "../state/repos.js";
 import type { BranchDetail } from "./branches.js";
 
 export function toProjectDto(p: ProjectRow): ProjectDto {
@@ -14,5 +14,25 @@ export function toBranchDto(b: BranchDetail): BranchDto {
     lastRecordLsn: b.lastRecordLsn, logicalSizeBytes: b.logicalSizeBytes, ancestorLsn: b.ancestorLsn,
     createdBy: b.createdBy, context: b.context, // BranchRow now carries the union
     createdAt: b.createdAt, updatedAt: b.updatedAt,
+    runningPgVersion: b.runningPgVersion, // Task 8: BranchDetail now resolves the real value
+  };
+}
+
+// Task 10 (dynamic-pg-builds): row -> wire DTO for GET /api/pg-builds and the activate route's
+// response. `inUse` is derived here (not stored) from the CURRENT runningPgbins() snapshot the
+// caller passes in — a prefix match against `row.path + "/"` (not exact equality against a full
+// pgbin path) because BuildRegistry.assertRemovable uses the same "startsWith(path + '/')" test
+// for its own in-use guard (registry.ts), and this mapper is meant to agree with that guard's
+// notion of "in use" rather than encode a second, subtly different one. FIX-4 (final review):
+// both sites skip the prefix test for path === "" rows (early-failed / failure-rm'd builds own
+// no directory) — startsWith("/") would otherwise match EVERY running pgbin.
+export function toPgBuildDto(row: PgBuildRow, runningPgbins: string[]): PgBuildDto {
+  return {
+    id: row.id, major: row.major, minor: row.minor,
+    version: row.minor === null ? null : `${row.major}.${row.minor}`,
+    source: row.source, releaseTag: row.releaseTag, imageDigest: row.imageDigest,
+    status: row.status, active: row.active,
+    inUse: row.path !== "" && runningPgbins.some((p) => p.startsWith(row.path + "/")),
+    sizeBytes: row.sizeBytes, error: row.error, createdAt: row.createdAt,
   };
 }

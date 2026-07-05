@@ -17,6 +17,9 @@ describe("mapEventToKeys", () => {
   it("engine.health invalidates status", () => {
     expect(mapEventToKeys({ type: "engine.health", at: "t" })).toEqual([["status"]]);
   });
+  it("pg_builds invalidates the builds list and status", () => {
+    expect(mapEventToKeys({ type: "pg_builds", at: "" })).toEqual([["pg-builds"], ["status"]]);
+  });
 });
 
 class FakeEventSource {

@@ -4,6 +4,7 @@ import { DevdbError } from "./errors.js";
 import type { ProjectsDeps } from "./projects.js";
 import type { BranchesService, BranchDetail } from "./branches.js";
 import type { LogsService } from "./logs.js";
+import type { BuildsResolverApi } from "./engine-api.js";
 
 // TimeTravelService's swap (see services/timetravel.ts) must stop/restart a branch's endpoint
 // from WITHIN its own queue.run(branchId, ...) lane. Calling the public, queued start()/stop()
@@ -22,12 +23,12 @@ import type { LogsService } from "./logs.js";
 // turn, not one that leaked out of a settled run() call) and for the SAME branchId being operated
 // on (a caller could otherwise hold branch A's lane while passing branch B's id).
 export interface EndpointsLockedApi {
-  startLocked(lane: Lane, branchId: string): Promise<BranchDetail>;
+  startLocked(lane: Lane, branchId: string, opts?: { pgbinPath?: string }): Promise<BranchDetail>;
   stopLocked(lane: Lane, branchId: string): Promise<BranchDetail>;
 }
 
 export class EndpointsService {
-  constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService; logs: LogsService }) {}
+  constructor(private deps: ProjectsDeps & { queue: BranchQueue; branches: BranchesService; logs: LogsService; builds: BuildsResolverApi }) {}
 
   // Every endpoint status persisted to SQLite is also announced on /api/events — one seam so a
   // transition can never be written without being announced (spec Decision 1 emission table).
@@ -50,7 +51,7 @@ export class EndpointsService {
   // queues under the same branchId to serialize with concurrent start()/stop()/delete() calls
   // for that branch). Calling it unqueued is a deliberate least-invasive alternative to plumbing
   // a second "already locked" queue primitive — see the EndpointsLockedApi comment above.
-  async startLocked(lane: Lane, branchId: string): Promise<BranchDetail> {
+  async startLocked(lane: Lane, branchId: string, opts?: { pgbinPath?: string }): Promise<BranchDetail> {
     this.deps.queue.assertLane(lane, branchId);
     const branch = this.deps.branches.byIdOr404(branchId);
     const project = this.deps.state.projects.byId(branch.projectId)!;
@@ -78,6 +79,15 @@ export class EndpointsService {
     }
     this.setEndpointStatus(branch, { status: "starting", port: null });
     try {
+      // Dynamic builds: the ACTIVE build for this project's major, resolved fresh per start — this
+      // is what makes "adopt on restart" structural (spec §Architecture). The validation gate
+      // (startWithPgbin, below) passes an explicit override instead, and must NOT touch the run
+      // high-water: the candidate isn't active yet — recording it would arm the downgrade guard
+      // against a build that may fail its own gate. Resolved INSIDE this try (not before it) so a
+      // pgbinFor() 409 ("no usable Postgres — pull one or pick an installed major") lands in the
+      // SAME single "failed"-recording catch every other start() failure goes through below.
+      const resolved = opts?.pgbinPath ? null : this.deps.builds.pgbinFor(project.pgVersion);
+      const pgbinPath = opts?.pgbinPath ?? resolved!.path;
       // Fix 1: `onLine` is passed straight into computes.start() rather than subscribed after
       // the fact via a separate computes.onLine() call once start() resolves. ComputeManager
       // registers this listener at map-reservation time — before its own first await — so
@@ -87,7 +97,7 @@ export class EndpointsService {
       // delete(), or a failed start()'s cleanup) now owns this listener's cleanup — there is
       // nothing left for this service to unsubscribe on any stop path.
       const { port } = await this.deps.computes.start({
-        branch, pgVersion: project.pgVersion,
+        branch, pgVersion: project.pgVersion, pgbinPath,
         onLine: (line) => this.deps.logs.ingest(`branch:${branch.id}:compute`, line),
       });
       try {
@@ -105,6 +115,23 @@ export class EndpointsService {
         await this.deps.computes.stop(branch.id).catch((stopErr) =>
           this.deps.logger.error(`compensation failed — orphaned compute for branch ${branch.id} after a persist failure`, stopErr));
         throw persistErr;
+      }
+      // Fix round 1 (compensation gaps, review of Task 8 commit 43ce4b7): recordRun MUST run only
+      // AFTER the "running" persist has SUCCEEDED, and MUST be best-effort — swallowed here so its
+      // failure can never reach the outer catch (which would record "failed" for a start that
+      // genuinely succeeded, all while leaving the now-live compute stranded with no compensating
+      // computes.stop() call, since the outer catch doesn't do that). recordRun is a raise-only
+      // high-water write, advisory to the downgrade guard — losing one write is far cheaper than
+      // tearing down (or mis-reporting) a healthy compute over it.
+      if (resolved) {
+        // Only for a non-override (real, ACTIVE-build) start — the gate's override start must
+        // never raise the high-water; see the override's own comment above.
+        try {
+          const minor = Number(resolved.version.split(".")[1]);
+          this.deps.builds.recordRun(project.pgVersion, minor);
+        } catch (recordErr) {
+          this.deps.logger.error(`recordRun failed (non-fatal) for branch ${branch.id}`, recordErr);
+        }
       }
     } catch (e) {
       // Single "failed" recording point for startLocked: reached either directly (computes.start
@@ -134,6 +161,14 @@ export class EndpointsService {
 
   start(branchId: string): Promise<BranchDetail> {
     return this.deps.queue.run(branchId, (lane) => this.startLocked(lane, branchId));
+  }
+
+  // Gate-only queued entry point (builds/validate.ts, a later task). Deliberately NOT wired to any
+  // route — launches a CANDIDATE build (opts.pgbinPath override) instead of resolving the
+  // project's current ACTIVE build, so the validation gate can smoke-test a build before it's
+  // promoted. See startLocked's own override-path comment for why this must not recordRun.
+  startWithPgbin(branchId: string, pgbinPath: string): Promise<BranchDetail> {
+    return this.deps.queue.run(branchId, (lane) => this.startLocked(lane, branchId, { pgbinPath }));
   }
 
   // Public for the same reason as startLocked() above — see EndpointsLockedApi's doc comment.

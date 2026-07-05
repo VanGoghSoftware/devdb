@@ -1,4 +1,4 @@
-import type { BranchDto, ProjectDto, StatusDto, BranchContext } from "@devdb/shared";
+import type { BranchDto, ProjectDto, StatusDto, BranchContext, PgBuildDto } from "@devdb/shared";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -44,5 +44,18 @@ export const api = {
     restore: (id: string, body: RestoreBody) =>
       req<BranchDto>(`/api/branches/${id}/restore`, { method: "POST", body: JSON.stringify(body) }),
     reset: (id: string) => req<BranchDto>(`/api/branches/${id}/reset`, { method: "POST" }),
+  },
+  pgBuilds: {
+    list: () => req<PgBuildDto[]>("/api/pg-builds"),
+    check: (majors?: number[]) =>
+      req<Record<string, { tag: string; digest: string; isNew: boolean }>>("/api/pg-builds/check", {
+        method: "POST",
+        body: JSON.stringify({ majors }),
+      }),
+    pull: (a: { major: number; tag?: string }) =>
+      req<{ buildId: string }>("/api/pg-builds/pull", { method: "POST", body: JSON.stringify(a) }),
+    activate: (id: string, consented?: boolean) =>
+      req<PgBuildDto>(`/api/pg-builds/${id}/activate`, { method: "POST", body: JSON.stringify({ consented }) }),
+    remove: (id: string) => req<void>(`/api/pg-builds/${id}`, { method: "DELETE" }),
   },
 };

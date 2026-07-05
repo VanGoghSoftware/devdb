@@ -1,7 +1,7 @@
 import { DEFAULT_PG_VERSION, type PgVersion } from "@devdb/shared";
 import type { StateDb } from "../state/db.js";
 import type { BranchRow, ProjectRow } from "../state/repos.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "./engine-api.js";
 import type { LogsService } from "./logs.js";
 import type { EventsService } from "./events.js";
 import type { Logger } from "../logging/logger.js";
@@ -38,6 +38,15 @@ export interface ProjectsDeps {
   // edits. Optional so the many existing unit tests that construct services directly without an
   // EventsService keep typechecking unchanged.
   events?: EventsService;
+  // Task 8 (dynamic-pg-builds): OPTIONAL here (same rationale as `events?` above) so ProjectsService
+  // stays backward-compatible when constructed without it (old no-guard behavior — see create()
+  // below) — every existing unit test in this file's suite keeps typechecking unchanged.
+  // EndpointsService's OWN deps type (services/endpoints.ts) intersects this with `builds:
+  // BuildsResolverApi` (no `?`), which narrows it to REQUIRED there — production always wires a
+  // real BuildRegistry, and EndpointsService.startLocked() cannot resolve --pgbin without one.
+  // Narrowed to `Pick<..., "installedMajors">` here since that's the only method create()'s guard
+  // consumes — a caller supplying the full BuildsResolverApi still satisfies this structurally.
+  builds?: Pick<BuildsResolverApi, "installedMajors">;
 }
 
 // oracle: tenant config values src/mgmt/service/project.rs:95-108
@@ -58,14 +67,25 @@ export class ProjectsService {
   // something delete()'s correctness depends on).
   constructor(private deps: ProjectsDeps & { logs?: LogsService }) {}
 
-  async create(a: { name: string; pgVersion?: PgVersion }): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
+  // Fix 1 (task-9 gate integration): `opts.internal` is the validation gate's private affordance
+  // (compute/builds/validate.ts) — the gate's `_devdb_validate_<hex>` project must exist to
+  // smoke-test a CANDIDATE build, but (a) its reserved `_` prefix deliberately fails the public
+  // name regex (so users can never squat on/collide with gate names), and (b) the candidate's
+  // major is still `validating`, not `ready`, so installedMajors() doesn't list it yet. Neither
+  // check is meaningful for the gate; both stay MANDATORY for the public callers — REST
+  // POST /api/projects (http/api.ts) and MCP create_project (mcp/tools.ts) pass no opts at all.
+  // Everything else (dup-name 409, engine calls, compensation) applies to internal creates too.
+  async create(
+    a: { name: string; pgVersion?: PgVersion },
+    opts?: { internal?: boolean },
+  ): Promise<{ project: ProjectRow; mainBranch: BranchRow }> {
     const name = a.name.trim();
     // Fix 5 (task-9 fix wave): both DevdbError messages now NAME A REMEDIATION, not just the
     // failure reason — improved here at the service layer (not just in the MCP tool) so
     // REST (POST /api/projects) benefits identically, per this fix's stated preference. A bare
     // "invalid project name"/"already exists" tells a caller WHAT happened but not what to do
     // about it; an agent especially can't self-correct from the reason alone.
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,62}$/.test(name)) {
+    if (!opts?.internal && !/^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,62}$/.test(name)) {
       throw new DevdbError(400,
         `invalid project name: ${JSON.stringify(a.name)} — names must start with a letter or digit and contain only letters, digits, spaces, underscores, or hyphens (max 63 characters)`);
     }
@@ -74,6 +94,20 @@ export class ProjectsService {
         `project "${name}" already exists — choose a different name, or use the existing project (call list_projects to see it)`);
     }
     const pgVersion = a.pgVersion ?? DEFAULT_PG_VERSION;
+    // Task 8 (dynamic-pg-builds): a WHITELIST against builds.installedMajors() — rejects ANY major
+    // not currently installed (not a spot-check of one hardcoded "unsupported" value). Gated on
+    // `deps.builds` being present so callers that construct this service without a BuildRegistry
+    // (e.g. plenty of existing unit tests) keep the pre-Task-8 no-guard behavior unchanged.
+    // PgVersionSchema (packages/shared) only floors at 14 — the registry, not the schema, is now
+    // the source of truth for which majors actually exist on this daemon.
+    // Skipped for internal (gate) creates — see the doc comment above create().
+    if (!opts?.internal && this.deps.builds) {
+      const installed = this.deps.builds.installedMajors();
+      if (!installed.includes(pgVersion)) {
+        throw new DevdbError(400,
+          `Postgres ${pgVersion} is not installed — installed majors: ${installed.join(", ")}. Pull it via POST /api/pg-builds/pull.`);
+      }
+    }
     const projectId = newHexId(); // doubles as tenant id — oracle: project.rs:83-84
 
     await this.deps.storcon.tenantCreate(projectId, TENANT_CONFIG);

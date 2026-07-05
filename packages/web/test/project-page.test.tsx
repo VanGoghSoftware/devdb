@@ -20,7 +20,7 @@ const main: BranchDto = {
   endpointStatus: "running", endpointError: null, port: 54301, connectionString: "postgresql://postgres:pw@localhost:54301/postgres",
   jdbcUrl: "jdbc:postgresql://127.0.0.1:54301/postgres?user=postgres&password=pw&sslmode=disable",
   lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null, ancestorLsn: null,
-  createdAt: "1", updatedAt: "1",
+  createdAt: "1", updatedAt: "1", runningPgVersion: null,
 };
 
 // Fix 1 fixture: a child branch off main, so "Branch from here" on the child has a non-main

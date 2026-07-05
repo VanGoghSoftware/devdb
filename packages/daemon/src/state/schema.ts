@@ -49,4 +49,25 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- pg_builds identity is the image DIGEST (content-address); release_tag is metadata only.
+-- Deliberately NO UNIQUE(major, release_tag): a mutable tag ('latest') re-pulled at a newer
+-- digest is a NEW build under the same tag — the whole point of the update flow.
+CREATE TABLE IF NOT EXISTS pg_builds (
+  id TEXT PRIMARY KEY,
+  major INTEGER NOT NULL,
+  minor INTEGER,
+  source TEXT NOT NULL,
+  release_tag TEXT NOT NULL,
+  image_digest TEXT NOT NULL,
+  path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'downloading',
+  active INTEGER NOT NULL DEFAULT 0,
+  size_bytes INTEGER,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS pg_majors (
+  major INTEGER PRIMARY KEY,
+  last_run_minor INTEGER NOT NULL
+);
 `;

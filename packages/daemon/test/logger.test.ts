@@ -11,6 +11,9 @@ import type { BranchesService } from "../src/services/branches.js";
 import type { EndpointsService } from "../src/services/endpoints.js";
 import type { TimeTravelService } from "../src/services/timetravel.js";
 import type { SqlService } from "../src/services/sql.js";
+import type { BuildRegistry } from "../src/compute/builds/registry.js";
+import type { Provisioner } from "../src/compute/builds/provisioner.js";
+import type { ComputesApi } from "../src/services/engine-api.js";
 
 describe("createLogger", () => {
   it("ingests a formatted line into the daemon:app channel and writes stderr", () => {
@@ -139,6 +142,12 @@ describe("logger -> SSE channel wiring (end-to-end)", () => {
       engine: { status: () => ({}) } as unknown as EngineRuntime,
       logs,
       events: new EventsService(),
+      // Task 10 (dynamic-pg-builds): registry/provisioner/computes are now required on Deps —
+      // this file's route under test (the SSE logs channel) never touches a pg-builds route, so
+      // empty stand-ins are enough, same rationale as the service fakes below.
+      registry: {} as unknown as BuildRegistry,
+      provisioner: {} as unknown as Provisioner,
+      computes: {} as unknown as ComputesApi,
       services: {
         projects: {} as unknown as ProjectsService,
         branches: {} as unknown as BranchesService,

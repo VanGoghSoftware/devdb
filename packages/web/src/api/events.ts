@@ -17,6 +17,10 @@ export function mapEventToKeys(e: DevdbEvent): QueryKey[] {
     }
     case "engine.health":
       return [[...keys.status]];
+    // Task 12 wires the real keys.pgBuilds + api.pgBuilds surface: invalidate both the builds
+    // list (GET /api/pg-builds) and status (StatusDto.pgBuilds still carries the per-major summary).
+    case "pg_builds":
+      return [[...keys.pgBuilds], [...keys.status]];
   }
 }
 

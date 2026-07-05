@@ -14,14 +14,25 @@ vi.mock("../src/api/client.js", () => ({
 }));
 import { api } from "../src/api/client.js";
 import type { BranchDto, ProjectDto, StatusDto } from "@devdb/shared";
+import { SUPPORTED_PG_VERSIONS, DEFAULT_PG_VERSION } from "@devdb/shared";
 
 // FULLY-typed fixtures (repo rule: no `as any`/`as never`, tests included). Because the fixtures
 // carry their DTO types, vi.mocked(api.x).mockResolvedValue(fixture) needs no cast at all —
 // the mock's generic flows from the real module's type through vi.mocked.
+//
+// pgBuilds mirrors SUPPORTED_PG_VERSIONS (Task 14): a real running daemon always reports its
+// registered majors in status, so an empty pgBuilds isn't a realistic "loaded" default — it's the
+// registry-driven-majors tests below (which install their own narrower pgBuilds fixture) that
+// exercise the interesting cases. Keeping this default's majors == the baked list means every
+// OTHER test in this file (create/delete/degraded/etc., none of which care about the majors set)
+// keeps seeing the same PG 14/15/16/17 options and default selection it always has.
 const status: StatusDto = {
   version: "0.1.0", healthy: true,
   engine: { pageserver: { state: "running", pid: 1 }, safekeeper: { state: "running", pid: 2 } },
   portRange: { min: 54300, max: 54339 }, storage: "none",
+  pgBuilds: Object.fromEntries(
+    SUPPORTED_PG_VERSIONS.map((v) => [String(v), { activeVersion: `${v}.0`, source: "baked" as const, degradedDowngrade: false, updateAvailable: null }]),
+  ),
 };
 const projects: ProjectDto[] = [
   { id: "p1", name: "shop-api", pgVersion: 17, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z" },
@@ -31,6 +42,7 @@ const mainBranch: BranchDto = {
   timelineId: "t".repeat(32), endpointStatus: "stopped", endpointError: null, port: null,
   connectionString: null, jdbcUrl: null, lastRecordLsn: null, logicalSizeBytes: null, createdBy: "ui",
   context: null, ancestorLsn: null, createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:00:00Z",
+  runningPgVersion: null,
 };
 
 beforeEach(() => {
@@ -108,6 +120,43 @@ describe("DashboardPage", () => {
 
     // Modal closed on success — the Name field (only present while the modal is mounted/open) is gone.
     await waitForElementToBeRemoved(() => screen.queryByLabelText(/name/i));
+  });
+
+  it("offers exactly the registry-loaded majors (ascending) in the PG version picker, not the baked SUPPORTED_PG_VERSIONS list", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      ...status,
+      pgBuilds: {
+        "16": { activeVersion: "16.10", source: "downloaded", degradedDowngrade: false, updateAvailable: null },
+        "17": { activeVersion: "17.5", source: "baked", degradedDowngrade: false, updateAvailable: null },
+        "18": { activeVersion: "18.1", source: "downloaded", degradedDowngrade: false, updateAvailable: null },
+      },
+    });
+    renderApp(<DashboardPage />);
+    await userEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    await userEvent.click(await screen.findByRole("combobox", { name: /postgresql version/i }));
+
+    // Exactly the three registry majors, ascending — SUPPORTED_PG_VERSIONS' 14/15 must NOT appear.
+    expect(await screen.findByRole("option", { name: "PG 16", hidden: true })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "PG 17", hidden: true })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "PG 18", hidden: true })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "PG 14", hidden: true })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "PG 15", hidden: true })).not.toBeInTheDocument();
+
+    // DEFAULT_PG_VERSION (17) is present among the loaded majors, so it stays the picked value.
+    expect(screen.getByRole("combobox", { name: /postgresql version/i })).toHaveValue("PG 17");
+  });
+
+  it("falls back to the baked SUPPORTED_PG_VERSIONS list while status is still loading", async () => {
+    // Never resolves within the test — mirrors the "loading" state (`useStatus().data` undefined).
+    vi.mocked(api.status).mockReturnValue(new Promise(() => {}));
+    renderApp(<DashboardPage />);
+    await userEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    await userEvent.click(await screen.findByRole("combobox", { name: /postgresql version/i }));
+
+    for (const v of SUPPORTED_PG_VERSIONS) {
+      expect(await screen.findByRole("option", { name: `PG ${v}`, hidden: true })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("combobox", { name: /postgresql version/i })).toHaveValue(`PG ${DEFAULT_PG_VERSION}`);
   });
 
   it("guards project deletion behind window.confirm", async () => {

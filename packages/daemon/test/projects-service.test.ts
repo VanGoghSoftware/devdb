@@ -6,7 +6,7 @@ import { slugify } from "../src/services/slug.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { BranchQueue } from "../src/state/queue.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
 import type { BranchRow } from "../src/state/repos.js";
 import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
@@ -28,6 +28,13 @@ import { loadConfig } from "../src/config.js";
 //
 // Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
 // service's deps now require it (ProjectsDeps), for compensation-path logging.
+//
+// Task 8: `computes` gains `runningPgbin`/`runningPgbins` (tsc-forced by ComputesApi). `builds` is
+// NOT included in this base fakes() bag's return — ProjectsDeps' `builds` field is OPTIONAL and
+// every EXISTING test in this file constructs ProjectsService via `{ state, ...f }` relying on the
+// pre-Task-8 no-guard behavior; the two new tests below build their own `builds` fake inline
+// (mirroring how `queue` is sometimes destructured directly rather than folded into this bag) so
+// that backward-compatibility default stays proven by every other test in the file, unchanged.
 function fakes(): {
   storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
   queue: BranchQueue; logger: Logger;
@@ -53,11 +60,26 @@ function fakes(): {
     statusOf: vi.fn((): EndpointStatus => "stopped"),
     portOf: vi.fn(() => null),
     runningPorts: vi.fn(() => []),
+    runningPgbin: vi.fn(() => null),
+    runningPgbins: vi.fn(() => []),
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
   const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
   return { storcon, pageserver, safekeeper, computes, queue: new BranchQueue(), logger };
+}
+
+// Task 8: a minimal BuildsResolverApi fake carrying only what ProjectsService.create()'s major
+// guard consumes (installedMajors) — ProjectsDeps types this dep as
+// `Pick<BuildsResolverApi, "installedMajors">`, but the full interface fake is supplied anyway so
+// it also satisfies BuildsResolverApi itself where a test wants that.
+function fakeBuilds(installedMajors: number[] = [14, 15, 16, 17]): BuildsResolverApi {
+  return {
+    pgbinFor: vi.fn((major: number) => ({ path: `/b/v${major}/bin/postgres`, version: `${major}.10`, buildId: `dl-${major}-t` })),
+    versionForPgbin: vi.fn(() => null),
+    recordRun: vi.fn(),
+    installedMajors: vi.fn(() => installedMajors),
+  };
 }
 
 describe("slugify", () => {
@@ -93,6 +115,94 @@ describe("ProjectsService", () => {
     expect(mainBranch.name).toBe("main");
     expect(mainBranch.parentBranchId).toBeNull();
     expect(state.branches.byProjectAndName(project.id, "main")).not.toBeNull();
+  });
+
+  // Task 8: the project-create major guard — a WHITELIST against builds.installedMajors(),
+  // rejecting ANY major not in that list (not a spot-check of one hardcoded "unsupported" value).
+  // Gated on `deps.builds` being PRESENT: when the caller supplies no builds dep at all, create()
+  // must fall back to the pre-Task-8 no-guard behavior unchanged (every other test in this file
+  // exercises exactly that default, via `fakes()`'s bag which carries no `builds` key).
+  describe("create() major guard (Task 8)", () => {
+    it("rejects a major the registry doesn't know", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "p", pgVersion: 18 }))
+        .rejects.toThrow(/not installed — installed majors: 14, 15, 16, 17/);
+      await expect(svc.create({ name: "p", pgVersion: 18 })).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    // A whitelist, not a spot-check: an absurdly out-of-range major must be rejected exactly like
+    // 18 is — proving the guard isn't hardcoded against some specific "known bad" value.
+    it("rejects a wildly-out-of-range major (whitelist, not a spot-check of one value)", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "p", pgVersion: 999 }))
+        .rejects.toThrow(/not installed — installed majors: 14, 15, 16, 17/);
+    });
+
+    it("create accepts a registry-known major and stays backward-compatible when builds dep absent", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svcWithBuilds = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svcWithBuilds.create({ name: "known", pgVersion: 16 })).resolves.toBeDefined();
+
+      // Old behavior: no `builds` key at all (not even `builds: undefined`) — create() must not
+      // guard, so a major the registry (if it existed) wouldn't recognize still resolves.
+      const state2 = openState(":memory:");
+      const svcNoBuilds = new ProjectsService({ state: state2, ...f });
+      await expect(svcNoBuilds.create({ name: "unguarded", pgVersion: 18 })).resolves.toBeDefined();
+    });
+  });
+
+  // Fix 1 (task-9 gate integration): the validation gate's OWN project must get past both public
+  // guards — its reserved `_devdb_validate_` prefix deliberately fails the name regex (users can
+  // never squat/collide with gate names), and the candidate major is still `validating`, not yet
+  // in installedMajors(). `internal: true` is the gate's private affordance for exactly those two
+  // checks; everything else (dup-name 409, engine calls, compensation) applies to internal creates
+  // unchanged, and NO public caller (REST POST /api/projects, MCP create_project) passes opts.
+  describe("create() internal option (Fix 1, task-9 gate integration)", () => {
+    it("internal create bypasses BOTH the name regex and the installed-major guard — real guards active", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      // 18 is NOT in installedMajors() (a mid-gate candidate is still `validating`), and the
+      // leading underscore fails the public regex — the PUBLIC form of this exact call is proven
+      // to reject in the two tests below.
+      const { project, mainBranch } = await svc.create(
+        { name: "_devdb_validate_x", pgVersion: 18 }, { internal: true },
+      );
+      expect(project.name).toBe("_devdb_validate_x");
+      expect(project.pgVersion).toBe(18);
+      expect(mainBranch.name).toBe("main");
+      expect(state.projects.byName("_devdb_validate_x")).not.toBeNull();
+    });
+
+    it("public create (no opts) still rejects the underscore-prefixed name with 400", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "_devdb_validate_x" })).rejects.toMatchObject({ statusCode: 400 });
+      await expect(svc.create({ name: "_devdb_validate_x" })).rejects.toThrow(/invalid project name/);
+    });
+
+    it("public create (no opts) still rejects an uninstalled major with 400", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([14, 15, 16, 17]) });
+      await expect(svc.create({ name: "ok", pgVersion: 18 })).rejects.toMatchObject({ statusCode: 400 });
+      await expect(svc.create({ name: "ok2", pgVersion: 18 })).rejects.toThrow(/not installed/);
+    });
+
+    it("internal create keeps the duplicate-name 409 — only the two gate-blocking checks are skipped", async () => {
+      const f = fakes();
+      const state = openState(":memory:");
+      const svc = new ProjectsService({ state, ...f, builds: fakeBuilds([17]) });
+      await svc.create({ name: "_devdb_validate_dup", pgVersion: 17 }, { internal: true });
+      await expect(svc.create({ name: "_devdb_validate_dup", pgVersion: 17 }, { internal: true }))
+        .rejects.toMatchObject({ statusCode: 409 });
+    });
   });
 
   it("rejects duplicate project names with 409", async () => {

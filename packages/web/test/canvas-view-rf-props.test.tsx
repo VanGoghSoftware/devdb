@@ -34,7 +34,7 @@ function b(id: string, parent: string | null, over: Partial<BranchDto> = {}): Br
     id, projectId: "p1", parentBranchId: parent, name: id, slug: `${id}-s`, timelineId: "t".repeat(32),
     endpointStatus: "stopped", endpointError: null, port: null, connectionString: null, jdbcUrl: null,
     lastRecordLsn: null, logicalSizeBytes: null, createdBy: "api", context: null, ancestorLsn: null,
-    createdAt: id, updatedAt: id, ...over,
+    createdAt: id, updatedAt: id, runningPgVersion: null, ...over,
   };
 }
 

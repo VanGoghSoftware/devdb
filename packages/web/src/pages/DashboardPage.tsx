@@ -33,22 +33,30 @@ function EngineStrip() {
 
 function CreateProjectModal(a: { opened: boolean; onClose: () => void }) {
   const create = useCreateProject();
+  const { data: status } = useStatus();
   const [name, setName] = useState("");
   const [pg, setPg] = useState(String(DEFAULT_PG_VERSION));
+  // Runtime source of truth for installed majors is the daemon's BuildRegistry (status.pgBuilds);
+  // SUPPORTED_PG_VERSIONS is only the baked-image fallback while status hasn't loaded yet.
+  const majors = status ? Object.keys(status.pgBuilds).map(Number).sort((x, y) => x - y) : [...SUPPORTED_PG_VERSIONS];
+  // Clamp: if the currently-picked value isn't among the loaded majors (e.g. DEFAULT_PG_VERSION
+  // wasn't actually installed), fall back to the highest available rather than pass the Select a
+  // value absent from its own `data`.
+  const effectivePg = majors.includes(Number(pg)) ? pg : String(majors.at(-1) ?? DEFAULT_PG_VERSION);
   return (
     <Modal opened={a.opened} onClose={a.onClose} title="New project">
       <Stack>
         <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} data-autofocus />
         <Select
           label="PostgreSQL version"
-          data={SUPPORTED_PG_VERSIONS.map((v) => ({ value: String(v), label: `PG ${v}` }))}
-          value={pg}
+          data={majors.map((v) => ({ value: String(v), label: `PG ${v}` }))}
+          value={effectivePg}
           onChange={(v) => v && setPg(v)}
         />
         <Button
           loading={create.isPending}
           disabled={name.trim() === ""}
-          onClick={() => create.mutate({ name: name.trim(), pgVersion: Number(pg) }, { onSuccess: a.onClose })}
+          onClick={() => create.mutate({ name: name.trim(), pgVersion: Number(effectivePg) }, { onSuccess: a.onClose })}
         >
           Create
         </Button>

@@ -29,6 +29,22 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 const realFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 
+// Task 8: allocatePort is spied (not fully replaced) so every EXISTING test in this file keeps
+// its real bind-and-probe behavior (including the exhaustion tests, which depend on genuinely
+// running out of real ports) — the default implementation below just calls straight through to
+// the real function. Only the new --pgbin/runningPgbin test overrides this per-call via
+// mockResolvedValueOnce, so it never touches a real socket regardless of what else is bound on
+// the host (this environment currently has a container holding the entire default port range —
+// see docs/superpowers/sdd/progress.md's ENV NOTE — so real-bind tests in THIS file already fail
+// here; the new test must not add to that list by depending on a real bind of its own).
+const allocatePortMock = vi.hoisted(() => vi.fn());
+vi.mock("../src/compute/ports.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/compute/ports.js")>();
+  allocatePortMock.mockImplementation(actual.allocatePort);
+  return { ...actual, allocatePort: allocatePortMock };
+});
+const realAllocatePort = (await vi.importActual<typeof import("../src/compute/ports.js")>("../src/compute/ports.js")).allocatePort;
+
 import { loadConfig } from "../src/config.js";
 import { newHexId } from "../src/engine/ids.js";
 import { ComputeManager } from "../src/compute/manager.js";
@@ -109,6 +125,8 @@ describe("ComputeManager", () => {
     stopMock.mockImplementation(async () => {});
     rmMock.mockReset();
     rmMock.mockImplementation(realFs.rm);
+    allocatePortMock.mockReset();
+    allocatePortMock.mockImplementation(realAllocatePort);
     ManagedProcessMock.mockClear();
   });
 
@@ -119,7 +137,12 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, probe);
     const branch = fakeBranch();
 
-    const { port } = await manager.start({ branch, pgVersion: 17 });
+    // Task 8: pgbinPath is deliberately NOT under cfg.pgInstallDir/v{pgVersion} — this test's own
+    // --pgbin assertion below must prove byte-exact PASS-THROUGH of the caller-resolved path, not
+    // coincidentally match a value that could ALSO have come from the old
+    // join(pgInstallDir, `v${pgVersion}`, "bin", "postgres") derivation this task removed.
+    const pgbinPath = "/data/pg_builds/v17/deadbeef/bin/postgres";
+    const { port } = await manager.start({ branch, pgVersion: 17, pgbinPath });
 
     expect(ManagedProcessMock).toHaveBeenCalledTimes(1);
     const opts = ManagedProcessMock.mock.calls[0]![0] as {
@@ -145,7 +168,7 @@ describe("ComputeManager", () => {
 
     expect(opts.args).toEqual([
       "--pgdata", join(dir, "pg_data"),
-      "--pgbin", join(cfg.pgInstallDir, "v17", "bin", "postgres"),
+      "--pgbin", pgbinPath,
       "--compute-id", `compute-${branch.timelineId}`,
       "--connstr", `postgresql://cloud_admin@localhost:${port}/postgres`,
       "--config", join(dir, "config.json"),
@@ -194,7 +217,7 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
 
-    const firstStart = manager.start({ branch, pgVersion: 17 });
+    const firstStart = manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
 
     // The map slot is reserved synchronously before the first await inside start(), but the
     // first call still needs to run its own setup (port alloc, dir/file writes) before it
@@ -202,7 +225,7 @@ describe("ComputeManager", () => {
     // concurrent-in-flight case, not a race against the first call's own microtasks.
     await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow(/already/);
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow(/already/);
 
     releaseFirstStart();
     await firstStart;
@@ -214,7 +237,7 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl exploded");
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow("compute_ctl exploded");
 
     expect(manager.statusOf(branch.id)).toBe("stopped");
     expect(manager.portOf(branch.id)).toBeNull();
@@ -226,7 +249,7 @@ describe("ComputeManager", () => {
     // Ports must have been released, or a fresh start (also on this same branch) would throw
     // PortExhaustedError/hang re-binding a still-reserved port instead of proceeding normally.
     startMock.mockResolvedValueOnce(undefined);
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: expect.any(Number) });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: expect.any(Number) });
   });
 
   // start()'s failure cleanup shares stop()'s reap+rm discipline (removeComputeDir): a launch
@@ -251,7 +274,7 @@ describe("ComputeManager", () => {
       );
     });
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl not ready within 50000ms");
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow("compute_ctl not ready within 50000ms");
 
     expect(rmMock).toHaveBeenCalledTimes(2);
     expect(dirSeen).not.toBe("");
@@ -259,7 +282,7 @@ describe("ComputeManager", () => {
     expect(manager.statusOf(branch.id)).toBe("stopped");
 
     startMock.mockResolvedValueOnce(undefined);
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: expect.any(Number) });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: expect.any(Number) });
   });
 
   // The two hazards the old inline failure-path rm (no try/catch) had beyond the ENOTEMPTY race
@@ -277,7 +300,7 @@ describe("ComputeManager", () => {
       throw Object.assign(new Error("ENOTEMPTY: directory not empty"), { code: "ENOTEMPTY" });
     });
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute_ctl exploded");
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow("compute_ctl exploded");
     expect(rmMock).toHaveBeenCalledTimes(2); // bounded: first attempt + exactly one retry
     expect(manager.statusOf(branch.id)).toBe("stopped");
     expect(manager.portOf(branch.id)).toBeNull(); // a stale map entry would still report 54332
@@ -291,7 +314,7 @@ describe("ComputeManager", () => {
     startMock.mockResolvedValueOnce(undefined);
     // Same branch, single-port range: this resolves only if the failed start released BOTH the
     // map entry (else "already ...") and the reserved port (else PortExhaustedError).
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54332 });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: 54332 });
   });
 
   // Fix 1 (review): `onLine` supplied to start()'s args must be registered at map-reservation
@@ -309,7 +332,7 @@ describe("ComputeManager", () => {
     const branch = fakeBranch();
     const received: string[] = [];
 
-    const startPromise = manager.start({ branch, pgVersion: 17, onLine: (line) => received.push(line) });
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres", onLine: (line) => received.push(line) });
 
     // Wait for the ManagedProcess constructor call (setup — port alloc, dir/file writes — has
     // completed) so the fanout closure passed to ManagedProcess's `onLine` opt actually exists,
@@ -340,7 +363,7 @@ describe("ComputeManager", () => {
     const branch = fakeBranch();
     const received: string[] = [];
 
-    const startPromise = manager.start({ branch, pgVersion: 17, onLine: (line) => received.push(line) });
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres", onLine: (line) => received.push(line) });
 
     await vi.waitFor(() => expect(ManagedProcessMock).toHaveBeenCalledTimes(1));
     const opts = ManagedProcessMock.mock.calls[0]![0] as { onLine: (line: string, stream: "stdout" | "stderr") => void };
@@ -360,7 +383,7 @@ describe("ComputeManager", () => {
     const cfg = freshCfg();
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
-    await manager.start({ branch, pgVersion: 17 });
+    await manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
 
     const computesDir = join(cfg.dataDir, "computes");
     const childrenBefore = await readdir(computesDir);
@@ -386,7 +409,7 @@ describe("ComputeManager", () => {
     const cfg = freshCfg();
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
-    await manager.start({ branch, pgVersion: 17 });
+    await manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
 
     const computesDir = join(cfg.dataDir, "computes");
     const children = await readdir(computesDir);
@@ -419,7 +442,7 @@ describe("ComputeManager", () => {
     const cfg = freshCfg({ DEVDB_PORT_RANGE: "54331-54331" });
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54331 });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: 54331 });
     const computesDir = join(cfg.dataDir, "computes");
     const [child] = await readdir(computesDir);
     const dir = join(computesDir, child!);
@@ -439,7 +462,7 @@ describe("ComputeManager", () => {
     rmMock.mockReset();
     rmMock.mockImplementation(realFs.rm);
     startMock.mockResolvedValueOnce(undefined);
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54331 });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: 54331 });
   });
 
   it("isolates onLine listeners: a throwing listener does not prevent later listeners from receiving the line", async () => {
@@ -447,7 +470,7 @@ describe("ComputeManager", () => {
     const cfg = freshCfg();
     const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady(), undefined, fakeProbe());
     const branch = fakeBranch();
-    await manager.start({ branch, pgVersion: 17 });
+    await manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
 
     const opts = ManagedProcessMock.mock.calls[0]![0] as { onLine: (line: string, stream: "stdout" | "stderr") => void };
 
@@ -478,7 +501,7 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady, undefined, fakeProbe());
     const branch = fakeBranch();
 
-    const startPromise = manager.start({ branch, pgVersion: 17 });
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
 
     // Wait for the mocked ManagedProcess.start() to resolve — the point at which the real
     // ManagedProcess would have already flipped proc.state to "running" (the needle fired).
@@ -511,7 +534,7 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), deferredWaitReady, undefined, fakeProbe());
     const branch = fakeBranch();
 
-    void manager.start({ branch, pgVersion: 17 }).catch(() => {});
+    void manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" }).catch(() => {});
 
     await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
     const constructedProc = ManagedProcessMock.mock.results[0]!.value as { state: string };
@@ -542,7 +565,7 @@ describe("ComputeManager", () => {
     const manager = new ComputeManager(cfg, fakeLogger(), failingWaitReady, undefined, fakeProbe());
     const branch = fakeBranch();
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute readiness timed out after 50000ms");
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow("compute readiness timed out after 50000ms");
 
     expect(manager.statusOf(branch.id)).toBe("stopped");
     expect(manager.portOf(branch.id)).toBeNull();
@@ -550,7 +573,7 @@ describe("ComputeManager", () => {
     // Single-port range: this only resolves if the failed start released the reserved port
     // despite proc.stop() having rejected during its cleanup.
     startMock.mockResolvedValueOnce(undefined);
-    await expect(manager.start({ branch, pgVersion: 17 })).resolves.toEqual({ port: 54333 });
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).resolves.toEqual({ port: 54333 });
   });
 
   // Task 3 (phase 3): onStatusChange is the async-observer seam index.ts wires to /api/events —
@@ -576,7 +599,7 @@ describe("ComputeManager", () => {
       fakeProbe(),
     );
 
-    const startPromise = manager.start({ branch, pgVersion: 17 });
+    const startPromise = manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
     await vi.waitFor(() => expect(startMock).toHaveBeenCalledTimes(1));
     const constructedProc = ManagedProcessMock.mock.results[0]!.value as { state: string };
     constructedProc.state = "running"; // needle fired — models the real class's own transition
@@ -607,7 +630,7 @@ describe("ComputeManager", () => {
       fakeProbe(),
     );
 
-    await expect(manager.start({ branch, pgVersion: 17 })).rejects.toThrow("compute readiness timed out after 50000ms");
+    await expect(manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" })).rejects.toThrow("compute readiness timed out after 50000ms");
 
     expect(ticks[ticks.length - 1]).toBe("stopped"); // entry deleted by the catch's cleanup
   });
@@ -627,7 +650,7 @@ describe("ComputeManager", () => {
       fakeProbe(),
     );
 
-    await manager.start({ branch, pgVersion: 17 });
+    await manager.start({ branch, pgVersion: 17, pgbinPath: "/usr/local/share/neon/pg_install/v17/bin/postgres" });
     ticks.length = 0; // only care about what happens after start() has already settled
 
     const opts = ManagedProcessMock.mock.calls[0]![0] as { onStateChange?: (s: string) => void };
@@ -636,5 +659,43 @@ describe("ComputeManager", () => {
 
     expect(ticks).toHaveLength(1);
     expect(ticks[0]).toMatch(new RegExp(`^${branch.id}:`));
+  });
+
+  // Task 8: start() now takes a caller-RESOLVED pgbinPath (the BuildRegistry's active build for
+  // this project's major, resolved by EndpointsService — see endpoints.ts) instead of joining
+  // `pgInstallDir/v{pgVersion}/bin/postgres` itself. This is what makes "adopt on restart"
+  // structural: ComputeManager has no opinion on WHICH build backs a version, it just launches
+  // whatever path it's handed. allocatePortMock is overridden here (not the real bind) so this
+  // test never depends on a real free port existing in cfg.portRange — this environment currently
+  // has that whole range externally held (see the allocatePortMock doc comment above), and this
+  // test's whole point is the --pgbin arg / runningPgbin(), not port allocation.
+  it("start passes the caller-resolved pgbinPath to compute_ctl --pgbin and exposes it via runningPgbin", async () => {
+    startMock.mockResolvedValueOnce(undefined);
+    allocatePortMock
+      .mockResolvedValueOnce(54300) // main compute port
+      .mockResolvedValueOnce(40100) // metrics (external-http) port
+      .mockResolvedValueOnce(40101); // internal-http port
+    const cfg = freshCfg();
+    const manager = new ComputeManager(cfg, fakeLogger(), fakeWaitReady());
+    const branch = fakeBranch();
+    const pgbinPath = "/data/pg_builds/v16/9124/bin/postgres";
+
+    await manager.start({ branch, pgVersion: 16, pgbinPath });
+
+    const opts = ManagedProcessMock.mock.calls[0]![0] as { args: string[] };
+    // Byte-exact: the caller-resolved path is passed through verbatim, NOT a
+    // pgInstallDir-joined path built from pgVersion.
+    const pgbinIdx = opts.args.indexOf("--pgbin");
+    expect(pgbinIdx).toBeGreaterThanOrEqual(0);
+    expect(opts.args[pgbinIdx + 1]).toBe(pgbinPath);
+    expect(opts.args).not.toContain(join(cfg.pgInstallDir, "v16", "bin", "postgres"));
+
+    expect(manager.runningPgbin(branch.id)).toBe(pgbinPath);
+    expect(manager.runningPgbins()).toEqual([pgbinPath]);
+
+    await manager.stop(branch.id);
+
+    expect(manager.runningPgbin(branch.id)).toBeNull();
+    expect(manager.runningPgbins()).toEqual([]);
   });
 });

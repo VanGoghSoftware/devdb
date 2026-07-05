@@ -19,6 +19,10 @@ interface RunningCompute {
   dir: string | null;
   listeners: Array<(line: string) => void>;
   phase: "starting" | "running" | "stopping";
+  // Task 8: the caller-resolved --pgbin path this entry was (or is being) launched with — set in
+  // the SAME synchronous reservation tick as the other entry fields below, before the first
+  // await, so a concurrent runningPgbin() call can never observe a half-started entry missing it.
+  pgbinPath: string | null;
 }
 
 export class ComputeManager {
@@ -81,6 +85,18 @@ export class ComputeManager {
       .map(([branchId, c]) => ({ branchId, port: c.port as number }));
   }
 
+  // Task 8: unlike runningPorts() above, NOT phase-gated to "running" — a caller resolving
+  // runningPgVersion (BranchesService.detail()) wants to know the path for the whole entry
+  // lifetime (starting/running/stopping), not just once fully up; assertRemovable's in-use check
+  // (BuildRegistry) also wants every currently-claimed path regardless of phase.
+  runningPgbin(branchId: string): string | null {
+    return this.computes.get(branchId)?.pgbinPath ?? null;
+  }
+
+  runningPgbins(): string[] {
+    return [...this.computes.values()].map((e) => e.pgbinPath).filter((p): p is string => p !== null);
+  }
+
   onLine(branchId: string, cb: (line: string) => void): () => void {
     const c = this.computes.get(branchId);
     if (!c) return () => {};
@@ -101,15 +117,18 @@ export class ComputeManager {
   // any SSE client tailing it. Registering the listener in the SAME synchronous tick that reserves
   // the map slot means it's live for the entire lifetime of this compute entry — launch, running,
   // and (via ComputeManager's own listener fanout closure below) right up to the process exiting.
-  async start(a: { branch: BranchRow; pgVersion: PgVersion; onLine?: (line: string) => void }): Promise<{ port: number }> {
+  async start(a: { branch: BranchRow; pgVersion: PgVersion; pgbinPath: string; onLine?: (line: string) => void }): Promise<{ port: number }> {
     const existing = this.computes.get(a.branch.id);
     if (existing) {
       throw new Error(`endpoint for branch ${a.branch.name} already ${this.statusOf(a.branch.id)}`);
     }
     // Reserve the map slot synchronously (before the first await) so a concurrent start()
     // for the same branch sees this entry immediately instead of racing past the check above.
+    // pgbinPath is set in this SAME tick (not assigned later) so a concurrent runningPgbin() call
+    // can never observe a reserved-but-pgbinPath-less entry.
     const entry: RunningCompute = {
       proc: null, port: null, metricsPort: null, internalHttpPort: null, dir: null, listeners: [], phase: "starting",
+      pgbinPath: a.pgbinPath,
     };
     if (a.onLine) entry.listeners.push(a.onLine);
     this.computes.set(a.branch.id, entry);
@@ -154,7 +173,7 @@ export class ComputeManager {
         bin: join(this.cfg.neonBinDir, "compute_ctl"),
         args: [
           "--pgdata", join(dir, "pg_data"),
-          "--pgbin", join(this.cfg.pgInstallDir, `v${a.pgVersion}`, "bin", "postgres"),
+          "--pgbin", a.pgbinPath,
           "--compute-id", `compute-${a.branch.timelineId}`,
           "--connstr", `postgresql://cloud_admin@localhost:${port}/postgres`,
           "--config", configPath,

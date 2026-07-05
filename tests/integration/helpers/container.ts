@@ -1,5 +1,5 @@
 import { execa } from "execa";
-import { GenericContainer, Wait, type StartedTestContainer } from "testcontainers";
+import { GenericContainer, Wait, type StartedNetwork, type StartedTestContainer } from "testcontainers";
 
 const IMAGE = "devdb:dev";
 let built = false;
@@ -64,16 +64,24 @@ export interface Devdb {
   stop(): Promise<void>;
 }
 
-export async function startDevdb(env: Record<string, string> = {}): Promise<Devdb> {
+export async function startDevdb(
+  env: Record<string, string> = {},
+  opts: { network?: StartedNetwork } = {},
+): Promise<Devdb> {
   await buildImage();
   const endpointPorts = Array.from({ length: 10 }, (_, i) => 54300 + i);
   const exposedPorts = [4400, ...endpointPorts];
-  const container = await new GenericContainer(IMAGE)
+  const unstarted = new GenericContainer(IMAGE)
     .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
     .withExposedPorts(...exposedPorts)
     .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
-    .withStartupTimeout(240_000)
-    .start();
+    .withStartupTimeout(240_000);
+  // Task 15 (dynamic-pg-builds), additive: pg-builds.test.ts puts the daemon on a shared
+  // user-defined network with its hermetic fixture registry (network alias `pgregistry`) so the
+  // daemon's OCI client can dial it by name. Callers that omit `opts` keep the default bridge
+  // network and the exact pre-existing behavior.
+  if (opts.network) unstarted.withNetwork(opts.network);
+  const container = await unstarted.start();
   assertAllPortsBound(container, exposedPorts);
 
   return {

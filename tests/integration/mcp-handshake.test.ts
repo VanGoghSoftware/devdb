@@ -48,14 +48,21 @@ describe("mcp handshake", () => {
   // delete_branch, reset_branch, restore_branch) alongside Task 9's original 5, bringing the full
   // MCP surface to 10 — this assertion now covers all of them so a future registration drift here
   // is caught at the handshake level, not just in mcp-tools.test.ts's unit-level registration check.
-  it("lists all 10 registered tools via a real tools/list round-trip", async () => {
+  //
+  // Updated for dynamic-pg-builds Tasks 12-13: four pg-build tools joined the surface
+  // (list_pg_builds, check_pg_updates, pull_pg_build, activate_pg_build — deliberately NO MCP
+  // delete, that stays REST/UI-only), bringing the total to 14. Those tasks' commits (cfec31c,
+  // ec0027a) registered the tools without updating this handshake-level list; Task 15's
+  // full-suite gate caught the drift — exactly the failure mode this assertion exists to catch.
+  it("lists all 14 registered tools via a real tools/list round-trip", async () => {
     const client = new Client({ name: "test", version: "1.0.0" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${dev.base}/mcp`)));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
-        "create_branch", "create_project", "delete_branch", "get_branch", "get_status",
-        "list_branches", "list_projects", "reset_branch", "restore_branch", "stop_endpoint",
+        "activate_pg_build", "check_pg_updates", "create_branch", "create_project",
+        "delete_branch", "get_branch", "get_status", "list_branches", "list_pg_builds",
+        "list_projects", "pull_pg_build", "reset_branch", "restore_branch", "stop_endpoint",
       ].sort(),
     );
     await client.close();

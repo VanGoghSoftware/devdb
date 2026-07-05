@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 
 const ENGINE_PORTS = {
@@ -23,6 +23,8 @@ const EnvSchema = z.object({
   DEVDB_MCP_ALLOWED_HOSTS: z.string().optional(),
   DEVDB_MCP_ALLOWED_ORIGINS: z.string().optional(),
   DEVDB_WEB_DIST: z.string().optional(),
+  DEVDB_PG_REGISTRY_BASE: z.string().optional(),
+  DEVDB_PG_IMAGE_TEMPLATE: z.string().optional(),
 });
 
 export interface DevdbConfig {
@@ -44,6 +46,10 @@ export interface DevdbConfig {
   mcpAllowedHosts: string[];
   mcpAllowedOrigins: string[];
   webDistDir: string | null;
+  pgRegistryBase: string;
+  pgImageTemplate: string;
+  pgBuildsDir: string;
+  pgDistribDir: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
@@ -100,6 +106,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
   }
   const webDistDir = webDistDirRaw;
 
+  // Dynamic PG builds (spec 2026-07-04): overrides exist for mirrors/air-gap AND for the hermetic
+  // integration fixture registry. http:// is allowed deliberately (the fixture, an in-network
+  // registry:2, has no TLS) — the DEFAULT stays https to Docker Hub.
+  const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://registry-1.docker.io").replace(/\/+$/, "");
+  if (!/^https?:\/\//.test(pgRegistryBase)) {
+    throw new Error(`DEVDB_PG_REGISTRY_BASE must be an http(s) URL, got: ${pgRegistryBase}`);
+  }
+  const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "neondatabase/compute-node-v{major}";
+  if (!pgImageTemplate.includes("{major}")) {
+    throw new Error(`DEVDB_PG_IMAGE_TEMPLATE must contain the literal {major} placeholder, got: ${pgImageTemplate}`);
+  }
+
   return {
     httpPort,
     dataDir: e.DEVDB_DATA_DIR,
@@ -110,5 +128,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     mcpAllowedHosts: e.DEVDB_MCP_ALLOWED_HOSTS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
     mcpAllowedOrigins: e.DEVDB_MCP_ALLOWED_ORIGINS?.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
     webDistDir,
+    pgRegistryBase,
+    pgImageTemplate,
+    pgBuildsDir: join(e.DEVDB_DATA_DIR, "pg_builds"),
+    pgDistribDir: join(e.DEVDB_DATA_DIR, "pg_distrib"),
   };
 }

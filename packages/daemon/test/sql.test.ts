@@ -279,4 +279,66 @@ describe("SqlService", () => {
     await expect(sql.run("branch-1", "SELECT 1")).rejects.toThrow(/connection refused/);
     expect(mockConnect).toHaveBeenCalledTimes(1);
   });
+
+  // ——— Fix 2 (task-9 gate integration): noAutoStart mode ———
+  // The default path's ensureRunning shares startLocked's crash recovery, which restarts a FAILED
+  // compute with the currently-ACTIVE build's pgbin — for POST /api/sql that recovery is the
+  // feature, but the validation gate's smoke SQL would silently run against the WRONG build if
+  // the candidate crashed after startWithPgbin. noAutoStart reads the endpoint's CURRENT state
+  // via branches.detail (connectionString/port non-null only while actually running) and hard-502s
+  // instead of starting anything.
+  describe("noAutoStart (validation-gate mode)", () => {
+    // Only name/port/connectionString/password are consumed by run(); byIdOr404's row only feeds
+    // detail(). Same narrowly-scoped cast idiom as fakeBranches()/fakeEndpoints() above.
+    function fakeBranchesWithDetail(a: { running: boolean; port?: number; password?: string }) {
+      const port = a.port ?? 54311;
+      const detail = {
+        id: "branch-1", name: "main", password: a.password ?? "gate-pw",
+        port: a.running ? port : null,
+        connectionString: a.running ? `postgresql://postgres:pw@localhost:${port}/postgres` : null,
+      };
+      const byIdOr404 = vi.fn((id: string) => ({ id, name: "main" }));
+      const detailSpy = vi.fn(async () => detail);
+      const branches = { byIdOr404, detail: detailSpy } as unknown as BranchesService;
+      return { branches, byIdOr404, detailSpy };
+    }
+
+    it("never calls ensureRunning; a non-running endpoint is a hard 502 and no client is ever constructed", async () => {
+      const { branches, byIdOr404, detailSpy } = fakeBranchesWithDetail({ running: false });
+      const { endpoints } = fakeEndpoints();
+      const sql = new SqlService({ branches, endpoints });
+
+      await expect(sql.run("branch-1", "SELECT version()", { noAutoStart: true }))
+        .rejects.toMatchObject({ statusCode: 502 });
+      expect(endpoints.ensureRunning).not.toHaveBeenCalled();
+      expect(byIdOr404).toHaveBeenCalledWith("branch-1");
+      expect(detailSpy).toHaveBeenCalledTimes(1);
+      expect(ClientMock).not.toHaveBeenCalled();
+    });
+
+    it("queries the CURRENT endpoint when it is running — still without ensureRunning", async () => {
+      const { branches } = fakeBranchesWithDetail({ running: true, port: 54322, password: "gate-pw" });
+      const { endpoints } = fakeEndpoints();
+      const sql = new SqlService({ branches, endpoints });
+      mockQuery.mockResolvedValueOnce({ rows: [{ v: 1 }], rowCount: 1, fields: [{ name: "v" }] });
+
+      const out = await sql.run("branch-1", "SELECT 1 AS v", { noAutoStart: true });
+
+      expect(out.rows).toEqual([{ v: 1 }]);
+      expect(endpoints.ensureRunning).not.toHaveBeenCalled();
+      expect(ClientMock).toHaveBeenCalledWith(expect.objectContaining({ port: 54322, password: "gate-pw" }));
+    });
+
+    it("the default path (no opts) keeps auto-starting via ensureRunning — POST /api/sql behavior unchanged", async () => {
+      const { branches, byIdOr404, detailSpy } = fakeBranchesWithDetail({ running: false });
+      const { endpoints } = fakeEndpoints();
+      const sql = new SqlService({ branches, endpoints });
+
+      await sql.run("branch-1", "SELECT 1");
+
+      expect(endpoints.ensureRunning).toHaveBeenCalledWith("branch-1");
+      expect(byIdOr404).not.toHaveBeenCalled();
+      expect(detailSpy).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -9,7 +9,7 @@ import { TimeTravelService } from "../src/services/timetravel.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { EngineApiError } from "../src/engine/http.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
 import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
@@ -28,6 +28,7 @@ function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetai
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
     port: 54300, connectionString: null, jdbcUrl: null, lastRecordLsn: null,
     logicalSizeBytes: null, ancestorLsn: null,
+    runningPgVersion: null, // Task 8
     ...overrides,
   };
 }
@@ -38,8 +39,16 @@ function branchDetailFixture(overrides: Partial<BranchDetail> = {}): BranchDetai
 //
 // Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
 // service's deps now require it (ProjectsDeps), for compensation-path logging.
+//
+// Task 8: `builds` joins the bag — EndpointsService (constructed via `...f` below) now REQUIRES
+// it to resolve --pgbin per start. TimeTravelService itself never reads `builds` (it only
+// delegates to BranchesService/EndpointsService, which already carry their own copies), so a
+// plain always-succeeds default is enough here — none of this file's tests exercise the
+// pgbinFor/installedMajors/recordRun paths directly (see endpoints-service.test.ts /
+// projects-service.test.ts for that coverage).
 function fakes(): {
-  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
+  storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi;
+  builds: BuildsResolverApi; logger: Logger;
 } {
   const storcon: StorconApi = {
     tenantCreate: vi.fn(async () => {}),
@@ -65,11 +74,21 @@ function fakes(): {
     statusOf: vi.fn((): EndpointStatus => "stopped"),
     portOf: vi.fn(() => null),
     runningPorts: vi.fn(() => []),
+    // Task 8: ComputesApi grew these two members (tsc-forced on every fake) — TimeTravelService
+    // itself never calls either, so a plain never-running default is enough here.
+    runningPgbin: vi.fn(() => null),
+    runningPgbins: vi.fn(() => []),
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
+  const builds: BuildsResolverApi = {
+    pgbinFor: vi.fn((major: number) => ({ path: `/b/v${major}/bin/postgres`, version: `${major}.10`, buildId: `dl-${major}-t` })),
+    versionForPgbin: vi.fn(() => null),
+    recordRun: vi.fn(),
+    installedMajors: vi.fn(() => [14, 15, 16, 17]),
+  };
   const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
-  return { storcon, pageserver, safekeeper, computes, logger };
+  return { storcon, pageserver, safekeeper, computes, builds, logger };
 }
 
 // TimeTravelService depends on EndpointsService only through its unqueued *Locked internals

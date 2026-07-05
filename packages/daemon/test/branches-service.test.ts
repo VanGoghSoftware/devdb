@@ -6,7 +6,7 @@ import { ProjectsService } from "../src/services/projects.js";
 import { LogsService } from "../src/services/logs.js";
 import { EventsService } from "../src/services/events.js";
 import { EngineApiError } from "../src/engine/http.js";
-import type { ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
+import type { BuildsResolverApi, ComputesApi, PageserverApi, SafekeeperApi, StorconApi } from "../src/services/engine-api.js";
 import type { Logger } from "../src/logging/logger.js";
 import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 
@@ -16,6 +16,12 @@ import type { DevdbEvent, EndpointStatus } from "@devdb/shared";
 //
 // Task 4: `logger` is a typed fake (Logger's three methods as vi.fn()s), not a cast — every
 // service's deps now require it (ProjectsDeps), for compensation-path logging.
+//
+// Task 8: `computes` gains `runningPgbin`/`runningPgbins` (tsc-forced by ComputesApi). `builds` is
+// NOT folded into this bag's return — BranchesDeps' `builds` field is OPTIONAL and every EXISTING
+// test in this file constructs BranchesService via `seeded()`/`{ state, queue, ...f }` relying on
+// detail()'s pre-Task-8 default (runningPgVersion: null with no builds dep); the one new test below
+// supplies its own `builds` fake inline instead.
 function fakes(): {
   storcon: StorconApi; pageserver: PageserverApi; safekeeper: SafekeeperApi; computes: ComputesApi; logger: Logger;
 } {
@@ -43,11 +49,25 @@ function fakes(): {
     statusOf: vi.fn((): EndpointStatus => "stopped"),
     portOf: vi.fn(() => null),
     runningPorts: vi.fn(() => []),
+    runningPgbin: vi.fn(() => null),
+    runningPgbins: vi.fn(() => []),
     onLine: vi.fn(() => () => {}),
     stopAll: vi.fn(async () => {}),
   };
   const logger: Logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
   return { storcon, pageserver, safekeeper, computes, logger };
+}
+
+// Task 8: a minimal BuildsResolverApi fake carrying only what BranchesService.detail()'s
+// runningPgVersion resolution consumes (versionForPgbin) — BranchesDeps types this dep as
+// `Pick<BuildsResolverApi, "versionForPgbin">`.
+function fakeBuilds(versionForPgbin: (pgbin: string) => string | null = () => null): BuildsResolverApi {
+  return {
+    pgbinFor: vi.fn(() => ({ path: "/unused", version: "0.0", buildId: "unused" })),
+    versionForPgbin: vi.fn(versionForPgbin),
+    recordRun: vi.fn(),
+    installedMajors: vi.fn(() => []),
+  };
 }
 
 async function seeded() {
@@ -268,6 +288,27 @@ describe("BranchesService", () => {
     const d = await branches.detail(mainBranch);
     expect(d.connectionString).toBeNull();
     expect(d.jdbcUrl).toBeNull();
+  });
+
+  // Task 8: detail() resolves runningPgVersion via computes.runningPgbin(branch.id) ->
+  // builds.versionForPgbin(...) — null end-to-end whenever EITHER hop misses (stopped compute, or
+  // a running one whose path the registry can't map back to a version), never a thrown error.
+  it("detail carries runningPgVersion resolved from the running compute's pgbin", async () => {
+    const f = fakes();
+    const state = openState(":memory:");
+    const queue = new BranchQueue();
+    const projects = new ProjectsService({ state, queue, ...f });
+    const { mainBranch } = await projects.create({ name: "acme" });
+    const builds = fakeBuilds((pgbin) => (pgbin === "/b/v16/bin/postgres" ? "16.10" : null));
+    const branches = new BranchesService({ state, queue, builds, ...f });
+
+    vi.mocked(f.computes.runningPgbin).mockReturnValue("/b/v16/bin/postgres");
+    const running = await branches.detail(mainBranch);
+    expect(running.runningPgVersion).toBe("16.10");
+
+    vi.mocked(f.computes.runningPgbin).mockReturnValue(null);
+    const stopped = await branches.detail(mainBranch);
+    expect(stopped.runningPgVersion).toBeNull();
   });
 
   it("list returns detail-enriched rows for every branch in the project", async () => {

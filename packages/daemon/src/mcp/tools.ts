@@ -5,6 +5,7 @@ import { PACKAGE_VERSION } from "../http/api.js";
 import type { ToolCtx } from "./server.js";
 import { DevdbError } from "../services/errors.js";
 import { toBranchDto, toProjectDto } from "../services/dto.js";
+import type { PgBuildRow } from "../state/repos.js";
 import { text, errorResult, contextLine, nowIso, type ToolResult } from "./format.js";
 
 type BranchDto = ReturnType<typeof toBranchDto>;
@@ -147,6 +148,66 @@ async function startNewBranchOrPartialSuccess(
       ),
     };
   }
+}
+
+// Task 11 (dynamic-pg-builds): "16.9" when a minor is known, "16.x" while still downloading/
+// unknown — same fallback dto.ts's toPgBuildDto uses for the wire DTO's `version` field, kept
+// consistent here so an agent sees the identical string whether it reads the REST DTO or this
+// tool's text.
+function versionString(row: PgBuildRow): string {
+  return row.minor === null ? `${row.major}.x` : `${row.major}.${row.minor}`;
+}
+
+// One subline per non-active build row: "[ready] 16.9 baked" / "[ready] 16.10 release 9124" /
+// "[failed] release 9101: gate: …". Baked rows render "baked" (there's no meaningful release tag
+// to show — registry.ts seeds them with releaseTag: "baked"); downloaded rows render
+// "release <tag>" so an agent can tell which OCI tag a given build came from (the same releaseTag
+// field the REST DTO exposes, see dto.ts's toPgBuildDto doc comment).
+function renderBuildSubline(row: PgBuildRow): string {
+  const originLabel = row.source === "baked" ? "baked" : `release ${row.releaseTag}`;
+  if (row.status === "failed") {
+    return `  [failed] ${originLabel}: ${row.error ?? "unknown error"}`;
+  }
+  return `  [${row.status}] ${versionString(row)} ${originLabel}`;
+}
+
+// Fix round 1 (review of Task 11 commit cfec31c, P3): `others` is no longer guaranteed non-empty
+// when there's no active row — list_pg_builds now visits every major registry.list() knows about
+// (see its own call site below), including one whose ONLY rows are in-flight/failed, so the
+// no-active branch must say something more useful than a bare "no active build" (which reads as
+// "nothing is happening" even mid-pull). Prefers "pulling" when a downloading/validating row is
+// actually in flight (the common case right after pull_pg_build fires); falls back to "last pull
+// failed" when every other row for this major is failed (no pull in flight at all); "no active
+// build" alone remains the fallback for the (believed-impossible today, since seedBaked/adopt/pull
+// are the only writers and registry.list() only returns majors with >=1 row) case of a major with
+// literally no other rows to describe either.
+function noActiveSuffix(others: PgBuildRow[]): string {
+  if (others.some((r) => r.status === "downloading" || r.status === "validating")) return " yet (pulling)";
+  if (others.length > 0 && others.every((r) => r.status === "failed")) return " (last pull failed)";
+  return "";
+}
+
+// Renders one major's block: the active line (or a "no active build" line if none resolved — see
+// noActiveSuffix() above for how that line adapts to in-flight/failed-only majors), then a subline
+// per OTHER row for that major (active row is already named on the header line, so it's excluded
+// from the sublines to avoid saying the same build twice). `rows` may include EVERY status
+// (ready/downloading/validating/failed) for this major — not just ready ones — so every row still
+// gets a subline via renderBuildSubline() regardless of status.
+function renderMajorBlock(major: number, rows: PgBuildRow[], degraded: boolean, updateAvailable: string | null): string {
+  const active = rows.find((r) => r.active && r.status === "ready") ?? null;
+  const others = rows.filter((r) => r !== active);
+  const lines: string[] = [];
+  if (degraded) {
+    lines.push(`⚠ PG ${major} is running BELOW its last-run minor — re-pull to clear`);
+  }
+  lines.push(
+    active
+      ? `PG ${major} — active ${versionString(active)} (${active.source}, release ${active.releaseTag})`
+      : `PG ${major} — no active build${noActiveSuffix(others)}`,
+  );
+  for (const row of others) lines.push(renderBuildSubline(row));
+  if (updateAvailable) lines.push(`updates: PG ${major} → ${updateAvailable}`);
+  return lines.join("\n");
 }
 
 export function registerTools(server: McpServer, ctx: ToolCtx): void {
@@ -407,6 +468,144 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
     return text(
       `${contextLine({ project: p.name, branch: dto.name })}\n${body}\n` +
       `Next: verify the restored data.`,
+    );
+  }));
+
+  // Task 11 (dynamic-pg-builds): the four pg-builds tools — agents self-serve a missing major or
+  // a newer minor without a human touching the REST API/UI. Deliberately NO MCP delete tool: the
+  // spec keeps infra-destructive operations (removing a build from disk) human-only; an agent
+  // that wants a build gone has no MCP path to force it, only DELETE /api/pg-builds/:id via a
+  // human or the web UI. None of these four tools has a project/branch scope, so — like
+  // get_status above — they open with an ad hoc "[devdb] ..." header, not contextLine() (which
+  // requires naming a project).
+  server.registerTool("list_pg_builds", {
+    description: "List every Postgres build, grouped by major version: which one is active, every other ready/downloading/validating/failed build, degraded-downgrade warnings, and any update news from a prior check_pg_updates call.",
+    inputSchema: {},
+  }, guard("list_pg_builds", deps, async () => {
+    // Fix round 1 (review of Task 11 commit cfec31c, P3): the major set MUST come from
+    // `registry.list()` (every row of every status) — NOT `registry.installedMajors()`, which only
+    // returns majors that have at least one READY row (BuildRegistry.installedMajors(), registry.ts
+    // — filters on `row.status === "ready"` before collecting the major). `pull_pg_build`'s own
+    // response text tells agents to "poll list_pg_builds" for progress; deriving the set from
+    // installedMajors() meant a pull of a brand-new major (no ready row for it yet) was invisible
+    // for the ENTIRE downloading/validating window, and stayed invisible forever if the pull ended
+    // failed — the self-service "add a major" flow looked like it silently never started. The REST
+    // route (GET /api/pg-builds, http/api.ts) and the web UI already read `registry.list()`
+    // directly for exactly this reason; this brings the MCP tool's rendering in line with them.
+    const rows = deps.registry.list();
+    if (rows.length === 0) {
+      return text(`[devdb] no Postgres builds installed\nNext: pull_pg_build to install one.`);
+    }
+    const majors = [...new Set(rows.map((r) => r.major))].sort((a, b) => a - b);
+    const degraded = new Set(deps.registry.degradedMajors());
+    const blocks = majors.map((major) =>
+      renderMajorBlock(
+        major,
+        rows.filter((r) => r.major === major),
+        degraded.has(major),
+        deps.provisioner.updateAvailableFor(major),
+      ),
+    );
+    // "tracked", not "installed": with the fix above, a major can appear here on the strength of a
+    // downloading/failed row alone, with nothing actually installed yet — "installed" would be a
+    // false claim for exactly the majors this fix makes visible.
+    return text(
+      `[devdb] ${majors.length} Postgres major(s) tracked as of ${nowIso()}\n${blocks.join("\n")}\n` +
+      `Next: check_pg_updates to look for news, or activate_pg_build to switch a major's active build.`,
+    );
+  }));
+
+  const CheckPgUpdatesShape = { majors: z.array(PgVersionSchema).optional() };
+  server.registerTool("check_pg_updates", {
+    description: "Check the OCI registry for a newer 'latest' build per major (egress — hits the network). Populates list_pg_builds' trailing 'updates:' lines.",
+    inputSchema: CheckPgUpdatesShape,
+  }, guard("check_pg_updates", deps, async ({ majors }: z.infer<z.ZodObject<typeof CheckPgUpdatesShape>>) => {
+    const targets = majors ?? deps.registry.installedMajors();
+    const result = await deps.provisioner.check(targets);
+    const lines = Object.entries(result).map(
+      ([major, r]) => `  PG ${major}: ${r.isNew ? "new build available" : "up to date"} (${r.tag}@${r.digest.replace(/^sha256:/, "").slice(0, 12)})`,
+    );
+    return text(
+      `[devdb] checked ${targets.length} major(s) as of ${nowIso()}\n${lines.join("\n")}\n` +
+      `Next: pull_pg_build for any major reporting a new build.`,
+    );
+  }));
+
+  const PullPgBuildShape = { major: PgVersionSchema, tag: z.string().min(1).optional() };
+  server.registerTool("pull_pg_build", {
+    description: "Start pulling a Postgres build for a major (defaults to the 'latest' OCI tag). Async: returns immediately with the buildId — poll list_pg_builds for status.",
+    inputSchema: PullPgBuildShape,
+  }, guard("pull_pg_build", deps, async ({ major, tag }: z.infer<z.ZodObject<typeof PullPgBuildShape>>) => {
+    // Fire-and-return: the pipeline (extract/fixup/validate/auto-activate) runs after
+    // provisioner.pull() resolves its own synchronous "downloading row inserted" step — awaiting
+    // anything past that here would block this tool call for the full pull (up to the 90s
+    // validation-gate budget alone), the opposite of the documented immediate-return contract.
+    const { buildId } = await deps.provisioner.pull({ major, tag });
+    // "Progress: ... logs channel pgbuild:<id>" (not a REST path): provisioner.ts ingests pull
+    // progress to LogsService channel `pgbuild:${buildId}` (see its private log() helper), but no
+    // SSE route in http/api.ts currently serves that channel family — GET /api/daemon/logs/:component
+    // only allowlists the fixed engine-process component set (daemonLogChannel), and
+    // GET /api/branches/:id/logs serves a DIFFERENT channel (`branch:<id>:compute`, keyed by
+    // branch id, not build id). Naming a REST path here that 404s would be a broken hint, so this
+    // names the channel (useful today via list_pg_builds' polling loop, and for whichever future
+    // route/UI surfaces it) without asserting a currently-working URL.
+    //
+    // Enhancement (Sonnet Minor, review of Task 11 commit cfec31c, fold): names GET /api/events as
+    // the non-polling alternative — Provisioner.publish() (provisioner.ts, its own doc comment at
+    // the top of the class names this same route as the intended alternative to polling) emits a
+    // `pg_builds` invalidation event on EVERY pipeline transition (downloading -> validating ->
+    // ready/failed, and activate), so a caller that would rather watch an SSE stream than poll
+    // list_pg_builds on a timer has a real route to do that with, not just the poll instruction.
+    return text(
+      `pull started (build ${buildId}). Poll list_pg_builds — status downloading → validating → ready (auto-activates).\n` +
+      `Progress: daemon logs channel pgbuild:${buildId}. Or watch GET /api/events for a "pg_builds" event instead of polling.`,
+    );
+  }));
+
+  const ActivatePgBuildShape = { major: PgVersionSchema, version: z.string().regex(/^\d+\.\d+$/) };
+  server.registerTool("activate_pg_build", {
+    description: "Make a specific ready build the active one for its major. Refuses downgrades below the last-run minor — an agent cannot silently roll a branch back; downgrading requires human consent via the web UI or REST.",
+    inputSchema: ActivatePgBuildShape,
+  }, guard("activate_pg_build", deps, async ({ major, version }: z.infer<z.ZodObject<typeof ActivatePgBuildShape>>) => {
+    const candidates = deps.registry.list().filter((r) => r.major === major);
+    const target = candidates.find((r) => r.status === "ready" && versionString(r) === version);
+    if (!target) {
+      const available = candidates.filter((r) => r.status === "ready").map(versionString);
+      return errorResult(
+        `no ready build ${version} for PG ${major}` +
+        (available.length > 0 ? ` — available: ${available.join(", ")}` : ` — none ready; pull_pg_build first`),
+      );
+    }
+
+    // FIX-8 (Jordan's decision, 2026-07-05): "Refuse downgrades over MCP." An agent must NOT be
+    // able to unilaterally roll a branch back to an older minor — downgrading is a human decision,
+    // gated behind explicit consent (the web UI Settings card's confirm dialog, or REST
+    // `POST /api/pg-builds/:id/activate {consented:true}`). Determine downgrade-ness BEFORE calling
+    // activate at all: the SAME predicate BuildRegistry.activate uses internally (registry.ts)
+    // against the pg_majors high-water mark, reached directly via deps.state (Deps.state is the
+    // same StateDb instance the registry itself holds) since BuildRegistry has no public
+    // lastRunMinor passthrough. Checking here — rather than calling activate() with no consent and
+    // catching its 409 — means a downgrade target is REFUSED WITHOUT EVER CALLING
+    // provisioner.activate: no risk of the guard's own 409 path being changed out from under this
+    // check later and silently reintroducing an activation attempt on the agent's behalf.
+    const lastRun = deps.state.pgMajors.lastRunMinor(major);
+    const isDowngrade = target.minor !== null && lastRun !== null && target.minor < lastRun;
+    if (isDowngrade) {
+      return errorResult(
+        `refused: ${version} is a downgrade below the last-run PG ${major}.${lastRun} — MCP cannot consent to downgrades on an agent's behalf.\n` +
+        `Downgrades require human consent: use the web UI Settings card (confirm dialog) or ` +
+        `POST /api/pg-builds/:id/activate with {"consented":true}.`,
+      );
+    }
+
+    // Not a downgrade (minor >= last-run high-water, or no high-water recorded yet) — activates
+    // unchanged. No `{consented: true}` passed: this path never needs consent (registry.ts's
+    // activate() only demands it when isDowngrade), and MCP must never auto-consent regardless —
+    // see the refusal branch above for the downgrade case, which never reaches this call at all.
+    const row = await deps.provisioner.activate(target.id);
+    return text(
+      `[devdb] activated ${versionString(row)} for PG ${major}\n` +
+      `Next: list_pg_builds to confirm, or restart any running endpoint on this major to pick it up.`,
     );
   }));
 }

@@ -65,4 +65,27 @@ describe("loadConfig", () => {
       );
     });
   });
+
+  it("pg build provisioning defaults + derived dirs", () => {
+    const cfg = loadConfig(base);
+    expect(cfg.pgRegistryBase).toBe("https://registry-1.docker.io");
+    expect(cfg.pgImageTemplate).toBe("neondatabase/compute-node-v{major}");
+    expect(cfg.pgBuildsDir).toBe(`${cfg.dataDir}/pg_builds`);
+    expect(cfg.pgDistribDir).toBe(`${cfg.dataDir}/pg_distrib`);
+  });
+
+  it("DEVDB_PG_REGISTRY_BASE must be an http(s) URL; trailing slash stripped", () => {
+    expect(() => loadConfig({ ...base, DEVDB_PG_REGISTRY_BASE: "ftp://nope" })).toThrow(
+      /DEVDB_PG_REGISTRY_BASE/,
+    );
+    expect(
+      loadConfig({ ...base, DEVDB_PG_REGISTRY_BASE: "http://pgregistry:5000/" }).pgRegistryBase,
+    ).toBe("http://pgregistry:5000");
+  });
+
+  it("DEVDB_PG_IMAGE_TEMPLATE must contain {major}", () => {
+    expect(() =>
+      loadConfig({ ...base, DEVDB_PG_IMAGE_TEMPLATE: "neondatabase/compute-node" }),
+    ).toThrow(/\{major\}/);
+  });
 });

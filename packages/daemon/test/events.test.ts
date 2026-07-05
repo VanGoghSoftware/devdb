@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DevdbEventSchema } from "@devdb/shared";
+import { DevdbEventSchema, DevdbEventTypeSchema } from "@devdb/shared";
 import { EventsService } from "../src/services/events.js";
 
 describe("EventsService", () => {
@@ -45,5 +45,14 @@ describe("EventsService", () => {
   it("DevdbEventSchema rejects non-contract fields and accepts a valid event", () => {
     expect(DevdbEventSchema.safeParse({ type: "engine.health", at: "t" }).success).toBe(true);
     expect(DevdbEventSchema.safeParse({ type: "engine.health", at: "t", data: "leak" }).success).toBe(false);
+  });
+
+  it("event type whitelist matches the phase-3+pg-builds contract", () => {
+    expect(DevdbEventTypeSchema.options).toEqual([
+      "project.created", "project.deleted",
+      "branch.created", "branch.updated", "branch.deleted",
+      "endpoint.status", "engine.health",
+      "pg_builds",
+    ]);
   });
 });
