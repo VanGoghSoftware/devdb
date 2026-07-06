@@ -83,7 +83,7 @@ Your branch data physically lives in the pageserver's layer store on the volume.
   [engine/configs.ts](../packages/daemon/src/engine/configs.ts) — `remote_storage.local_path` →
   `/data/pageserver_1` (the layers), `pg_distrib_dir` → the composed `/data/pg_distrib` symlink dir
   (per-major Postgres binaries for WAL redo), disk-usage-based eviction enabled. Oracle:
-  `src/daemon/pageserver/mod.rs`.
+  `neon control_plane/src/pageserver.rs`.
 
 ### safekeeper — durability + consensus for writes
 
@@ -117,7 +117,7 @@ absorbs — see below).
 - **Port:** `1234` (HTTP). Readiness needle: `Serving HTTP on 127.0.0.1:1234`.
 - **DevDB specifics:** `storconSpec()` — `--database-url` (points at `storcon_db`), `--dev`,
   `--timelines-onto-safekeepers`, `--control-plane-url http://127.0.0.1:4318`. Oracle:
-  `src/daemon/mod.rs`.
+  `neon control_plane/src/storage_controller.rs`.
 
 ### storcon_db — the controller's own database
 
@@ -148,8 +148,8 @@ it. Readiness needle: `listening`.
   serves SQL on a port in `DEVDB_PORT_RANGE` (`54300–54339`). Managed by
   [compute/manager.ts](../packages/daemon/src/compute/manager.ts) (`ComputeManager`). These are the
   processes your daemon starts/stops per endpoint; the five engine services are always-on beneath.
-- **Tracer sink (`:4318`).** A catch-all HTTP sink the daemon runs (ported from neon's
-  `src/daemon/tracer/mod.rs`, see [engine/tracer.ts](../packages/daemon/src/engine/tracer.ts)). It
+- **Tracer sink (`:4318`).** A catch-all HTTP sink the daemon runs — DevDB's own, with no engine
+  counterpart (see [engine/tracer.ts](../packages/daemon/src/engine/tracer.ts)). It
   answers `200 {}` to any path, absorbing both the binaries' OTLP trace exports (`/v1/traces`) and
   the storage_controller's control-plane upcalls (`/notify-attach`) — both target `4318`, and
   without a listener there each would spew connection-refused on a retry loop.
@@ -245,10 +245,11 @@ loopback. It is a local-development tool, not a multi-tenant service. (Cited thr
 | Compute lifecycle | `packages/daemon/src/compute/manager.ts` |
 | Composition root | `packages/daemon/src/index.ts` |
 
-**Oracle** (read-only reference, `~/git/neond` — never modified, per the no-upstream-reports rule):
-`src/daemon/mod.rs` (boot order + process args), `src/daemon/pageserver/mod.rs` (pageserver config),
-`src/daemon/tracer/mod.rs` (the tracer sink). Engine-interaction code cites these inline as
-`// oracle: <file:line>`.
+**Oracle** (read-only reference, `~/git/neon` — never modified, per the no-upstream-reports rule):
+`control_plane/src/bin/neon_local.rs` (boot/stop order) and the per-component `control_plane/src/*.rs`
+— `pageserver.rs` (pageserver config), `storage_controller.rs` (storcon spec) — for process args +
+config. Engine-interaction code cites these inline as `// oracle: neon <path>`. (The tracer sink is
+DevDB's own — a no-op OTLP/upcall absorber with no engine counterpart.)
 
 ## Health & observability
 
