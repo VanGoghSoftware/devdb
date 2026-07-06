@@ -309,6 +309,11 @@ RUN set -e; \
 #     so the v17 reuse is a functional superset. verify-binaries.sh checks only
 #     `vanilla_v17/bin/initdb` (version-agnostic) so both satisfy the gate; the
 #     integration suite is the behavioural acceptance test for this choice.
+#     CAVEAT: `cp -a` copies v17's bin/pg_config verbatim, so vanilla_v17's
+#     pg_config still reports v17's baked-in --prefix/--sharedir
+#     (.../pg_install/v17, not .../vanilla_v17). Harmless for storcon (it uses
+#     initdb, which is path-independent); do NOT rely on
+#     `vanilla_v17/bin/pg_config --sharedir` resolving to a vanilla_v17 path.
 # port: neond Dockerfile:67-73 (the COPY-into-share layout; the vanilla source
 #       intentionally differs — see above).
 # ---------------------------------------------------------------------------
