@@ -256,7 +256,13 @@ RUN CARGO_TERM_PROGRESS_WHEN=never CI=1 \
 # oracle: neon compute/compute-node.Dockerfile:526-538 (pgvector-src fetch +
 #         patch, pgvector-build make/install). Patch source: neon's own tree
 #         (compute/patches/pgvector.patch), available from the clone.
-# port: neond Makefile:57-69 (per-major USE_PGXS install loop).
+# Upstream builds one major per compute-node image (a single make/install, no
+# re-clean). We assemble all four majors in one stage, so we loop and `make
+# clean` between majors (each needs a fresh build against its own PG headers).
+# That clean removes the downloaded sql/vector--0.7.4.sql (pgvector's
+# 0.7.4->0.8.0 upgrade base) — which, unlike vector--0.8.0.sql (regenerated from
+# sql/vector.sql by a make rule), has NO rule to recreate it. So we stash it once
+# and restore it after each clean, before that major's install.
 # `OPTFLAGS=""` strips pgvector's default -march=native (we build on a different
 # machine than we run) — compute-node.Dockerfile:520-522.
 # ---------------------------------------------------------------------------
@@ -268,15 +274,17 @@ RUN set -e; \
     curl -fsSL "https://github.com/pgvector/pgvector/raw/refs/tags/v0.7.4/sql/vector.sql" -o /tmp/pgvector-src/sql/vector--0.7.4.sql; \
     echo "${PGVECTOR_074_SQL_SHA256}  /tmp/pgvector-src/sql/vector--0.7.4.sql" | sha256sum --check; \
     ( cd /tmp/pgvector-src && patch -p1 < /src/neon/compute/patches/pgvector.patch ); \
+    cp /tmp/pgvector-src/sql/vector--0.7.4.sql /tmp/vector--0.7.4.sql.keep; \
     for ver in v14 v15 v16 v17; do \
       pg_config="/src/neon/pg_install/$ver/bin/pg_config"; \
       [ -x "$pg_config" ] || { echo "MISSING $pg_config"; exit 1; }; \
       echo "==> building pgvector for $ver"; \
       make MAKELEVEL=0 -C /tmp/pgvector-src USE_PGXS=1 PG_CONFIG="$pg_config" OPTFLAGS="" clean; \
+      cp /tmp/vector--0.7.4.sql.keep /tmp/pgvector-src/sql/vector--0.7.4.sql; \
       make MAKELEVEL=0 -C /tmp/pgvector-src USE_PGXS=1 PG_CONFIG="$pg_config" OPTFLAGS="" -j"${JOBS}" install; \
       echo 'trusted = true' >> "/src/neon/pg_install/$ver/share/extension/vector.control"; \
     done; \
-    rm -rf /tmp/pgvector.tar.gz /tmp/pgvector-src
+    rm -rf /tmp/pgvector.tar.gz /tmp/pgvector-src /tmp/vector--0.7.4.sql.keep
 
 # ---------------------------------------------------------------------------
 # 2g. Assemble the exact /usr/local/share/neon layout inside this stage so the
