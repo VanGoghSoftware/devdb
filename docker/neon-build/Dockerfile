@@ -42,6 +42,16 @@ ARG PG_V15_COMMIT=aaaeff2550d5deba58847f112af9b98fa3a58b00
 ARG PG_V16_COMMIT=9b9cb4b3e33347aea8f61e606bb6569979516de5
 ARG PG_V17_COMMIT=fa1788475e3146cc9c7c6a1b74f48fd296898fcd
 
+# vanilla_v17 source: TRUE upstream Postgres (postgres/postgres @ REL_17_5), NOT
+# the neon fork. storage_controller's catalog DB (storcon_db) must be plain PG —
+# the neon fork emits Neon-custom WAL (rmgr id 134) that FATALs on crash recovery
+# when the neon extension isn't loaded during redo (fine for a neon compute,
+# fatal for a standalone catalog host after an unclean stop; Phase-1 Task-3
+# integration finding). neond builds vanilla from upstream postgres for the same
+# reason. REL_17_5 matches the neon-v17 minor (17.5).
+# oracle: neond Makefile:21-24 (vanillapg: upstream postgres, --without-icu --with-openssl).
+ARG VANILLA_PG_COMMIT=5e2f3df49d4298c6097789364a5a53be172f6e85
+
 # pgvector: release tarball (NOT a submodule), sha256-pinned, then patched.
 ARG PGVECTOR_VERSION=0.8.0
 ARG PGVECTOR_SHA256=867a2c328d4928a5a9d6f052cd3bc78c7d60228a9b914ad32aa3db88e9de27b0
@@ -132,6 +142,29 @@ RUN git submodule update --init --depth 2 \
           && git fetch -q --depth 1 origin "${sha}" \
           && git checkout -q "${sha}" ); \
     done
+
+##############################################################################
+# Stage 2v: vanilla — a TRUE upstream Postgres 17 for pg_install/vanilla_v17.
+# (Rationale + oracle: see the VANILLA_PG_COMMIT ARG above.) storcon_db — the
+# storage_controller's metadata catalog — must run on plain upstream PG; the neon
+# fork's custom WAL rmgr (id 134) breaks its crash recovery after an unclean stop.
+# A separate shallow clone of postgres/postgres at the pinned REL_17_5 commit,
+# built on the SAME bookworm build-tools base as everything else (one base).
+# oracle: neond Makefile:21-24 (vanillapg: ./configure --without-icu --with-openssl
+#         then make install — core only, no contrib/extensions).
+##############################################################################
+FROM build-tools AS vanilla
+ARG JOBS
+ARG VANILLA_PG_COMMIT
+WORKDIR /src/vanilla-postgres
+RUN git init -q \
+    && git remote add origin https://github.com/postgres/postgres.git \
+    && git fetch -q --depth 1 origin "${VANILLA_PG_COMMIT}" \
+    && git checkout -q FETCH_HEAD
+# Minimal catalog-host config — core PG only (no contrib, no neon ext), matching
+# neond's vanillapg. `make install` builds then installs the core tree.
+RUN ./configure --prefix=/usr/local/vanilla_v17 --without-icu --with-openssl \
+    && make MAKELEVEL=0 -j"${JOBS}" install
 
 ##############################################################################
 # Stage 2: engine — build the Rust storage binaries + neon PG extensions +
@@ -298,32 +331,24 @@ RUN set -e; \
 #   - bin/         : the 5 storage binaries.
 #   - pg_install/v14..v17 : the per-major installs (with contrib + neon ext +
 #                    pgvector).
-#   - pg_install/vanilla_v17 : the v17 tree reused as storcon's catalog host
-#     (per spec — storage_controller initdbs its metadata DB against a vanilla
-#     PG; DevDB reuses v17 rather than building a separate vanilla tree).
-#     DELIBERATE DIVERGENCE from the neond baseline: neond's `make vanillapg`
-#     builds a SEPARATE vanilla tree from its own `postgres` submodule
-#     (currently PG 19devel, --without-icu, no extensions). Here we reuse the
-#     neon v17 install (real PG 17.5, ICU-enabled, carries neon.so/vector).
-#     storage_controller only needs a working PG to host its metadata catalog,
-#     so the v17 reuse is a functional superset. verify-binaries.sh checks only
-#     `vanilla_v17/bin/initdb` (version-agnostic) so both satisfy the gate; the
-#     integration suite is the behavioural acceptance test for this choice.
-#     CAVEAT: `cp -a` copies v17's bin/pg_config verbatim, so vanilla_v17's
-#     pg_config still reports v17's baked-in --prefix/--sharedir
-#     (.../pg_install/v17, not .../vanilla_v17). Harmless for storcon (it uses
-#     initdb, which is path-independent); do NOT rely on
-#     `vanilla_v17/bin/pg_config --sharedir` resolving to a vanilla_v17 path.
-# port: neond Dockerfile:67-73 (the COPY-into-share layout; the vanilla source
-#       intentionally differs — see above).
+#   - pg_install/vanilla_v17 : NOT assembled here — it is a TRUE upstream Postgres
+#     17 built in the `vanilla` stage (postgres/postgres @ REL_17_5) and COPY'd
+#     into the tree by the final stage, deliberately NOT the neon-forked v17.
+#     storcon_db (the storage_controller's metadata catalog) must be plain PG: the
+#     fork emits Neon-custom WAL (rmgr id 134) that FATALs storcon_db's crash
+#     recovery after an unclean stop when the neon extension isn't loaded during
+#     redo (Phase-1 Task-3 integration finding). This matches neond, which
+#     likewise builds a SEPARATE upstream-vanilla tree for storcon's catalog host.
+#     See the VANILLA_PG_COMMIT ARG + the `vanilla` stage.
+# port: neond Dockerfile:67-73 (the COPY-into-share layout) + Makefile:21-24
+#       (the separate upstream-vanilla build for storcon's catalog host).
 # ---------------------------------------------------------------------------
 RUN set -e; \
     mkdir -p /out/bin /out/pg_install; \
     for b in pageserver safekeeper storage_broker storage_controller compute_ctl; do \
       cp "target/release/$b" "/out/bin/$b"; \
     done; \
-    cp -a pg_install/v14 pg_install/v15 pg_install/v16 pg_install/v17 /out/pg_install/; \
-    cp -a pg_install/v17 /out/pg_install/vanilla_v17
+    cp -a pg_install/v14 pg_install/v15 pg_install/v16 pg_install/v17 /out/pg_install/
 
 ##############################################################################
 # Stage 3: final — slim runtime carrying only the assembled engine tree + the
@@ -349,6 +374,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=engine /out /usr/local/share/neon
+# vanilla_v17 = a TRUE upstream Postgres 17 (the `vanilla` stage), NOT the neon
+# fork — so storcon_db crash-recovers without the neon WAL rmgr (Phase-1 Task-3).
+COPY --from=vanilla /usr/local/vanilla_v17 /usr/local/share/neon/pg_install/vanilla_v17
 ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
     PG_INSTALL_DIR=/usr/local/share/neon/pg_install
 

@@ -130,6 +130,10 @@ type manifest struct {
 		TarballURL    string `json:"tarballUrl"`
 		TarballSha256 string `json:"tarballSha256"`
 	} `json:"pgvector"`
+	VanillaPostgres struct {
+		Tag    string `json:"tag"`
+		Commit string `json:"commit"`
+	} `json:"vanillaPostgres"`
 	Majors map[string]struct {
 		Minor              int    `json:"minor"`
 		PostgresForkCommit string `json:"postgresForkCommit"`
@@ -179,6 +183,8 @@ func cmdCheckManifest(args []string) int {
 	req("pgvector.tag", m.Pgvector.Tag)
 	req("pgvector.tarballUrl", m.Pgvector.TarballURL)
 	req("pgvector.tarballSha256", m.Pgvector.TarballSha256)
+	req("vanillaPostgres.tag", m.VanillaPostgres.Tag)
+	req("vanillaPostgres.commit", m.VanillaPostgres.Commit)
 
 	// majors must be exactly {14,15,16,17}, each with a resolvable fork commit.
 	got := make([]string, 0, len(m.Majors))
@@ -210,8 +216,8 @@ func cmdCheckManifest(args []string) int {
 		return 1
 	}
 
-	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, majors %v)\n",
-		p, m.NeonTag, m.Rust, m.Pgvector.Tag, wantMajors)
+	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v)\n",
+		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors)
 	return 0
 }
 

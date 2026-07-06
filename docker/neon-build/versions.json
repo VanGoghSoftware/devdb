@@ -20,6 +20,13 @@
     "_notes": "NOT a git submodule upstream (unlike neond's own /pgvector submodule wrapper). neondatabase/neon fetches pgvector as a release tarball inside compute/compute-node.Dockerfile's pgvector-src stage, sha256-pinned, then applies compute/patches/pgvector.patch (adds NEON_SMGR unlogged-build hook + a v0.7.4 SQL upgrade path). One pgvector build is shared across all 4 PG majors — pin is per-source, not per-major. commit resolved via `git ls-remote --tags https://github.com/pgvector/pgvector.git v0.8.0` (read-only lookup against pgvector's own repo, not neon's tree)."
   },
 
+  "vanillaPostgres": {
+    "tag": "REL_17_5",
+    "commit": "5e2f3df49d4298c6097789364a5a53be172f6e85",
+    "repo": "https://github.com/postgres/postgres.git",
+    "_notes": "TRUE upstream Postgres (NOT the neon fork) for pg_install/vanilla_v17 — storage_controller's catalog DB (storcon_db) host. The neon-forked v17 emits Neon-custom WAL (rmgr id 134) that FATALs on crash recovery when the neon extension is not loaded during redo — fine for a neon compute, fatal for a standalone catalog after an unclean stop (Phase-1 Task-3 integration finding: storcon_db redo hit 'resource manager with ID 134 not registered'). neond builds vanilla from the upstream postgres/postgres submodule for exactly this reason (Makefile:21-24 vanillapg: ./configure --without-icu --with-openssl). REL_17_5 matches the neon-v17 minor (17.5). commit resolved via `git ls-remote --tags https://github.com/postgres/postgres.git REL_17_5`."
+  },
+
   "majors": {
     "14": {
       "minor": 18,
