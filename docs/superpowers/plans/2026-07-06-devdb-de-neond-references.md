@@ -246,7 +246,7 @@ git commit -m "docs: sweep remaining neond references; add provenance footnote"
 
 *(If re-pointing a citation reveals DevDB's behavior appears to differ from neon's, record it here as one line — `file:line — DevDB does X, neon does Y` — for a possible future initiative. Do not change behavior.)*
 
-- _(none yet)_
+- `services/timetravel.ts:~138` (`classifyLsnRangeError`) — DevDB reclassifies engine LSN-range failures to HTTP **400** for a client-actionable PITR-range message; neon's pageserver returns **406 Not Acceptable** for `CreateTimelineError::AncestorLsn`/`AncestorArchived` (`pageserver/src/http/routes.rs:693-702`; `AncestorNotActive` is 503, excluded from the claim). Deliberate DevDB remap, not a bug — recorded for provenance. (Task 2)
 
 ---
 
