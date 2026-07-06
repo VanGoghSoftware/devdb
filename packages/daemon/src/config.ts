@@ -9,8 +9,10 @@ const ENGINE_PORTS = {
   pageserverPgPort: 64000,
   safekeeperPgPort: 5454,
   safekeeperHttpPort: 7676,
-  // oracle: src/preflight/mod.rs:17 TRACER_PORT = 4318 (reserved). The tracer sink (engine/tracer.ts)
-  // binds this; the storage_controller's --control-plane-url + the binaries' OTLP exporter target it.
+  // DevDB's own: 4318 is the standard OTLP/HTTP collector port (also neon's convention, e.g.
+  // compute_tools/src/logger.rs's OTEL_EXPORTER_OTLP_ENDPOINT doc comment), reserved here for
+  // DevDB's catch-all sink (engine/tracer.ts). storage_controller's --control-plane-url + the
+  // binaries' OTLP exporter target it.
   tracerPort: 4318,
 } as const;
 
@@ -82,7 +84,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     throw new Error(`DEVDB_PORT_RANGE invalid: ${e.DEVDB_PORT_RANGE}`);
   }
 
-  // oracle: port constants from src/daemon/mod.rs + src/daemon/pageserver/mod.rs
+  // oracle: neon pageserver_api::DEFAULT_HTTP_LISTEN_PORT / DEFAULT_PG_LISTEN_PORT, safekeeper_api's
+  // equivalents, and storage_broker::DEFAULT_LISTEN_ADDR (control_plane/src/bin/neon_local.rs
+  // imports these as its own port defaults) — DevDB's ENGINE_PORTS mirrors that default set.
   const reserved = Object.values(ENGINE_PORTS) as number[];
   const clash = reserved.find((p) => p >= min && p <= max);
   if (clash !== undefined) {

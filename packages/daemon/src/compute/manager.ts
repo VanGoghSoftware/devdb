@@ -152,7 +152,8 @@ export class ComputeManager {
     }
   }
 
-  // oracle: src/mgmt/compute/mod.rs:121-289 launch()
+  // oracle: neon compute_tools/src/bin/compute_ctl.rs (compute_ctl's launch entrypoint) +
+  // compute_tools/src/compute.rs (ComputeNode start/reconfigure lifecycle).
   //
   // Review fix (Fix 1): `onLine` is accepted here (not wired in by a caller after start()
   // resolves) and pushed onto entry.listeners at RESERVATION time — before any `await` — so a
@@ -234,7 +235,11 @@ export class ComputeManager {
       // common pre-proc window cleanly instead.
       this.assertStillStarting(a.branch, entry);
 
-      // oracle args: src/mgmt/compute/mod.rs:189-208; readiness: :245-252 ("listening on IPv4 address", 50s)
+      // oracle args: neon compute_tools/src/bin/compute_ctl.rs Cli struct (--pgdata/--pgbin/
+      // --connstr/--compute-id/--external-http-port/--internal-http-port). Readiness: neon polls
+      // postmaster.pid directly (compute_tools/src/pg_helpers.rs → wait_for_postgres); DevDB's
+      // "listening on IPv4 address" log-line needle (50s timeout) is its own simpler readiness
+      // signal for ManagedProcess's generic stdout-watcher.
       entry.proc = new ManagedProcess({
         name: `compute-${a.branch.slug}`,
         bin: join(this.cfg.neonBinDir, "compute_ctl"),

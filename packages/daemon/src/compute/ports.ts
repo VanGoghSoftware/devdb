@@ -44,7 +44,11 @@ async function tryClaim(
   }
 }
 
-// oracle: src/mgmt/compute/mod.rs:696-736 (sticky preferred port, then random, 100 attempts)
+// oracle: neon control_plane/src/endpoint.rs → ComputeControlPlane::get_port (compute-endpoint
+// port selection is neon_local's job, not compute_ctl's — compute_ctl receives its port already
+// chosen). Deviation: get_port is a monotonic increment over existing endpoints' ports; DevDB's
+// sticky-preferred-then-random-with-retry scheme below is its own allocator for a multi-branch
+// daemon, not a port for a neon concept.
 //
 // Reserve-then-probe: every candidate is claimed into the shared `reserved` set (via tryClaim)
 // SYNCHRONOUSLY — before the probe's await — so two allocatePort calls interleaving across that

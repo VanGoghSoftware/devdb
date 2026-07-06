@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   mkdirSync(cfg.dataDir, { recursive: true });
 
-  // oracle: src/daemon/lease/mod.rs — exclusive-create lockfile
+  // DevDB's own single-instance guard: O_EXCL lockfile under the data dir (see index.ts boot/shutdown).
   const lockPath = join(cfg.dataDir, ".lock");
   try {
     const fh = await open(lockPath, "wx");

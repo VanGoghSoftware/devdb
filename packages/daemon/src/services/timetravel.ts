@@ -9,10 +9,12 @@ import type { ProjectsDeps } from "./projects.js";
 import type { BranchesService, BranchDetail } from "./branches.js";
 import type { EndpointsLockedApi } from "./endpoints.js";
 
-// oracle (neond): restore = new timeline branched at the target LSN from the branch's OWN
-// timeline → timeline_detach_ancestor (reparents children) → DB identity swap archiving the old
-// row. reset = fresh fork of the PARENT's current head + the same identity swap, NO detach
-// (the new timeline's ancestor already IS the parent — that's the correct final shape).
+// oracle: neon pageserver POST /v1/tenant/:tenant_shard_id/timeline (create-at-LSN) + PUT
+// …/timeline/:timeline_id/detach_ancestor (routes.rs) for the engine-facing steps: restore = new
+// timeline branched at the target LSN from the branch's OWN timeline → detach_ancestor (reparents
+// children) → DB identity swap archiving the old row (DevDB's own — see state/repos.ts
+// restoreSwap). reset = fresh fork of the PARENT's current head + the same identity swap, NO
+// detach (the new timeline's ancestor already IS the parent — that's the correct final shape).
 //
 // Deadlock note: swapOntoNewTimeline() runs its body inside `this.deps.queue.run(branchId, ...)`
 // to serialize with any concurrent start()/stop()/delete() for this branch (same discipline as
@@ -38,8 +40,8 @@ export class TimeTravelService {
     queue: BranchQueue; branches: BranchesService; endpoints: EndpointsLockedApi;
   }) {}
 
-  // oracle: src/mgmt/service/branch.rs:520-599 (via storcon :1234, which proxies the pageserver's
-  // get_lsn_by_timestamp route).
+  // oracle: neon pageserver GET …/timeline/:timeline_id/get_lsn_by_timestamp (routes.rs,
+  // get_lsn_by_timestamp_handler), reached via storcon :1234 which proxies this pageserver route.
   async lsnAtTimestamp(branchId: string, isoTimestamp: string): Promise<string> {
     const branch = this.deps.branches.byIdOr404(branchId);
     // Review fix: require an explicit timezone (Z or ±HH:MM) rather than accepting whatever
@@ -81,9 +83,11 @@ export class TimeTravelService {
     }
   }
 
-  // oracle: src/mgmt/service/branch.rs:601-848 restore(): new timeline at LSN from the
-  // branch's own timeline → detach_ancestor (reparents children) → DB identity swap, old row
-  // archived as <name>_pitr_archived_<ts>; endpoint stopped/relaunched around it.
+  // oracle: neon pageserver POST /v1/tenant/:tenant_shard_id/timeline (create-at-LSN via
+  // ancestor_start_lsn) → PUT …/timeline/:timeline_id/detach_ancestor (reparents children) —
+  // the two engine-facing steps (routes.rs, timeline_create_handler + timeline_detach_ancestor_handler);
+  // the DB identity swap (old row archived as <name>_pitr_archived_<ts>) and the
+  // endpoint stop/relaunch around it are DevDB's own state-model choices, not an engine contract.
   async restoreInPlace(branchId: string, isoTimestamp: string): Promise<BranchDetail> {
     const lsn = await this.lsnAtTimestamp(branchId, isoTimestamp);
     return this.swapOntoNewTimeline(branchId, {
@@ -129,12 +133,16 @@ export class TimeTravelService {
     });
   }
 
-  // oracle: neond branch.rs:689-701 classifies engine LSN-range failures (out-of-range,
-  // not-found-at-that-point, malformed) at create-at-LSN time into a distinct PITR-range error
+  // oracle: neon pageserver's CreateTimelineError::AncestorLsn/AncestorNotActive/AncestorArchived
+  // (pageserver/src/tenant.rs; mapped to HTTP responses in http/routes.rs, timeline_create_handler)
+  // are the engine's own distinct error shapes for an unmaterializable ancestor_start_lsn at
+  // create-at-LSN time. This classifier reclassifies those into a client-actionable PITR-range 400
   // rather than a generic 5xx passthrough — the requested point simply isn't materializable on
-  // this branch's history, which is a client-actionable 400, not a server fault. Any other
-  // EngineApiError (auth, unreachable, unrelated 5xx, etc.) is a real engine/infra problem and
-  // must NOT be reclassified — only the LSN-range-shaped subset is oracle-mapped here.
+  // this branch's history. Any other EngineApiError (auth, unreachable, unrelated 5xx, etc.) is a
+  // real engine/infra problem and must NOT be reclassified — only the LSN-range-shaped subset is
+  // oracle-mapped here. Divergence: it text-matches the response body/message rather than the
+  // engine's actual status code (neon's AncestorLsn/AncestorArchived use 406 Not Acceptable, not
+  // 400) — out of scope to change here (comment-only sweep).
   private classifyLsnRangeError(e: unknown): unknown {
     if (!(e instanceof EngineApiError)) return e;
     const text = `${e.body} ${e.message}`;

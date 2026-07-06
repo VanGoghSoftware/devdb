@@ -4,7 +4,7 @@
 
 **Goal:** A Docker container running Neon's storage engine, orchestrated by a TypeScript daemon, that can create Postgres projects, branch them instantly, serve per-branch endpoints, and time-travel (restore/reset) — all over a REST API, proven by container-level integration tests.
 
-**Architecture:** Node 22 daemon (Fastify) is PID 1 in a Debian container. It supervises the Neon engine binaries copied from the pinned `neond/neond` image (storage_broker, storage_controller + its embedded vanilla Postgres, pageserver, safekeeper) and launches one `compute_ctl`-managed Postgres per running branch endpoint. Control-plane state lives in SQLite. Every engine interaction ports a specific, cited neond call site.
+**Architecture:** Node 22 daemon (Fastify) is PID 1 in a Debian container. It supervises the Neon engine binaries copied from a pinned image (storage_broker, storage_controller + its embedded vanilla Postgres, pageserver, safekeeper) and launches one `compute_ctl`-managed Postgres per running branch endpoint. Control-plane state lives in SQLite. Every engine interaction ports a specific, cited official-Neon call site.
 
 **Tech Stack:** TypeScript (strict), Node 22, pnpm workspaces, Fastify 5, zod, drizzle-orm + better-sqlite3, vitest, testcontainers, `pg` (client for tests/SQL console), execa.
 
@@ -16,16 +16,16 @@ Spec: `docs/superpowers/specs/2026-07-02-devdb-design.md`. This is **plan 1 of 5
 
 - Node `>=22`, TypeScript `strict: true`, ESM everywhere (`"type": "module"`).
 - Package manager: pnpm **11.9.0** via corepack. Supply-chain policy (user amendment A4): npm dependencies must be **≥24h old** at resolution time — `minimumReleaseAge: 1440` in pnpm-workspace.yaml; native build scripts allowlisted for better-sqlite3 only (`allowBuilds`). Monorepo layout per spec: `packages/daemon`, `packages/shared`, `docker/`, `tests/integration/`.
-- Management HTTP port **4400**; endpoint port range default **54300-54339**; engine-internal ports exactly as neond: broker `50051`, storcon `1234`, storcon-DB `5431`, pageserver http `9898` / pg `64000`, safekeeper pg `5454` / http `7676`, all bound to `127.0.0.1` inside the container.
+- Management HTTP port **4400**; endpoint port range default **54300-54339**; engine-internal ports exactly as upstream Neon's own local orchestration: broker `50051`, storcon `1234`, storcon-DB `5431`, pageserver http `9898` / pg `64000`, safekeeper pg `5454` / http `7676`, all bound to `127.0.0.1` inside the container.
 - Default branch name: **`main`**. IDs: Neon tenant id = project id (32-char hex, no dashes); timeline id = 32-char hex.
-- Deviations from neond (approved in spec): SQLite instead of management Postgres; **no PgBouncer**; **no TLS** on computes; no orgs/users/auth on our API; **engine runs in trust mode** (no NeonJWT — all engine ports are loopback-only inside the container; see Task 7 note; fallback documented there).
-- Engine binaries land at `/usr/local/share/neon/bin`, Postgres installs at `/usr/local/share/neon/pg_install` (same paths as neond image).
+- Deviations from Neon's own reference topology (approved in spec): SQLite instead of management Postgres; **no PgBouncer**; **no TLS** on computes; no orgs/users/auth on our API; **engine runs in trust mode** (no NeonJWT — all engine ports are loopback-only inside the container; see Task 7 note; fallback documented there).
+- Engine binaries land at `/usr/local/share/neon/bin`, Postgres installs at `/usr/local/share/neon/pg_install` (paths chosen to match the pinned engine image's layout).
 - Commit after every task (at minimum); conventional-commit style messages.
-- **Oracle rule:** every engine call/config cites its neond source (`// oracle: src/mgmt/service/branch.rs:141` style comments). Do not invent payloads — port them.
+- **Oracle rule:** every engine call/config cites its official-Neon source (`// oracle: src/mgmt/service/branch.rs:141` style comments — historical citation form; superseded by `// oracle: neon <path-or-endpoint>` per the redefined AGENTS.md rule). Do not invent payloads — port them.
 
 ## Oracle reference map
 
-| Ours | Ports from neond |
+| Ours | Ports from (Neon engine source) |
 |---|---|
 | `packages/daemon/src/engine/configs.ts` | `src/daemon/pageserver/mod.rs` (pageserver.toml/identity/metadata), `src/daemon/mod.rs:67-165` (broker/storcon/safekeeper args) |
 | `packages/daemon/src/engine/process.ts` | `src/daemon/process.rs` (spawn + readiness needle + stop) |
@@ -36,7 +36,7 @@ Spec: `docs/superpowers/specs/2026-07-02-devdb-design.md`. This is **plan 1 of 5
 | `packages/daemon/src/compute/*` | `src/mgmt/compute/mod.rs` (spec JSON :820-917, postgresql.conf :737-809, launch args :121-289, ports :696-736), `src/utils/password.rs` |
 | `packages/daemon/src/services/*` | `src/mgmt/service/{project,branch}.rs` flows incl. restore swap :601-848, reset :850+ |
 
-Initialize the neon submodule reference only when a payload is ambiguous: `git -C ~/git/neond submodule update --init --depth 1 neon` (pinned: `6a35a3e9f149`). Prefer reading neond's call sites first.
+Consult the official `neondatabase/neon` clone only when a payload is ambiguous (pinned reference commit recorded in AGENTS.md). Prefer reading its call sites first.
 
 ---
 
@@ -235,7 +235,7 @@ git add -A && git commit -m "chore: scaffold pnpm monorepo (daemon, shared)"
 - Consumes: workspace from Task 1.
 - Produces: image `devdb:dev` with engine binaries at `/usr/local/share/neon/bin/{pageserver,safekeeper,storage_broker,storage_controller,compute_ctl}` and Postgres at `/usr/local/share/neon/pg_install/<ver>/`; env `NEON_BINARIES_DIR`, `PG_INSTALL_DIR` set; daemon source runs under Node 22 as user `node`. Constant `SUPPORTED_PG_VERSIONS` decided here, used by Task 3.
 
-- [ ] **Step 1: Pin the neond image digest**
+- [ ] **Step 1: Pin the engine-binaries image digest**
 
 ```bash
 docker pull neond/neond:latest
@@ -290,7 +290,7 @@ Expected: FAIL with `MISSING pageserver`.
 FROM neond/neond@sha256:REPLACE_WITH_PINNED_DIGEST AS neon-binaries
 
 FROM node:22-bookworm-slim
-# Runtime libs the neon binaries + postgres need (oracle: neond Dockerfile runtime stage)
+# Runtime libs the neon binaries + postgres need (oracle: neon Dockerfile final/runtime stage)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl libssl3 libpq5 libreadline8 libseccomp2 libcurl4 \
     libicu72 zlib1g liblz4-1 libzstd1 libxml2 libkrb5-3 libuuid1 \
@@ -896,7 +896,7 @@ git add -A && git commit -m "feat: sqlite state layer with repos and per-branch 
   - `start(): Promise<void>` (resolves when `readyNeedle` seen on stdout or stderr; rejects on timeout/exit)
   - `stop(timeoutMs?: number): Promise<void>` (SIGTERM, then SIGKILL after timeout; resolves on exit)
   - `state: "stopped"|"starting"|"running"|"failed"`, `pid: number | null`, `recentLines(n: number): string[]`
-  - ~~`waitForLine` internal helper~~ **AMENDED (A10):** needle-watching is inlined in `start()` (per-stream readline watch, one shared readiness timeout) rather than a named helper — oracle: neond `wait_for_output_timeout` (`src/mgmt/compute/mod.rs:245-252`). Post-review the class also fences handlers by child identity, survives stop()-during-starting, evicts readline interfaces on exit, and swallows onLine observer errors (commit b1623d5).
+  - ~~`waitForLine` internal helper~~ **AMENDED (A10):** needle-watching is inlined in `start()` (per-stream readline watch, one shared readiness timeout) rather than a named helper — oracle: neon `control_plane/src/background_process.rs::start_process` (poll-with-retry-timeout readiness check; `neon_local`'s own process-supervision equivalent). Post-review the class also fences handlers by child identity, survives stop()-during-starting, evicts readline interfaces on exit, and swallows onLine observer errors (commit b1623d5).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1144,8 +1144,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ManagedProcess } from "./process.js";
 
-// oracle: src/daemon/postgres/mod.rs — initdb/postgres args and env.
-// Deviation: user is `devdb` (neond uses `neond`).
+// This wraps storcon_db, the storage controller's own metadata Postgres — not a compute. oracle:
+// neon control_plane/src/storage_controller.rs (closest neon analog of a component initdb'ing its
+// own private Postgres); the actual initdb/postgres args and env below are DevDB's own.
+// DevDB's own choice: the storcon_db superuser is `devdb` (neon_local's equivalent uses the host
+// OS user via `whoami::username()`, not a fixed name — not directly comparable).
 export function resolveVanillaPgDir(pgInstallDir: string): string {
   const vanilla = join(pgInstallDir, "vanilla_v17");
   if (existsSync(vanilla)) return vanilla;
@@ -1230,7 +1233,7 @@ git add -A && git commit -m "feat: embedded postgres wrapper for storage control
 - Create: `packages/daemon/src/engine/configs.ts`
 - Test: `packages/daemon/test/configs.test.ts`
 
-> **Trust-mode deviation (spec decision #7 detail):** neond enables NeonJWT auth on every engine component via an Ed25519 keypair (`http_auth_type`/`pg_auth_type = "NeonJWT"`, storcon `--jwt-token/--peer-jwt-token/--safekeeper-jwt-token/--public-key`, safekeeper `--*-auth-public-key-path`, pageserver `NEON_AUTH_TOKEN`, compute `storage_auth_token`). DevDB omits ALL of it: engine ports bind to `127.0.0.1` inside the container and upstream `neon_local` runs this exact stack in trust mode by default. **Fallback if any component refuses trust mode during Task 8:** port neond's `component_auth` (Ed25519 keypair + JWT per scope) — the flags to re-add are all listed above and in the oracle map.
+> **Trust-mode deviation (spec decision #7 detail):** official Neon supports NeonJWT auth on every engine component via an Ed25519 keypair (`http_auth_type`/`pg_auth_type = "NeonJWT"`, storcon `--jwt-token/--peer-jwt-token/--safekeeper-jwt-token/--public-key`, safekeeper `--*-auth-public-key-path`, pageserver `NEON_AUTH_TOKEN`, compute `storage_auth_token`). DevDB omits ALL of it: engine ports bind to `127.0.0.1` inside the container and upstream `neon_local` runs this exact stack in trust mode by default. **Fallback if any component refuses trust mode during Task 8:** re-enable Neon's own `component_auth` (Ed25519 keypair + JWT per scope) — the flags to re-add are all listed above and in the oracle map.
 
 **Interfaces:**
 - Consumes: `DevdbConfig` (Task 3).
@@ -2059,7 +2062,7 @@ git add -A && git commit -m "feat: typed engine http clients (storcon, pageserve
 
 ### Task 10: Compute config generation (SCRAM, postgresql.conf, pg_hba, ComputeSpec JSON)
 
-> **AMENDED (A15, post-review):** beyond the blocks below — pg_hba's IPv6 loopback row is `::1/128` (the oracle's `::1/32` is an upstream bug: far broader than loopback — documented internally in docs/notes/2026-07-02-neond-pg-hba-ipv6-loopback.md; do not report upstream, per policy); `hba_file` is GUC-quoted via `pgQuote`; `computeConfigJson` validates both ids with `assertEngineId`; tests pin `pageserver_connection_info` exactly and cover SCRAM salt freshness + custom iterations. T11 live-run watchpoint: `format_version` serializes as JSON `1` (JS int/float) — expected fine for the Rust deserializer, confirm. See commit 9a17afd.
+> **AMENDED (A15, post-review):** beyond the blocks below — pg_hba's IPv6 loopback row is `::1/128` (the inherited `::1/32` default is far broader than loopback — documented internally in docs/notes/2026-07-02-pg-hba-ipv6-loopback.md; do not report upstream, per policy); `hba_file` is GUC-quoted via `pgQuote`; `computeConfigJson` validates both ids with `assertEngineId`; tests pin `pageserver_connection_info` exactly and cover SCRAM salt freshness + custom iterations. T11 live-run watchpoint: `format_version` serializes as JSON `1` (JS int/float) — expected fine for the Rust deserializer, confirm. See commit 9a17afd.
 
 **Files:**
 - Create: `packages/daemon/src/compute/scram.ts`, `packages/daemon/src/compute/pgconf.ts`, `packages/daemon/src/compute/spec.ts`, `packages/daemon/src/compute/password.ts`
@@ -2216,7 +2219,7 @@ export function computePostgresqlConf(a: { port: number; hbaPath: string }): str
 
 // oracle: src/mgmt/compute/pg_hba.conf, hostssl lines dropped (no TLS).
 // Deviation: ::1/128, not upstream's ::1/32 — /32 is a prefix (matches all of ::/32,
-// incl. v4-mapped addrs), not loopback. See docs/notes/2026-07-02-neond-pg-hba-ipv6-loopback.md.
+// incl. v4-mapped addrs), not loopback. See docs/notes/2026-07-02-pg-hba-ipv6-loopback.md.
 export const PG_HBA = `# TYPE  DATABASE  USER          ADDRESS       METHOD
 local   all       cloud_admin                 trust
 host    all       cloud_admin   127.0.0.1/32  trust
@@ -4140,8 +4143,8 @@ Time travel:
 
 Status: Phase 1 (engine + branching over REST). Web UI, MCP server for agents,
 import/export, and S3/Azure durability land in subsequent phases.
-Built on [Neon](https://github.com/neondatabase/neon)'s storage engine;
-architecture informed by [neond](https://github.com/matisiekpl/neond) (Apache 2.0).
+Built on [Neon](https://github.com/neondatabase/neon)'s storage engine (Apache 2.0);
+architecture and orchestration are DevDB's own.
 ```
 
 - [ ] **Step 5: Commit**

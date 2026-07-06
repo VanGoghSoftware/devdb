@@ -50,7 +50,7 @@ export class EngineRuntime {
     });
     this.storconDbUri = this.storconDb.connectionUri();
 
-    // Catch-all sink on 127.0.0.1:4318 (oracle: neond src/daemon/tracer/mod.rs) — absorbs the
+    // Catch-all sink on 127.0.0.1:4318 (DevDB's own — see engine/tracer.ts) — absorbs the
     // binaries' OTLP trace exports AND the storage_controller's --control-plane-url upcalls, both
     // of which target 4318. Constructed here, started first in start() / stopped last in stop().
     this.tracer = new Tracer(cfg.engine.tracerPort, (line) => {
@@ -79,7 +79,9 @@ export class EngineRuntime {
     await proc.start();
   }
 
-  // oracle: startup order src/daemon/mod.rs:182-232
+  // oracle: neon control_plane/src/bin/neon_local.rs (handle_start_all_impl) + background_process.rs
+  // (per-process spawn+wait-ready, ~10s poll). neon starts services CONCURRENTLY (JoinSet); DevDB's
+  // fixed sequential order storcon_db → broker → storcon → safekeeper → pageserver is its own choice.
   async start(): Promise<void> {
     try {
       // First: the tracer sink, so it's listening before storcon/pageserver ever emit a trace or
@@ -120,7 +122,7 @@ export class EngineRuntime {
     }
   }
 
-  // oracle: src/daemon/mod.rs:247-281 (no bearer — trust mode)
+  // oracle: neon control_plane/src/storage_controller.rs register_safekeepers / node_register (no bearer — trust mode)
   private async registerSafekeeper(): Promise<void> {
     const url = `http://127.0.0.1:${this.cfg.engine.storconPort}/control/v1/safekeeper/1`;
     const body = JSON.stringify(safekeeperRegistrationBody(this.cfg, new Date().toISOString()));
@@ -144,7 +146,8 @@ export class EngineRuntime {
     throw new Error(`safekeeper registration at ${url} failed after retries: ${String(lastError)}`);
   }
 
-  // oracle: shutdown order src/daemon/mod.rs:235-244
+  // oracle: neon control_plane/src/bin/neon_local.rs try_stop_all (stop order); DevDB order:
+  // pageserver → safekeeper → storage_controller → storage_broker → storcon_db → tracer.
   async stop(): Promise<void> {
     for (const name of ["pageserver", "safekeeper", "storage_controller", "storage_broker"]) {
       await this.procs.get(name)?.stop();

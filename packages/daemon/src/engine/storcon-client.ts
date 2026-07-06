@@ -25,7 +25,7 @@ export class StorconClient {
     private sleepMs: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   ) {}
 
-  // oracle: src/mgmt/service/project.rs:95-123 — POST /v1/tenant, expect 201.
+  // oracle: neon storage_controller POST /v1/tenant (http.rs, handle_tenant_create), expect 201.
   // CONFIRMED live (storage_controller, 2026-07-02): TenantCreateRequest has no nested `config`
   // field — sending one 400s with "unknown field `config`". The TenantConfig fields flatten
   // directly onto the top-level request body alongside new_tenant_id/generation/placement_policy.
@@ -59,7 +59,7 @@ export class StorconClient {
     }
   }
 
-  // oracle: src/mgmt/service/branch.rs:570-599 — storcon proxies this pageserver route.
+  // oracle: neon pageserver GET …/timeline/:timeline_id/get_lsn_by_timestamp (routes.rs, get_lsn_by_timestamp_handler) — storcon proxies this pageserver route (no route of its own in storage_controller/src/http.rs).
   async getLsnByTimestamp(tenantId: string, timelineId: string, isoTimestamp: string): Promise<{ lsn: string; kind: string }> {
     assertEngineId(tenantId);
     assertEngineId(timelineId);

@@ -1,4 +1,5 @@
-// oracle: src/mgmt/compute/mod.rs:737-809 setup_pg_conf. Deviations: no ssl block, no cert files.
+// oracle: neon compute_tools/src/config.rs → write_postgres_conf (postgresql.conf assembly from
+// the ComputeSpec). Deviations: no ssl block, no cert files.
 
 function pgQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
@@ -38,7 +39,9 @@ export function computePostgresqlConf(a: { port: number; hbaPath: string }): str
   return kv.map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
 }
 
-// oracle: src/mgmt/compute/pg_hba.conf, hostssl lines dropped (no TLS)
+// oracle: neon compute_tools/src/spec.rs → update_pg_hba + params.rs::PG_HBA_ALL_MD5, hostssl
+// lines dropped (no TLS). Deviation: neon appends one md5 catch-all onto initdb's own pg_hba.conf
+// defaults; DevDB instead writes the whole file, with trust for cloud_admin on loopback.
 // (deviation: oracle uses ::1/32, which is far broader than IPv6 loopback — /128 is the loopback host)
 export const PG_HBA = `# TYPE  DATABASE  USER          ADDRESS       METHOD
 local   all       cloud_admin                 trust

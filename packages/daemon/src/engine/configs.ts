@@ -16,10 +16,10 @@ export function engineDirs(cfg: DevdbConfig) {
   };
 }
 
-// oracle: src/daemon/pageserver/mod.rs:67-96 (auth keys omitted — trust mode, see Task 7 note)
-// Trust-mode deviation (spec decision #7 detail): neond enables NeonJWT auth on every engine
-// component. DevDB omits ALL of it: engine ports bind to 127.0.0.1 inside the container and
-// upstream neon_local runs this exact stack in trust mode by default.
+// oracle: neon control_plane/src/pageserver.rs pageserver_init_make_toml (auth keys omitted — trust mode, see Task 7 note)
+// Trust-mode deviation (spec decision #7 detail): control_plane conditionally enables NeonJWT auth
+// on every engine component when configured. DevDB omits ALL of it: engine ports bind to 127.0.0.1
+// inside the container and upstream neon_local runs this exact stack in trust mode by default.
 // pg_distrib_dir points at the daemon-composed symlink dir (builds/pgdistrib.ts) — baked majors
 // stay baked; downloaded-only majors resolve for walredo.
 export function pageserverToml(cfg: DevdbConfig): string {
@@ -48,7 +48,7 @@ export function pageserverIdentityToml(): string {
 }
 
 export function pageserverMetadataJson(cfg: DevdbConfig): string {
-  // oracle: src/daemon/pageserver/mod.rs:125-130
+  // oracle: neon control_plane/src/pageserver.rs start() metadata.json write → pageserver_api::config::NodeMetadata
   return JSON.stringify({
     host: "127.0.0.1",
     http_host: "127.0.0.1",
@@ -62,7 +62,7 @@ export interface ProcessSpec {
 }
 
 export function brokerSpec(cfg: DevdbConfig): ProcessSpec {
-  // oracle: src/daemon/mod.rs:67-75
+  // oracle: neon control_plane/src/broker.rs start()
   // (trust mode: the broker takes no auth flags in the oracle either — nothing to omit)
   return {
     name: "storage_broker",
@@ -73,7 +73,7 @@ export function brokerSpec(cfg: DevdbConfig): ProcessSpec {
 }
 
 export function storconSpec(cfg: DevdbConfig, dbUri: string): ProcessSpec {
-  // oracle: src/daemon/mod.rs:83-109 (JWT args omitted — trust mode)
+  // oracle: neon control_plane/src/storage_controller.rs start() (JWT args omitted — trust mode)
   return {
     name: "storage_controller",
     bin: join(cfg.neonBinDir, "storage_controller"),
@@ -90,7 +90,7 @@ export function storconSpec(cfg: DevdbConfig, dbUri: string): ProcessSpec {
 }
 
 export function safekeeperSpec(cfg: DevdbConfig): ProcessSpec {
-  // oracle: src/daemon/mod.rs:117-144 (auth key paths omitted — trust mode)
+  // oracle: neon control_plane/src/safekeeper.rs start() (auth key paths omitted — trust mode)
   return {
     name: "safekeeper",
     bin: join(cfg.neonBinDir, "safekeeper"),
@@ -107,7 +107,7 @@ export function safekeeperSpec(cfg: DevdbConfig): ProcessSpec {
 }
 
 export function pageserverSpec(cfg: DevdbConfig): ProcessSpec {
-  // oracle: src/daemon/mod.rs:152-165 (NEON_AUTH_TOKEN omitted — trust mode)
+  // oracle: neon control_plane/src/pageserver.rs start() (NEON_AUTH_TOKEN omitted — trust mode)
   return {
     name: "pageserver",
     bin: join(cfg.neonBinDir, "pageserver"),
@@ -117,7 +117,7 @@ export function pageserverSpec(cfg: DevdbConfig): ProcessSpec {
 }
 
 export function safekeeperRegistrationBody(cfg: DevdbConfig, nowIso: string): object {
-  // oracle: src/daemon/mod.rs:247-281
+  // oracle: neon control_plane/src/storage_controller.rs register_safekeepers body shape
   return {
     id: 1, region_id: "devdb-1", host: "127.0.0.1",
     port: cfg.engine.safekeeperPgPort, http_port: cfg.engine.safekeeperHttpPort,

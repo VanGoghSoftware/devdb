@@ -366,11 +366,13 @@ describe("TimeTravelService", () => {
     expect(queue.pendingCount()).toBe(0);
   });
 
-  // Review fix 3: oracle (neond branch.rs:689-701) classifies engine LSN-range failures at
-  // create-at-LSN time into a client-actionable 400, not a generic passthrough of whatever status
-  // the engine returned. restoreInPlace always creates at an LSN (its own-timeline branch point),
-  // so it's the most direct path to exercise this without also standing up a second scenario for
-  // branchAtTimestamp (which shares the exact same classifyLsnRangeError() helper).
+  // Review fix 3: oracle (neon pageserver's CreateTimelineError::AncestorLsn/AncestorNotActive/
+  // AncestorArchived, mapped in http/routes.rs timeline_create_handler; see services/timetravel.ts
+  // classifyLsnRangeError) classifies engine LSN-range failures at create-at-LSN time into a
+  // client-actionable 400, not a generic passthrough of whatever status the engine returned.
+  // restoreInPlace always creates at an LSN (its own-timeline branch point), so it's the most
+  // direct path to exercise this without also standing up a second scenario for branchAtTimestamp
+  // (which shares the exact same classifyLsnRangeError() helper).
   it("restoreInPlace maps an engine LSN-out-of-range failure to a 400 carrying the engine's text", async () => {
     const { f, mainBranch, tt } = await seeded();
     vi.mocked(f.pageserver.timelineCreate).mockRejectedValueOnce(

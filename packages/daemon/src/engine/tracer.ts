@@ -1,16 +1,16 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-// oracle: src/daemon/tracer/mod.rs — neond runs a catch-all HTTP sink on 127.0.0.1:4318 that
-// absorbs BOTH the engine binaries' OTLP trace exports (POST /v1/traces) AND the
-// storage_controller's control-plane compute-notify upcalls (its `--control-plane-url
-// http://127.0.0.1:4318`, e.g. POST /notify-attach — see engine/configs.ts storconSpec). Without a
-// listener there, every export and every upcall hits a dead port: the binaries log a
-// connection-refused error on a growing-backoff retry loop (observed live 2026-07-04, both the OTLP
-// BatchSpanProcessor and the storage_controller notify_attach reconciler). neond's handler answers
-// ANY method + ANY path with 200 "{}"; ported faithfully. Loopback-only, matching every other
-// engine port's in-container posture. DevDB shipped the storcon arg pointing here (Task-1 port) but
-// never ported this sink — this closes that gap.
+// DevDB's own no-op OTLP sink so the engine's tracing export never blocks; the engine emits to
+// TRACER_PORT (OTLP/HTTP default 4318). It absorbs BOTH the engine binaries' OTLP trace exports
+// (POST /v1/traces) AND the storage_controller's control-plane compute-notify upcalls (its
+// `--control-plane-url http://127.0.0.1:4318`, e.g. POST /notify-attach — see engine/configs.ts
+// storconSpec). Without a listener there, every export and every upcall hits a dead port: the
+// binaries log a connection-refused error on a growing-backoff retry loop (observed live
+// 2026-07-04, both the OTLP BatchSpanProcessor and the storage_controller notify_attach
+// reconciler). The handler answers ANY method + ANY path with 200 "{}" — good enough to keep both
+// clients quiet. Loopback-only, matching every other engine port's in-container posture. DevDB
+// shipped the storcon arg pointing here (Task-1 port) but never had a sink — this closes that gap.
 export class Tracer {
   private server: Server | null = null;
 
@@ -23,7 +23,8 @@ export class Tracer {
     return new Promise((resolve, reject) => {
       const server = createServer((req, res) => {
         // Discard the request body (OTLP protobuf / notify JSON — never read) so the socket drains,
-        // then answer exactly like neond's tracer handler: 200 "{}", for every method and path.
+        // then answer 200 "{}" unconditionally, for every method and path — good enough to keep
+        // both the OTLP exporter and the storage_controller upcall client quiet.
         req.resume();
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");

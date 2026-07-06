@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-02
 **Status:** Approved pending final user review
-**Oracle:** [neond](https://github.com/matisiekpl/neond) at `~/git/neond` (Apache 2.0) — studied, not copied; UI explicitly rebuilt from scratch.
+**Oracle:** official [neondatabase/neon](https://github.com/neondatabase/neon) (Apache 2.0) — engine source, HTTP APIs, `control_plane`, and `compute_tools` studied, not copied; UI explicitly rebuilt from scratch.
 
 ## Product statement
 
@@ -25,7 +25,7 @@ DevDB is a local development Postgres server with Neon-style instant branching a
 - Branch *merging* (branches fork; they never merge — same as Neon).
 - Auto-suspend of idle endpoints (start is automated where it helps agents; stop stays explicit).
 - Native (non-Docker) packaging.
-- Building Neon/Postgres from source (binaries come from the pinned neond image).
+- Building Neon/Postgres from source (binaries come from a pinned engine image).
 
 ## Decisions log
 
@@ -33,11 +33,11 @@ DevDB is a local development Postgres server with Neon-style instant branching a
 |---|----------|--------|
 | 1 | Runtime | Single Docker container + one data volume |
 | 2 | Control-plane language | TypeScript/Node 22 (Neon engine binaries stay Rust, driven via subprocess + HTTP) |
-| 3 | "Checkpoint" semantics | neond's meaning: durability sync status. User-facing time travel = branch/restore/reset |
+| 3 | "Checkpoint" semantics | Neon's meaning: durability sync status. User-facing time travel = branch/restore/reset |
 | 4 | Bucket features | Both: continuous durability (S3/Azure) **and** explicit `pg_dump` exports |
 | 5 | Agent connection model | Per-branch connection strings; "switch" = fetch another branch's connstring. No mutable pointer |
 | 6 | Auth | None (localhost trust) |
-| 7 | Engine orchestration | Faithful port of neond's process topology ("Approach A") |
+| 7 | Engine orchestration | Faithful port of Neon's own reference process topology ("Approach A") |
 | 8 | UI stack | React 19 + Vite + **Mantine** |
 | 9 | PG versions | Two most recent stable majors (currently 17, 18); older kept if binaries provide them |
 | 10 | Extensions | contrib + pgvector (inherited) + pg_cron + PostGIS (compiled in our image) |
@@ -54,7 +54,7 @@ DevDB is a local development Postgres server with Neon-style instant branching a
 
 ## Architecture
 
-One container. The Node daemon is PID 1 and supervises (neond's exact topology):
+One container. The Node daemon is PID 1 and supervises (Neon's own reference topology):
 
 | Process | Ports (container-internal) |
 |---|---|
@@ -69,18 +69,18 @@ One container. The Node daemon is PID 1 and supervises (neond's exact topology):
 
 **Data dir** (single mounted volume): pageserver workdir, safekeeper workdir, storcon PG data, `state.db` (SQLite), per-process log files, lockfile.
 
-**Lifecycle:** boot = acquire lockfile (stale-lock protocol ported from neond) → optional state restore from bucket → start storcon-PG → broker → storcon → pageserver → safekeeper → reconcile SQLite state against real engine state (existing timelines, dead endpoints). Shutdown (SIGTERM) = stop computes → wait for durability sync ("final checkpoint") → stop engine processes in reverse order → release lock. `stop_grace_period` documented in compose file.
+**Lifecycle:** boot = acquire lockfile (DevDB's own stale-lock protocol — official Neon's local orchestration has no equivalent, since it's typically run interactively rather than supervising an unclean container shutdown) → optional state restore from bucket → start storcon-PG → broker → storcon → pageserver → safekeeper → reconcile SQLite state against real engine state (existing timelines, dead endpoints). Shutdown (SIGTERM) = stop computes → wait for durability sync ("final checkpoint") → stop engine processes in reverse order → release lock. `stop_grace_period` documented in compose file.
 
-**Engine binaries:** multi-stage `COPY` from the published `neond/neond` image **pinned by digest** (Apache 2.0, attribution in NOTICE). Our Dockerfile adds: Node runtime, our daemon, extension builds (below). If the pinned image lacks a required PG major (18), we build that compute flavor from the `neon` submodule as a fallback build stage — verified during planning.
+**Engine binaries:** multi-stage `COPY` from a published engine-binaries image **pinned by digest** (Apache 2.0, attribution in NOTICE). Our Dockerfile adds: Node runtime, our daemon, extension builds (below). If the pinned image lacks a required PG major (18), we build that compute flavor from the `neon` submodule as a fallback build stage — verified during planning.
 
-**Simplifications vs neond:** no PgBouncer (agents don't need pooling; endpoints accept direct connections), no TLS (SCRAM auth stays), no orgs/users/JWT, SQLite instead of a second embedded Postgres for management state.
+**Simplifications vs Neon's own reference topology:** no PgBouncer (agents don't need pooling; endpoints accept direct connections), no TLS (SCRAM auth stays), no orgs/users/JWT, SQLite instead of a second embedded Postgres for management state.
 
 ## Control-plane daemon (TypeScript, Fastify)
 
 Modules with hard boundaries:
 
 - **ProcessSupervisor** — spawn/monitor engine binaries; ordered start/stop; log capture to ring buffer + files; crash restart with backoff.
-- **Engine clients** — typed HTTP clients for pageserver/storcon/safekeeper management APIs. Rule: *make the same calls neond makes* (`timeline_create` with `ancestor_timeline_id`/`ancestor_start_lsn`, `timeline_info`, reset-to-LSN, tenant create via storcon). Each client method cites its neond reference (file:line) in a comment.
+- **Engine clients** — typed HTTP clients for pageserver/storcon/safekeeper management APIs. Rule: *make the same calls official Neon makes* (`timeline_create` with `ancestor_timeline_id`/`ancestor_start_lsn`, `timeline_info`, reset-to-LSN, tenant create via storcon). Each client method cites its neon reference (file:line or endpoint) in a comment.
 - **ComputeManager** — endpoint port allocation, compute spec JSON generation (incl. `shared_preload_libraries`), `compute_ctl` launch, readiness poll, SCRAM secrets.
 - **JobRunner** — imports/exports/restores as persisted jobs with SSE-streamed log channels.
 - **State** — SQLite (Drizzle, WAL mode). All branch mutations flow through a per-branch queue (no interleaved operations).
@@ -133,7 +133,7 @@ Superpowers-convention SKILL.md files, installable to `~/.claude/skills` or a pr
 
 ## Web UI
 
-React 19 + Vite + **Mantine**, static build embedded in the daemon at `:4400`. No login. Fresh design — no neond visual/layout reuse.
+React 19 + Vite + **Mantine**, static build embedded in the daemon at `:4400`. No login. Fresh design — no upstream visual/layout reuse.
 
 - **Dashboard** — projects, engine health, durability badge.
 - **Project view** — **git-graph-style branch tree** with endpoint status chips and per-branch actions (branch-from-here, copy connstring, start/stop, restore, reset, export, delete). Agent-created branches tagged with their fork context — creating agent, its **git branch**, purpose — as an inline chip on the tree node, full context in the branch panel; whose-fork-is-whose must be readable at a glance.
@@ -154,12 +154,12 @@ Sequencing within phase 4: (1) is the base import; (2) the initial manual path (
 
 ## Durability & recovery
 
-Daemon-level mode `none | s3 | azure` (config/env at boot). We generate pageserver `remote_storage` + safekeeper WAL-backup config for the chosen backend (upstream Neon supports S3, Azure, GCS natively — verified in `libs/remote_storage`; neond wired only S3, we wire S3 + Azure). When enabled: layers stream continuously; `state.db` is uploaded on an interval and on graceful shutdown. Recovery: fresh container + same bucket + same config → restore `state.db`, fetch layers on demand. Switching `none → bucket` allowed; `bucket → none` blocked with explanation.
+Daemon-level mode `none | s3 | azure` (config/env at boot). We generate pageserver `remote_storage` + safekeeper WAL-backup config for the chosen backend (upstream Neon supports S3, Azure, GCS natively — verified in `libs/remote_storage`; DevDB wires S3 + Azure). When enabled: layers stream continuously; `state.db` is uploaded on an interval and on graceful shutdown. Recovery: fresh container + same bucket + same config → restore `state.db`, fetch layers on demand. Switching `none → bucket` allowed; `bucket → none` blocked with explanation.
 
 ## Postgres versions & extensions
 
 - **Versions:** the two most recent stable majors — currently **17 and 18** — selectable per project; older majors (14–16) exposed if present in the engine binaries. Policy: track new stable majors as upstream Neon supports them.
-- **Extensions (every supported major):** full contrib set + **pgvector** (inherited from neond image); **pg_cron** and **PostGIS** compiled in our Dockerfile against the shipped `pg_install` headers. `shared_preload_libraries` preset (pg_cron) in generated compute config so `CREATE EXTENSION` just works. UI lists available extensions per project.
+- **Extensions (every supported major):** full contrib set + **pgvector** (inherited from the pinned engine image); **pg_cron** and **PostGIS** compiled in our Dockerfile against the shipped `pg_install` headers. `shared_preload_libraries` preset (pg_cron) in generated compute config so `CREATE EXTENSION` just works. UI lists available extensions per project.
 
 ## Error handling
 
@@ -192,11 +192,11 @@ docs/                user docs · docs/superpowers/specs/ design docs
 
 ## Risks & open questions (to resolve in planning)
 
-1. **PG 18 in neond image** — does the pinned image ship v18 compute? If not: fallback build stage from `neon` submodule.
-2. **Exact engine API shapes** — pin pageserver/storcon endpoints + payloads by reading neond's calls (`src/mgmt/service/branch.rs`, `src/daemon/*`) against the initialized `neon` submodule.
+1. **PG 18 in the pinned engine image** — does the pinned image ship v18 compute? If not: fallback build stage from `neon` submodule.
+2. **Exact engine API shapes** — pin pageserver/storcon endpoints + payloads by reading official Neon's own call sites against the initialized `neon` submodule.
 3. **pg_cron in Neon computes** — confirm background-worker behavior in `compute_ctl`-launched computes (Neon cloud supports it; verify locally).
 4. **PostGIS build time/size** — acceptable image growth; if painful, make it an opt-in image variant.
-5. **neond image digest pinning** — choose digest; document upgrade procedure.
+5. **Engine image digest pinning** — choose digest; document upgrade procedure.
 6. **Branch-from-timestamp UX** — timestamp→LSN resolution comes from engine APIs; confirm precision/rounding behavior.
 
 ## v1 acceptance (demo script)

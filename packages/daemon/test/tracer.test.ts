@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Tracer } from "../src/engine/tracer.js";
 
-// The tracer is a catch-all HTTP sink (oracle: neond src/daemon/tracer/mod.rs) that absorbs the
+// The tracer is DevDB's own catch-all HTTP sink (mirrors src/engine/tracer.ts) that absorbs the
 // engine binaries' OTLP trace exports AND the storage_controller's control-plane compute-notify
 // upcalls — both target 127.0.0.1:4318, which nothing else serves. Every method + path → 200 "{}".
 // Tests bind an OS-assigned ephemeral port (Tracer(0)) so they never touch the real 4318 or each other.
