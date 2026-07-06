@@ -263,6 +263,11 @@ RUN CARGO_TERM_PROGRESS_WHEN=never CI=1 \
 # 0.7.4->0.8.0 upgrade base) — which, unlike vector--0.8.0.sql (regenerated from
 # sql/vector.sql by a make rule), has NO rule to recreate it. So we stash it once
 # and restore it after each clean, before that major's install.
+# We mark pgvector trusted (neon compute-node.Dockerfile:538) so a non-superuser
+# can CREATE EXTENSION vector. neon hardcodes its own prefix
+# (/usr/local/pgsql/share/extension); our pg_install prefix differs, so we derive
+# the control-file dir from `pg_config --sharedir` — the exact sharedir PGXS
+# installed vector.control into.
 # `OPTFLAGS=""` strips pgvector's default -march=native (we build on a different
 # machine than we run) — compute-node.Dockerfile:520-522.
 # ---------------------------------------------------------------------------
@@ -282,7 +287,8 @@ RUN set -e; \
       make MAKELEVEL=0 -C /tmp/pgvector-src USE_PGXS=1 PG_CONFIG="$pg_config" OPTFLAGS="" clean; \
       cp /tmp/vector--0.7.4.sql.keep /tmp/pgvector-src/sql/vector--0.7.4.sql; \
       make MAKELEVEL=0 -C /tmp/pgvector-src USE_PGXS=1 PG_CONFIG="$pg_config" OPTFLAGS="" -j"${JOBS}" install; \
-      echo 'trusted = true' >> "/src/neon/pg_install/$ver/share/extension/vector.control"; \
+      sharedir="$("$pg_config" --sharedir)"; \
+      echo 'trusted = true' >> "$sharedir/extension/vector.control"; \
     done; \
     rm -rf /tmp/pgvector.tar.gz /tmp/pgvector-src /tmp/vector--0.7.4.sql.keep
 
