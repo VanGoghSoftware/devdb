@@ -104,6 +104,23 @@ function makeProvisioner(a: {
   return { state, registry, logs, events, provisioner, recomposeDistrib };
 }
 
+// Same-version dedup (extractFixupAndGate) no-ops a pull whose detected minor already exists as a
+// ready build of that major. Tests that seed a BAKED v17 and then pull v17 must give the pulled
+// build a DIFFERENT minor than the baked one, or the pull dedups before reaching what it exercises
+// (gate / activate / recompose / compensation). This factory returns a path-aware detectVersion —
+// makeProvisioner hands the SAME fn to BuildRegistry (baked detection, probes under the install
+// dir) and the Provisioner (pull detection, probes under the builds/tmp dir), so a check on whether
+// the pgbin lives under `builds` cleanly separates them: pulled ⇒ pulledMinor, baked ⇒ bakedMinor.
+// Default pulledMinor is 7 (not 6) so it also clears the minor-6 downloaded `d1` rows some of these
+// tests pre-seed alongside the baked-5 build.
+function pathAwareDetectVersion(
+  builds: string, opts: { pulledMinor?: number; bakedMinor?: number } = {},
+): (pgbin: string) => Promise<{ major: number; minor: number }> {
+  const pulledMinor = opts.pulledMinor ?? 7;
+  const bakedMinor = opts.bakedMinor ?? 5;
+  return async (pgbin) => ({ major: 17, minor: pgbin.startsWith(builds) ? pulledMinor : bakedMinor });
+}
+
 describe("Provisioner", () => {
   it("pull happy path: downloading→validating→ready+active; build.json written; events published; log channel has layer lines", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
@@ -177,6 +194,9 @@ describe("Provisioner", () => {
     const { oci } = fakeOci();
     const { state, registry, provisioner } = makeProvisioner({
       install, builds, oci,
+      // Pulled build detects a DIFFERENT minor (17.7) than the baked (17.5), so the same-version
+      // dedup doesn't no-op it before it reaches the gate this test is exercising.
+      detectVersion: pathAwareDetectVersion(builds),
       validate: async () => { throw new Error("compute never became ready"); },
     });
     await registry.seedBaked();
@@ -510,7 +530,10 @@ describe("Provisioner", () => {
     dirs.push(root);
     await fakeInstallDir(install, "v17"); // baked v17, seeded + active (the would-be revert target)
     const { oci } = fakeOci();
-    const { state, registry, logs, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+    // Pulled build detects 17.7 (≠ baked 17.5) so it isn't dedup-no-op'd before it activates.
+    const { state, registry, logs, provisioner, recomposeDistrib } = makeProvisioner({
+      install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+    });
     await registry.seedBaked();
     registry.resolveActives(); // baked-v17 active
     expect(registry.pgbinFor(17).buildId).toBe("baked-v17");
@@ -677,6 +700,74 @@ describe("Provisioner", () => {
 
     expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: true });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+  });
+
+  // Same-version dedup (the fix): a baked build carries the '' digest sentinel, so `latest`
+  // resolving to a NEW digest that turns out to be the SAME minor already baked never digest-matches
+  // — it reaches the version dedup in extractFixupAndGate and must no-op there rather than install a
+  // redundant second build of the identical version (which would make Activate a confusing toggle
+  // between two 17.5s). The baked build keeps its default detectVersion minor (17.5); the pulled
+  // build detects the SAME minor (default makeProvisioner detectVersion returns 17.5 regardless of
+  // path), so the dedup fires.
+  it("same-minor pull is a no-op: no duplicate build", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked v17 → seedBaked detects minor 5
+    const { oci } = fakeOci({ digest: DIGEST_A }); // a real digest, NOT the baked '' sentinel
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives(); // baked-v17 (17.5) active
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      return r!;
+    });
+    // The pull no-op'd against the already-installed 17.5 — recording the source it collided with.
+    expect(row.error).toMatch(/already installed as 17\.5/);
+    // The digest→minor link is persisted on the failing row (so check() can read it back), the
+    // resolved digest survives, and the failure-rm'd row drops its path claim.
+    expect(row.minor).toBe(5);
+    expect(row.imageDigest).toBe(DIGEST_A);
+    expect(row.path).toBe("");
+    // Crucially: no duplicate ready build — only the baked one remains ready (and still active).
+    const ready = state.pgBuilds.listByMajor(17).filter((b) => b.status === "ready");
+    expect(ready).toHaveLength(1);
+    expect(ready[0]).toMatchObject({ id: "baked-v17", active: true });
+  });
+
+  // The update-check counterpart of the fix: before the same-minor pull, the registry's `latest`
+  // digest is genuinely unknown (no row carries it — the baked build has the '' sentinel), so isNew
+  // is TRUE and the "update available" badge shows. After the same-minor pull no-ops, the failed row
+  // records that digest→minor 5, and 17.5 is already installed ready (baked) — so the version-aware
+  // check must now report isNew false and clear the badge, rather than perpetually offering an
+  // "update" that resolves to a version you already run.
+  it("update-check is version-aware", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked v17 (17.5)
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives(); // baked-v17 (17.5) active
+
+    // BEFORE any pull: DIGEST_A's version is unknown (baked carries ''), so the badge fires.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: true } });
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+
+    // The same-minor pull no-ops, recording DIGEST_A → minor 5 on the failed row.
+    const { buildId } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("failed");
+      expect(r?.minor).toBe(5);
+    });
+
+    // AFTER: the recorded digest→minor resolves to the already-ready baked 17.5 — no update.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: false } });
+    expect(provisioner.updateAvailableFor(17)).toBeNull();
   });
 
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
@@ -950,6 +1041,9 @@ describe("Provisioner", () => {
       const { oci } = fakeOci(); // DIGEST_A → finalDir v17/SHORT_A
       const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({
         install, builds, oci,
+        // Pulled build is 17.7 — distinct from BOTH the baked 17.5 and the seeded d1 17.6 below —
+        // so the same-version dedup doesn't no-op it before the gate (which fails) is reached.
+        detectVersion: pathAwareDetectVersion(builds),
         validate: async () => { throw new Error("compute never became ready"); }, // the gate fails
       });
       await registry.seedBaked();
@@ -1016,7 +1110,10 @@ describe("Provisioner", () => {
       dirs.push(root);
       await fakeInstallDir(install, "v17"); // baked v17 (minor 5) — the would-be revert target
       const { oci } = fakeOci(); // the v17 pull resolves DIGEST_A
-      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      // Pulled v17 build detects 17.7 (≠ baked 17.5) so it isn't dedup-no-op'd before it activates.
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({
+        install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+      });
       await registry.seedBaked();
       registry.resolveActives(); // baked-v17 active
 
@@ -1054,7 +1151,11 @@ describe("Provisioner", () => {
       dirs.push(root);
       await fakeInstallDir(install, "v17"); // baked v17 (minor 5)
       const { oci } = fakeOci(); // the pull resolves DIGEST_A → finalDir v17/SHORT_A
-      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      // Pulled build is 17.7 — distinct from BOTH the baked 17.5 and the seeded d1 17.6 below —
+      // so it activates rather than dedup-no-op'ing before this scenario runs.
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({
+        install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+      });
       await registry.seedBaked();
       registry.resolveActives(); // baked-v17 active
 
@@ -1090,7 +1191,11 @@ describe("Provisioner", () => {
       dirs.push(root);
       await fakeInstallDir(install, "v17"); // baked v17 (minor 5)
       const { oci } = fakeOci();
-      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({ install, builds, oci });
+      // Pulled build is 17.7 — distinct from BOTH the baked 17.5 and the seeded d1 17.4 below —
+      // so its auto-activate runs (not a dedup no-op) and can be suspended mid-recompose.
+      const { state, registry, provisioner, recomposeDistrib } = makeProvisioner({
+        install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+      });
       await registry.seedBaked();
       registry.resolveActives(); // baked-v17 active
 

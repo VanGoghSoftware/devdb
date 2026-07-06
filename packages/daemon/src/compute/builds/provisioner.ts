@@ -120,10 +120,18 @@ export class Provisioner {
     const out: Record<string, CheckResult> = {};
     for (const major of majors) {
       const { digest } = await this.deps.oci.resolveDigest(this.repoFor(major), "latest");
-      // byDigest is intentionally ready-preferred: absent a ready row, it returns a failed one
-      // instead (so pull() can retry). That makes a bare "found a row" check wrong here — a row
-      // that failed at this exact digest is NOT installed, so only a ready row counts.
-      const isNew = this.deps.state.pgBuilds.byDigest(digest)?.status !== "ready";
+      // Version-aware "is there something new to pull?". byDigest is ready-preferred: it surfaces a
+      // prior row at this digest — a ready install, OR the same-minor no-op extractFixupAndGate
+      // records (status failed, but with its minor set). isNew is true only when this digest is
+      // NEITHER already installed at its exact digest, NOR (via that recorded minor) a minor already
+      // present as a ready build. Without the minor arm a baked build — which carries the '' digest
+      // sentinel, so `latest` never digest-matches it — would flag "update available" forever even
+      // when `latest` resolves to the exact minor already baked.
+      const seen = this.deps.state.pgBuilds.byDigest(digest);
+      const seenMinor = seen?.minor ?? null;
+      const minorInstalled = seenMinor !== null &&
+        this.deps.state.pgBuilds.listByMajor(major).some((b) => b.status === "ready" && b.minor === seenMinor);
+      const isNew = seen?.status !== "ready" && !minorInstalled;
       const result: CheckResult = { tag: "latest", digest, isNew, at: new Date().toISOString() };
       this.lastCheck.set(major, result);
       out[String(major)] = result;
@@ -359,6 +367,28 @@ export class Provisioner {
       const msg = `image contained postgres ${detectedMajor}.${minor}, expected major ${major}`;
       await rm(tmpDir, { recursive: true, force: true });
       state.pgBuilds.updatePath(id, ""); // FIX-3(a): failure-rm'd the dir ⇒ drop the row's claim on it
+      state.pgBuilds.setStatus(id, "failed", msg);
+      this.log(id, msg);
+      this.publish();
+      return;
+    }
+
+    // --- Same-version dedup. runPipeline's digest-dedup only catches an identical DIGEST; a
+    // mutable `latest` re-tagged at a postgres MINOR already installed reaches here — most often
+    // vs a baked build, which carries the '' digest sentinel and so never digest-matches. A second
+    // build of an already-present minor is pointless: it cannot change the active version, and it
+    // makes Activate a confusing no-op toggle between two identical versions. No-op it, mirroring
+    // the major-mismatch cleanup above. Record the minor on the (failing) row FIRST so its
+    // digest→minor link persists — check()/updateAvailableFor() below read it back so the "update
+    // available" badge stops flagging a `latest` that resolves to a version you already have.
+    const sameMinor = state.pgBuilds.listByMajor(major).find(
+      (b) => b.id !== id && b.status === "ready" && b.minor === minor,
+    );
+    if (sameMinor) {
+      const msg = `already installed as ${major}.${minor} (${sameMinor.source}) — no-op`;
+      await rm(tmpDir, { recursive: true, force: true });
+      state.pgBuilds.updateMinor(id, minor);
+      state.pgBuilds.updatePath(id, ""); // failure-rm'd the dir ⇒ drop the row's claim on it
       state.pgBuilds.setStatus(id, "failed", msg);
       this.log(id, msg);
       this.publish();
