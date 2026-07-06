@@ -2,11 +2,22 @@ import { randomUUID } from "node:crypto";
 import { execa } from "execa";
 import { GenericContainer, Wait, type StartedNetwork, type StartedTestContainer } from "testcontainers";
 
-const IMAGE = "devdb:dev";
+// Image under test. Defaults to devdb:dev (built from docker/Dockerfile by
+// buildImage() below). Override with DEVDB_TEST_IMAGE to run the suite against a
+// pre-built image supplied externally — e.g. the Phase-1 `devdb:selfbuilt`
+// variant built from docker/Dockerfile.selfbuilt (self-built Neon engine).
+const IMAGE = process.env.DEVDB_TEST_IMAGE ?? "devdb:dev";
 let built = false;
 
 export async function buildImage(): Promise<void> {
   if (built) return;
+  // When DEVDB_TEST_IMAGE is set the image is supplied pre-built by the caller;
+  // do NOT rebuild it from docker/Dockerfile (that would clobber the external
+  // image with a default-sourced one).
+  if (process.env.DEVDB_TEST_IMAGE) {
+    built = true;
+    return;
+  }
   await execa("docker", ["build", "-f", "docker/Dockerfile", "-t", IMAGE, "."], {
     cwd: new URL("../../..", import.meta.url).pathname,
     stdio: "inherit",
