@@ -5,8 +5,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ManagedProcess } from "./process.js";
 
-// oracle: src/daemon/postgres/mod.rs — initdb/postgres args and env.
-// Deviation: user is `devdb` (neond uses `neond`).
+// This wraps storcon_db, the storage controller's own metadata Postgres — not a compute. oracle:
+// neon control_plane/src/storage_controller.rs → its initdb/createdb self-management (the closest
+// neon analog of a component initdb'ing its own private Postgres); the actual initdb/postgres args
+// and env below are DevDB's own.
+// DevDB's own choice: the storcon_db superuser is `devdb` (neon_local's equivalent uses the host
+// OS user via `whoami::username()`, not a fixed name — not directly comparable).
 export function resolveVanillaPgDir(pgInstallDir: string): string {
   const vanilla = join(pgInstallDir, "vanilla_v17");
   if (existsSync(vanilla)) return vanilla;

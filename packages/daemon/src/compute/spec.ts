@@ -2,7 +2,8 @@ import { computePostgresqlConf } from "./pgconf.js";
 import { scramSha256Verifier } from "./scram.js";
 import { assertEngineId } from "../engine/ids.js";
 
-// oracle: src/mgmt/compute/mod.rs:820-917 generate_config.
+// oracle: neon libs/compute_api/src/spec.rs (ComputeSpec struct) + compute_tools/src/spec_apply.rs
+// (how compute_ctl consumes it); DevDB emits the minimal spec compute_ctl requires to boot.
 // Deviation: storage_auth_token omitted (trust mode).
 // CONFIRMED live (Task 14): the pageserver_connection_info shards key ("0000") encoding below
 // was accepted as-is by compute_ctl on the first live launch that got far enough to attach to

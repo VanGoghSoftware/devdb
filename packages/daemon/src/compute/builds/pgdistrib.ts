@@ -7,8 +7,8 @@ import { join } from "node:path";
 // Callers: index.ts boot (BEFORE EngineRuntime.start() writes/reads pageserver.toml) and
 // Provisioner activation. Per-entry atomicity: symlink to a temp name then rename() over the
 // slot — a pageserver spawning a walredo mid-recompose reads either the old or the new target,
-// never a missing one. oracle: pg_distrib_dir per-major resolution is upstream pageserver
-// behavior — see engine/configs.ts pageserverToml's oracle comment (src/daemon/pageserver/mod.rs:67-96).
+// never a missing one. oracle: neon control_plane/src/pageserver.rs (pg_distrib_dir per-major
+// resolution is the pageserver's own expectation for locating each major's WAL-redo postgres).
 export async function composePgDistrib(a: {
   distribDir: string; pgInstallDir: string; downloadedOnly: Array<{ major: number; path: string }>;
 }): Promise<void> {
