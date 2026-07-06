@@ -2,7 +2,8 @@
 FROM neond/neond@sha256:e94082a476cb348daa59c960e2ce6f279cd7f745ab34ebee5562ae5bf97dafd7 AS neon-binaries
 
 FROM node:22-bookworm-slim
-# Runtime libs the neon binaries + postgres need (oracle: neond Dockerfile runtime stage)
+# Runtime libs the neon binaries + postgres need (oracle: neon Dockerfile final/runtime stage —
+# neondatabase/neon root Dockerfile installs a comparable apt-get set in its assembled-image stage)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl libssl3 libpq5 libreadline8 libseccomp2 libcurl4 \
     libicu72 zlib1g liblz4-1 libzstd1 libxml2 libkrb5-3 libuuid1 \

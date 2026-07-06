@@ -37,7 +37,7 @@ describe("dynamic pg builds (hermetic e2e)", () => {
   let dev: Devdb;
   let registry: FixtureRegistry;
   // Derived from the daemon's own baked row, not hardcoded: the fixture layer IS the baked build
-  // ("17.5" with the currently-pinned neond image), so deriving keeps every equality below — and
+  // ("17.5" with the pinned neon compute image), so deriving keeps every equality below — and
   // the tie-goes-to-baked assertions in test 3 — true by construction even if the pin moves.
   let bakedVersion: string;
   let bakedMinor: number;

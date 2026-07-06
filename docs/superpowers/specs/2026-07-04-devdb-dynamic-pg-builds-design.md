@@ -4,7 +4,7 @@
 
 ## Problem & goal
 
-DevDB's Postgres builds are frozen at image-build time (digest-pinned neond snapshot: 14.18 / 15.13 / 16.9 / 17.5). Users should be able to (a) pull a **newer minor** of an installed major (bugfixes, e.g. 16.9 → 16.10) and (b) add a **major not baked into the image**, at **runtime, from inside the product, without destroying and re-upping the container**. Agents must be able to do the same over MCP.
+DevDB's Postgres builds are frozen at image-build time (digest-pinned base-image snapshot: 14.18 / 15.13 / 16.9 / 17.5). Users should be able to (a) pull a **newer minor** of an installed major (bugfixes, e.g. 16.9 → 16.10) and (b) add a **major not baked into the image**, at **runtime, from inside the product, without destroying and re-upping the container**. Agents must be able to do the same over MCP.
 
 ## Settled decisions
 
@@ -73,7 +73,7 @@ Runs with state setup, before endpoints resume; the composed `/data/pg_distrib` 
 ## Compatibility & security posture
 
 - Trust root = the `neondatabase` Docker Hub org — the same org the baked binaries derive from. Digest pinning + layer sha256 + the validation gate bound the blast radius. Downloaded postgres runs as the same non-root `node` user as everything else.
-- Residual skew risk (frozen baked storage vs fresh compute — the neond snapshot's release is unknown; `pageserver --version` reports `git:unknown`) is owned by the gate. Documented troubleshooting knob if a gate fails on protocol negotiation: pin `neon.protocol_version` via pgconf (not built proactively). Hygiene, not guarantee: re-pin the base image at each devdb release (phase-5 CI) to keep the skew window small.
+- Residual skew risk (frozen baked storage vs fresh compute — the pinned image snapshot's release is unknown; `pageserver --version` reports `git:unknown`) is owned by the gate. Documented troubleshooting knob if a gate fails on protocol negotiation: pin `neon.protocol_version` via pgconf (not built proactively). Hygiene, not guarantee: re-pin the base image at each devdb release (phase-5 CI) to keep the skew window small.
 - Docker Hub anonymous rate limits are a non-issue at user-initiated frequency; the registry/template overrides are the documented mirror path if it ever matters.
 - Supply chain: no new npm/native deps; the `minimumReleaseAge`/`allowBuilds` rules are untouched.
 

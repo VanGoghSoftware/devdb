@@ -22,7 +22,7 @@ describe("boot", () => {
   // broker P4 (parity): the health check above passes even if the tracer sink were absent/misbound,
   // letting OTLP + storage_controller notify-attach spam connection-refused again. Assert the sink
   // is actually serving 4318 in-container for both the OTLP and control-plane paths it absorbs
-  // (oracle: neond src/daemon/tracer/mod.rs — any path -> 200). curl ships in the runtime image.
+  // (DevDB's own sink, src/engine/tracer.ts — any path -> 200). curl ships in the runtime image.
   it("serves the tracer/control-plane sink on 127.0.0.1:4318 inside the container", async () => {
     for (const path of ["/v1/traces", "/notify-attach"]) {
       const { output, exitCode } = await dev.container.exec([

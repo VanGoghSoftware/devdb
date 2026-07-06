@@ -172,5 +172,5 @@ Phase 2 (MCP server + agent skills) is live per above. Phase 3 (the embedded
 web UI — dashboard, git-graph branch tree with live updates, branch drawer,
 logs, restore) is live and served from the image at `:4400`. Import/export and
 S3/Azure durability land in subsequent phases.
-Built on [Neon](https://github.com/neondatabase/neon)'s storage engine;
-architecture informed by [neond](https://github.com/matisiekpl/neond) (Apache 2.0).
+Built on [Neon](https://github.com/neondatabase/neon)'s storage engine (Apache 2.0);
+architecture and orchestration are DevDB's own.
