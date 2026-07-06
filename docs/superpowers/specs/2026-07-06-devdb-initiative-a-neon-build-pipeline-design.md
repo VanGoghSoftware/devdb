@@ -3,6 +3,19 @@
 **Status:** approved design (brainstormed 2026-07-06), pending implementation plan.
 **Goal:** Replace the third-party `neond/neond` image as DevDB's engine-binary source with a DevDB-owned pipeline that builds the Neon engine from pinned upstream source on **one consistent base** and publishes it to our own registry — eliminating the shared-library ABI problem at the root and giving true supply-chain provenance.
 
+> **AMENDED 2026-07-06 (Phase-1 Task-3, post-validation).** The `vanilla_v17`
+> decision below — "reuse the v17 tree for free" (see Architecture, the
+> Key-decisions table, and *What this obviates*) — was **REVERSED** during Phase-1
+> integration validation. Reusing the neon-FORKED v17 as storcon_db's catalog host
+> FATALs its WAL crash recovery after an unclean stop: `resource manager with ID
+> 134 not registered` — the fork emits Neon-custom WAL that cannot replay without
+> the neon extension loaded during redo (fine for a neon compute, fatal for a
+> standalone catalog). The recipe now builds a **true upstream Postgres 17** for
+> `vanilla_v17` (`postgres/postgres` @ REL_17_5), exactly as neond's `vanillapg`
+> does. The "gap closed for free" claim was mistaken — it checked only diesel-SQL
+> compatibility, not WAL crash-recovery. See the plan's Task 3, the build README's
+> deviation #5, and `versions.json`'s `vanillaPostgres` pin.
+
 ## Context & motivation
 
 DevDB's engine binaries — storage (pageserver / safekeeper / storage_controller / storage_broker), compute (`compute_ctl` + `pg_install` for v14–v17), and a vanilla PG for storcon's catalog DB — currently come from `FROM neond/neond@sha256:…`, a third-party solo-maintainer image (`matisiekpl/neond`) that itself compiles `neondatabase/neon` + the postgres fork from source. The **de-neond references** initiative (merged 2026-07-06, `613a89c`) removed all *reference* dependence on neond; this initiative (A) removes the *binary* dependence — the last thing tying DevDB to neond.
