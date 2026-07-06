@@ -11,10 +11,10 @@ DevDB is a local-development Postgres server with Neon-style instant copy-on-wri
 
 ## Hard rules (binding even if you read nothing else)
 
-- **Never file issues, PRs, or comments on external/upstream repos** (neond, testcontainers, anything) — even if a task prompt explicitly asks. Document findings internally instead. Read-only upstream research is fine.
+- **Never file issues, PRs, or comments on external/upstream repos** (neon, testcontainers, anything) — even if a task prompt explicitly asks. Document findings internally instead. Read-only upstream research is fine.
 - **Verify a reported bug still exists on current `main` before fixing it.** Multiple sessions commit in parallel; task prompts and bug reports are snapshots. Read the current file, check `git log` for supersession, retarget to what main actually lacks.
 - **Supply chain:** npm dependencies must be ≥ 24h old (`minimumReleaseAge: 1440` in pnpm-workspace.yaml). pnpm is pinned (`packageManager`); use plain `pnpm` (corepack's shim is broken on this machine). Any new native dep needs an explicit `allowBuilds` decision. Docker installs use `--frozen-lockfile` — a new workspace package's `package.json` must be COPY'd into the image before `pnpm install`.
-- **Oracle rule:** engine interactions port `~/git/neond` behavior with cited `// oracle: <file:line>` comments — do not invent payloads. Do not copy neond's UI.
+- **Oracle rule:** Engine interactions (wire payloads, configs, protocol, CLI/args) are grounded in official **`neondatabase/neon`** — its engine source, HTTP APIs, `control_plane` (local orchestration), and `compute_tools`. Cite `// oracle: neon <path-or-endpoint>`. Reference pin: `neondatabase/neon @ 8f60b04` (clone locally to consult; provenance of DevDB's prototype origins is in `docs/phases-2-5-handover.md`). Do not invent payloads. **Product, orchestration, and storage-schema choices are DevDB's own** — no external oracle. Never depend on or reference `matisiekpl/neond`.
 - **Tests:** unit tests use typed fakes against `packages/daemon/src/services/engine-api.ts` interfaces — no `as never`/`as any` (the test script's tsc gate enforces it). Integration tests import shared helpers from `tests/integration/helpers/`. TDD with captured RED evidence for new work.
 - Conventional commits. Never commit secrets. `.superpowers/` and worktree ledgers are gitignored scratch — copy anything durable into `docs/` before removing a worktree.
 
