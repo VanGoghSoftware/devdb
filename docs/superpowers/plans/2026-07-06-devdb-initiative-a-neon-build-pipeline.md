@@ -17,6 +17,7 @@
 - **Multi-arch: amd64 + arm64** (arm64 required for native Apple-Silicon execution; current runtime is arm64).
 - **Registry: GHCR, private** (`ghcr.io/<org>/…`, `<org>` TBD until the repo is pushed). The daemon consumes via `DEVDB_PG_REGISTRY_BASE` / `DEVDB_PG_IMAGE_TEMPLATE` (already env-configurable — config, not code).
 - **Extension scope = match what DevDB ships today**, NOT upstream's full 98-stage surface (PostGIS/plv8/etc. are out unless already baked). Task 1 pins the exact target set.
+- **Build tooling is written in Go.** The project is being renamed **DevDB → Worktree DB** and rewritten in Go (see `docs/2026-07-06-rename-to-worktree-db-and-go-rewrite.md`). The build/verify/manifest orchestration (referred to below as `build-local.sh`) is a **Go CLI at `cmd/worktree-build/`** under a root module `github.com/<org>/worktree-db` (`<org>` TBD) — the first Go code, seeding the rewrite. The `neon-build/Dockerfile` + Actions YAML + `versions.json` stay declarative; the Go tool drives them. Published engine images use the new name: `ghcr.io/<org>/worktree-neon-engine`, `ghcr.io/<org>/worktree-compute-v{N}`. The daemon-side repoint (Task 8) is **DEFERRED into the Go rewrite** — the Go pull client will target GHCR from the start; do NOT rewire the TS `oci.ts` now.
 - npm/dep supply-chain rules unchanged; conventional commits + `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
 
 ## ⚠️ Phase gating
