@@ -1,0 +1,72 @@
+{
+  "$comment": "Pinned source set for the from-source Neon build (initiative A / Worktree DB, Phase 1 Task 1). Bumped by hand in lockstep — no upstream tooling. See docker/neon-build/README or the phases-2-5 handover doc for the bump procedure.",
+
+  "neonTag": "release-9129",
+  "neonCommit": "5340423416b46c85841904f42c93be9af145c643",
+
+  "_neonTag_notes": "release-9129 is neondatabase/neon's storage release train (cut off main, 2025-07-25). Its matched compute release is release-compute-9073 (2025-07-25, same day) on the separate long-lived release-compute branch — but merge-base shows neither tag is an ancestor of the other (parallel release trains, not a single lineage). Verified byte-identical between the two tags: compute/compute-node.Dockerfile, compute/patches/pgvector.patch, vendor/revisions.json, Makefile, postgres.mk, build-tools/Dockerfile, rust-toolchain.toml. Since every file this build recipe reads is identical at both tags, release-9129 alone is a fully coherent single pin — no need to special-case the compute tag.",
+  "matchedComputeTag": "release-compute-9073",
+  "matchedComputeCommit": "98882548d80fdc2e5e28f2ea3c693307587b057e",
+
+  "postgresForkCommit": "see majors[*].postgresForkCommit — the neon postgres fork is tracked as 4 independent per-major submodules (vendor/postgres-v14..v17), not one commit. This top-level key is kept for schema compatibility and intentionally non-resolvable; consumers must read the per-major value.",
+
+  "pgvectorCommit": "2627c5ff775ae6d7aef0c430121ccf857842d2f2",
+  "pgvector": {
+    "tag": "v0.8.0",
+    "commit": "2627c5ff775ae6d7aef0c430121ccf857842d2f2",
+    "repo": "https://github.com/pgvector/pgvector.git",
+    "tarballUrl": "https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz",
+    "tarballSha256": "867a2c328d4928a5a9d6f052cd3bc78c7d60228a9b914ad32aa3db88e9de27b0",
+    "_notes": "NOT a git submodule upstream (unlike neond's own /pgvector submodule wrapper). neondatabase/neon fetches pgvector as a release tarball inside compute/compute-node.Dockerfile's pgvector-src stage, sha256-pinned, then applies compute/patches/pgvector.patch (adds NEON_SMGR unlogged-build hook + a v0.7.4 SQL upgrade path). One pgvector build is shared across all 4 PG majors — pin is per-source, not per-major. commit resolved via `git ls-remote --tags https://github.com/pgvector/pgvector.git v0.8.0` (read-only lookup against pgvector's own repo, not neon's tree)."
+  },
+
+  "majors": {
+    "14": {
+      "minor": 18,
+      "postgresForkCommit": "c9f9fdd0113b52c0bd535afdb09d3a543aeee25f",
+      "submodulePath": "vendor/postgres-v14",
+      "submoduleBranch": "REL_14_STABLE_neon"
+    },
+    "15": {
+      "minor": 13,
+      "postgresForkCommit": "aaaeff2550d5deba58847f112af9b98fa3a58b00",
+      "submodulePath": "vendor/postgres-v15",
+      "submoduleBranch": "REL_15_STABLE_neon"
+    },
+    "16": {
+      "minor": 9,
+      "postgresForkCommit": "9b9cb4b3e33347aea8f61e606bb6569979516de5",
+      "submodulePath": "vendor/postgres-v16",
+      "submoduleBranch": "REL_16_STABLE_neon"
+    },
+    "17": {
+      "minor": 5,
+      "postgresForkCommit": "fa1788475e3146cc9c7c6a1b74f48fd296898fcd",
+      "submodulePath": "vendor/postgres-v17",
+      "submoduleBranch": "REL_17_STABLE_neon"
+    }
+  },
+
+  "rust": "1.88.0",
+  "_rust_notes": "Upstream's pinned toolchain (neon/rust-toolchain.toml channel + build-tools/Dockerfile RUSTC_VERSION, both confirmed at release-9129). Deliberately NOT neond's drifted rust:1.94.1-bookworm base image.",
+
+  "debianVersion": "bookworm",
+  "_debianVersion_notes": "compute/compute-node.Dockerfile's own default (ARG DEBIAN_VERSION=bookworm) at release-9129 — passed as a build arg to upstream's unmodified Dockerfile, not a fork.",
+
+  "expectedBinaries": [
+    "pageserver",
+    "safekeeper",
+    "storage_broker",
+    "storage_controller",
+    "compute_ctl"
+  ],
+  "expectedPgInstallDirs": ["v14", "v15", "v16", "v17", "vanilla_v17"],
+
+  "currentBaselineAtPinTime": {
+    "_source": "docker exec docker-devdb-1 (neond-baked image), captured 2026-07-06 for the coherence check — must be <= the majors[*].minor values above.",
+    "14": 18,
+    "15": 13,
+    "16": 9,
+    "17": 5
+  }
+}
