@@ -1,0 +1,16 @@
+# Build context is the repo root for all Dockerfiles. Keep it lean: exclude VCS,
+# installed deps (the image runs `pnpm install` fresh), build outputs (regenerated
+# by `pnpm -r build`), the Go binary, docs, and local scratch. Do NOT exclude
+# package manifests, lockfiles, packages/ sources, tsconfig*, .npmrc, or docker/.
+.git
+.gitignore
+**/node_modules
+**/dist
+*.tsbuildinfo
+/worktreedb-build
+.superpowers
+.devdb-data
+.idea
+.DS_Store
+.claude
+docs

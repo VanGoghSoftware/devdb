@@ -7,3 +7,7 @@ dist/
 .idea/
 .DS_Store
 .claude/settings.local.json
+
+# Go build output — `go build ./cmd/worktreedb-build` emits this binary at the
+# repo root (the seed of the DevDB -> Worktree DB Go rewrite).
+/worktreedb-build

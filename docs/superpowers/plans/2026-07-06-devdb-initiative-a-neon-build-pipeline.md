@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **AMENDED 2026-07-06 (Phase-1 Task-3, post-validation).** The "v17-tree-as-vanilla-storcon-PG" / "reuse v17" element below (the **Architecture** line; **Task 2 Step 1 §3**; the **Spec-coverage** line "vanilla=v17") was **REVERSED** during Phase-1 validation. Reusing the neon-FORKED v17 as storcon_db's catalog host FATALs its WAL crash recovery after an unclean stop (`resource manager with ID 134 not registered` — the fork emits Neon-custom WAL that can't replay without the neon extension loaded during redo). `vanilla_v17` is now built as a **true upstream Postgres 17** (`postgres/postgres` @ REL_17_5), matching neond's `vanillapg`. See the design-spec amendment, the build README's deviation #5, and `versions.json`'s `vanillaPostgres` pin.
+
 **Goal:** Replace `FROM neond/neond` with a DevDB-owned pipeline that builds the Neon engine from pinned upstream source on one bookworm base, publishes digest-pinned multi-arch OCI images to GHCR, and has both the docker build and the runtime dynamic-minor-pull consume from it — eliminating the mixed-base ABI problem at the root.
 
 **Architecture:** A multi-stage build (build-tools base → storage binaries → per-major compute `pg_install` on `DEBIAN_VERSION=bookworm` → v17-tree-as-vanilla-storcon-PG) ported from neond's working recipe + upstream neon's own `Makefile`/Dockerfiles, validated locally first, then wrapped in GitHub Actions publishing to GHCR. The daemon consumes it with **no code change** (Dockerfile `FROM` swap + `oci.ts` env-config swap).

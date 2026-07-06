@@ -29,7 +29,7 @@ Jordan chose build-from-source (2026-07-06) — control, provenance, and ABI-cor
 **Build (GitHub Actions)** — from a pinned Neon release (the `neondatabase/neon` repo + its `postgres` fork + `pgvector` submodules), a workflow builds:
 - **Storage binaries** (pageserver, safekeeper, storage_controller, storage_broker) + `compute_ctl` — one Rust build, on a bookworm build-tools base (Rust pinned to upstream's version).
 - **Per-major compute `pg_install`** (v14, v15, v16, v17) — each from Neon's own compute-node recipe with **`DEBIAN_VERSION=bookworm`** (config arg, not a fork), so all majors land on ONE base.
-- **vanilla PG for storcon's catalog DB** — the v17 tree doubles as this (confirmed: storcon's diesel migrations have no `19devel`-specific SQL), closing the `vanilla_v17` gap for free.
+- **vanilla PG for storcon's catalog DB** — a **true upstream Postgres 17** (`postgres/postgres` @ REL_17_5), built separately (matching neond's `vanillapg`). *(AMENDED — originally proposed as "the v17 tree doubles as this, closing the gap for free"; reversed in Phase-1 Task 3, see the banner above: the neon-forked v17 FATALs storcon_db's WAL crash recovery.)*
 - **Multi-arch: amd64 + arm64.** arm64 is *required* for native execution on Apple Silicon (the current runtime image is already arm64 — verified `uname -m` = `aarch64`); amd64 is kept for other/cloud users. Both build on standard runners (arm64 now covers private repos on included minutes).
 
 **Publish** — digest-pinned OCI images to **GHCR** (private for now):
@@ -51,7 +51,7 @@ Jordan chose build-from-source (2026-07-06) — control, provenance, and ABI-cor
 | Version matrix | **latest minor per major, accumulating** | covers bugfix-minor + new-major use cases; older built minors stay published & pullable |
 | Base | **bookworm, all majors** | `DEBIAN_VERSION` config arg → one base → no ABI mismatch |
 | Arch | **multi-arch amd64 + arm64** | arm64 native on Apple Silicon; amd64 for other/cloud users |
-| vanilla_v17 | **reuse the v17 tree** | no separate artifact needed |
+| vanilla_v17 | **true upstream PG 17** (`postgres/postgres` @ REL_17_5) | the fork's Neon-custom WAL (rmgr 134) breaks storcon crash-recovery — the original "reuse the v17 tree" was reversed in Task 3 (see banner) |
 | Update contract | **storage image-pinned; compute minors pull + hot-swap** | unchanged from the shipped dynamic-pg-builds feature; WAL/page format stable within a major |
 | Pinning | **Neon release tag + 3 submodule commits, manual bump** | no upstream lockstep tooling; recorded in a versions manifest |
 
@@ -70,7 +70,7 @@ Jordan chose build-from-source (2026-07-06) — control, provenance, and ABI-cor
 ## What this obviates
 
 - **The deferred lib-bundling ABI fix** — gone entirely (one base → no missing libs → no `LD_LIBRARY_PATH` bundling, no EOL OpenSSL 1.1, no touching the security-sensitive extraction path).
-- **The `vanilla_v17` gap** — closed (v17 tree reused).
+- **The `vanilla_v17` gap** — closed by a separate true-upstream PG 17 build (NOT the v17 reuse; that was reversed in Phase-1 Task 3 — see the banner).
 
 ## Maintenance model
 
