@@ -4,19 +4,24 @@
 
 ## The rename
 
-The project is being renamed **DevDB → "Worktree DB."** The name makes the core metaphor explicit — *worktree : files :: branch : data*. All **new** code and published artifacts use the new name from the start; the existing TypeScript daemon + docs keep "DevDB" until the Go rewrite (below) renames them wholesale — we do **not** mass-rename piecemeal now.
+The project is being renamed **DevDB → "Worktree DB."** The name makes the core metaphor explicit — *worktree : files :: branch : data*.
+
+- **Display / product name:** **Worktree DB** (two words).
+- **Code identifier:** **`worktreedb`** (one word, lowercase). Deliberately NOT `worktree` — that word alone is a common git term and would collide/confuse in code, package names, and image tags.
+
+All **new** code and published artifacts use the new name from the start; the existing TypeScript daemon + docs keep "DevDB" until the Go rewrite (below) renames them wholesale — we do **not** mass-rename piecemeal now.
 
 ## The Go rewrite
 
 Jordan is rewriting the daemon (currently TypeScript / Node 22 / Fastify) in **Go**, short-term. The rewrite will:
 - Reimplement the daemon — state/SQLite, engine supervision, compute lifecycle, services, HTTP + MCP, and the dynamic-pg-build **OCI pull client** — in Go.
-- Adopt the **Worktree DB** name throughout.
-- Live under a root Go module: **`github.com/<org>/worktree-db`** (`<org>` TBD until the repo is pushed to GitHub).
+- Adopt the **Worktree DB** name throughout (code identifier `worktreedb`).
+- Live under a root Go module: **`github.com/<org>/worktreedb`** (`<org>` TBD until the repo is pushed to GitHub).
 
 ## What already reflects the rename (starting with initiative A)
 
-- **Build tooling is Go, named for Worktree DB.** Initiative A's from-source Neon build CLI is Go at **`cmd/worktree-build/`**, module **`github.com/<org>/worktree-db`** — the *first* Go code in the repo, seeding the rewrite.
-- The pipeline's **published engine images** use the new name: `ghcr.io/<org>/worktree-neon-engine`, `ghcr.io/<org>/worktree-compute-v{N}`.
+- **Build tooling is Go, named `worktreedb`.** Initiative A's from-source Neon build CLI is Go at **`cmd/worktreedb-build/`**, module **`github.com/<org>/worktreedb`** — the *first* Go code in the repo, seeding the rewrite.
+- The pipeline's **published engine images** use the new name: `ghcr.io/<org>/worktreedb-neon-engine`, `ghcr.io/<org>/worktreedb-compute-v{N}`.
 
 ## What still says "DevDB" (renamed at rewrite time, not now)
 
@@ -24,6 +29,6 @@ Jordan is rewriting the daemon (currently TypeScript / Node 22 / Fastify) in **G
 
 ## Roadmap implications
 
-- **Initiative A's build *pipeline*** (the from-source `neon-build/Dockerfile`) is **language-agnostic and rewrite-proof** — it compiles Neon (Rust) + Postgres (C) regardless of the daemon's language, so it proceeds now (with the tooling authored in Go).
+- **Initiative A's build *pipeline*** (the from-source `neon-build/Dockerfile`) is **language-agnostic and rewrite-proof** — it compiles Neon (Rust) + Postgres (C) regardless of the daemon's language, so it proceeds now (with the tooling authored in Go as `worktreedb`).
 - **Initiative A's daemon-side repoint** (`oci.ts` config → GHCR) is **deferred into the Go rewrite** — the Go pull client targets GHCR from the start; no effort is spent rewiring the about-to-be-replaced TS `oci.ts`.
 - **Phases 4–5** (import/export + durability; extensions/platform) will be built as **Worktree DB in Go**.
