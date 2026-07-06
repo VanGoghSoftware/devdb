@@ -118,9 +118,11 @@ export class BranchesRepo {
     const r = this.db.prepare("SELECT COUNT(*) AS n FROM branches").get() as { n: number };
     return r.n;
   }
-  // oracle: src/mgmt/repository/branch.rs:251 restore_swap — archive old row under new
-  // name/slug, insert replacement carrying the original identity (name/slug/password/port),
-  // reparent children whose timelines the engine reparented, repoint remaining children.
+  // DevDB's own state model: on in-place restore we archive the prior branch row under the new
+  // timeline id (see TimeTravelService.swapOntoNewTimeline). Not an engine contract. Mechanics:
+  // archive old row under new name/slug, insert replacement carrying the original identity
+  // (name/slug/password/port), reparent children whose timelines the engine reparented, repoint
+  // remaining children.
   restoreSwap(a: {
     oldBranchId: string; newBranchId: string; newTimelineId: string;
     archiveName: string; archiveSlug: string; reparentedTimelineIds: string[];

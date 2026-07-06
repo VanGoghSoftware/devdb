@@ -69,7 +69,8 @@ export class BranchesService {
   // ECONNREFUSED. This is the USER-FACING string only; the internal engine/compute/SQL-console
   // connections dial 127.0.0.1 inside the container on their own paths (a devdb product choice, so
   // the host intentionally diverges from the oracle below).
-  // oracle: src/mgmt/model/branch.rs get_connection_string; no sslmode (no TLS in devdb)
+  // DevDB's own connection-string format (postgresql://user:pass@host:port/db) — no sslmode
+  // param, since the engine runs trust-mode with no TLS. Not an engine contract.
   connectionString(branch: BranchRow, port: number): string {
     return `postgresql://postgres:${encodeURIComponent(branch.password)}@127.0.0.1:${port}/postgres`;
   }
@@ -84,7 +85,7 @@ export class BranchesService {
     return `jdbc:postgresql://127.0.0.1:${port}/postgres?user=postgres&password=${encodeURIComponent(branch.password)}&sslmode=disable`;
   }
 
-  // oracle: src/mgmt/service/branch.rs:66-208 create()
+  // oracle: neon pageserver POST /v1/tenant/:tenant_shard_id/timeline (routes.rs, timeline_create_handler) — the engine-facing step of this sequence; the DB row + compensation-on-failure wrapper around it is DevDB's own.
   async create(a: {
     projectId: string; name: string; parentBranchId?: string | null;
     atLsn?: string | null; createdBy?: "ui" | "api" | "mcp"; context?: BranchContext | null;
@@ -228,7 +229,7 @@ export class BranchesService {
     });
   }
 
-  // oracle: src/mgmt/service/branch.rs:416-519 delete()
+  // oracle: neon pageserver DELETE /v1/tenant/:tenant_shard_id/timeline/:timeline_id (routes.rs, timeline_delete_handler) + safekeeper DELETE /v1/tenant/:tenant_id/timeline/:timeline_id (http/routes.rs, timeline_delete_handler) — the two engine-facing calls in this sequence; the children-exist guard and DB row delete are DevDB's own.
   async delete(id: string): Promise<void> {
     return this.deps.queue.run(id, async () => {
       const branch = this.byIdOr404(id);

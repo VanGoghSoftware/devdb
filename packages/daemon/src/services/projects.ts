@@ -49,7 +49,7 @@ export interface ProjectsDeps {
   builds?: Pick<BuildsResolverApi, "installedMajors">;
 }
 
-// oracle: tenant config values src/mgmt/service/project.rs:95-108
+// oracle: neon pageserver_api::models::TenantConfig field names (libs/pageserver_api/src/models.rs) — gc_period/gc_horizon/pitr_interval/checkpoint_distance/checkpoint_timeout, set via the same fields flattened onto storage_controller's POST /v1/tenant body.
 export const TENANT_CONFIG = {
   gc_period: "1h",
   gc_horizon: 67108864,
@@ -108,11 +108,11 @@ export class ProjectsService {
           `Postgres ${pgVersion} is not installed — installed majors: ${installed.join(", ")}. Pull it via POST /api/pg-builds/pull.`);
       }
     }
-    const projectId = newHexId(); // doubles as tenant id — oracle: project.rs:83-84
+    const projectId = newHexId(); // doubles as tenant id — shaped like neon's TenantId (libs/utils/src/id.rs), the opaque hex id the pageserver/storcon API expects; DevDB's own 1-project-equals-1-tenant modeling choice.
 
     await this.deps.storcon.tenantCreate(projectId, TENANT_CONFIG);
     try {
-      // oracle: bootstrap mode timeline create — src/mgmt/service/branch.rs:124-128
+      // oracle: neon pageserver POST /v1/tenant/:tenant_shard_id/timeline (routes.rs; TimelineCreateRequestMode::Bootstrap variant, pg_version set, no ancestor)
       const timelineId = newHexId();
       await this.deps.pageserver.timelineCreate(projectId, {
         new_timeline_id: timelineId,
@@ -254,7 +254,7 @@ export class ProjectsService {
   async delete(id: string): Promise<void> {
     const project = this.byIdOr404(id);
     await this.drainBranches(project.id);
-    // oracle: src/mgmt/service/project.rs:351-395
+    // oracle: neon pageserver DELETE /v1/tenant/:tenant_shard_id (routes.rs, tenant_delete_handler) + safekeeper DELETE /v1/tenant/:tenant_id (http/routes.rs, tenant_delete_handler) — the two engine-facing calls; drainBranches()/the final row-delete retry loop are DevDB's own.
     await this.deps.pageserver.tenantDelete(project.id);
     await this.deps.safekeeper.tenantDelete(project.id);
     // Fix 1 (review): bounded retry (3 sweeps) around the final row-delete. drainBranches() above
