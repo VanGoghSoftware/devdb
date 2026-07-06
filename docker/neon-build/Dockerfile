@@ -81,6 +81,16 @@ RUN curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v$
     && mv protoc/include/google /usr/local/include/google \
     && rm -rf protoc.zip protoc
 
+# grounding: neondatabase/neon rust-toolchain.toml — channel = "1.88.0",
+# components = ["llvm-tools", "rustfmt", "clippy"]. cargo auto-installs those
+# components on first use inside the neon tree; the per-major `make -j neon-pg-ext`
+# fires 4 cargo builds in parallel, so without pre-installing them the concurrent
+# rustup downloads race on the shared download dir and fail non-deterministically
+# ("could not rename <hash>.partial … to … : No such file or directory"). The stock
+# rust base ships none of them; pre-install once here so the parallel build finds
+# them already present (this is what upstream's build-tools image does).
+RUN rustup component add llvm-tools rustfmt clippy
+
 ##############################################################################
 # Stage 1: fetch — clone neon @ pinned commit and pin the 4 per-major
 # postgres-fork submodules to their exact commits.
