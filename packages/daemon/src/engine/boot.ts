@@ -79,8 +79,9 @@ export class EngineRuntime {
     await proc.start();
   }
 
-  // oracle: neon control_plane/src/bin/neon_local.rs start sequence + background_process.rs
-  // (spawn→wait-ready→next); DevDB order: storcon_db → broker → storcon → safekeeper → pageserver.
+  // oracle: neon control_plane/src/bin/neon_local.rs (handle_start_all_impl) + background_process.rs
+  // (per-process spawn+wait-ready, ~10s poll). neon starts services CONCURRENTLY (JoinSet); DevDB's
+  // fixed sequential order storcon_db → broker → storcon → safekeeper → pageserver is its own choice.
   async start(): Promise<void> {
     try {
       // First: the tracer sink, so it's listening before storcon/pageserver ever emit a trace or

@@ -142,7 +142,9 @@ git commit -m "docs(oracle): re-point branch/project citations to neon pageserve
 ```
 becomes:
 ```ts
-// oracle: neon control_plane/src/bin/neon_local.rs start sequence + background_process.rs (spawn→wait-ready→next); DevDB order: storcon_db → broker → storcon → safekeeper → pageserver.
+// oracle: neon control_plane/src/bin/neon_local.rs (handle_start_all_impl) + background_process.rs
+// (per-process spawn+wait-ready, ~10s poll). neon starts services CONCURRENTLY (JoinSet); DevDB's
+// fixed sequential order storcon_db → broker → storcon → safekeeper → pageserver is its own choice.
 ```
 
 - [ ] **Step 3: apply to the remaining `daemon/mod.rs` + `pageserver/mod.rs` citations** in `config.ts`, `boot.ts`, `configs.ts`, pointing at the specific `control_plane/src/*.rs` file. Preserve every trust-mode `— note` verbatim.
