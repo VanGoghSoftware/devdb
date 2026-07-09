@@ -392,6 +392,30 @@ describe("PgBuildsCard", () => {
     expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1); // and no consented retry followed
   });
 
+  // Review finding (P4): the failed-row Retry pulls the row's OWN (pinned) tag, not the latest flow —
+  // so it must NOT clear the major's latest-check badge. Only a latest pull (header Pull, or a retry
+  // of a `latest`-tagged row) verifies the latest digest.
+  it("retrying a failed NON-latest build leaves the major's latest-check badge intact", async () => {
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:new", isNew: true },
+    });
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b16-active", major: 16, minor: 10, version: "16.10", active: true, inUse: true }),
+      build({ id: "b16-bad", major: 16, minor: null, version: null, status: "failed", active: false, inUse: false, error: "gate failed", releaseTag: "16.9" }),
+    ]);
+    vi.mocked(api.pgBuilds.pull).mockResolvedValue({ buildId: "retry-16" });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /retry pull/i }));
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.pull).mock.calls.at(-1)?.[0]).toEqual({ major: 16, tag: "16.9" }));
+
+    // The retry pulled 16.9, not latest — the unverified-latest badge must remain.
+    expect(screen.getByText(/unverified latest/i)).toBeInTheDocument();
+  });
+
   // #9: failed rows accumulated unbounded — the only action was Retry (which on a dedup no-op mints
   // another failed row). FIX-3/FIX-4 made empty-path/ shared-dir delete safe, so a failed row can now
   // offer Delete for cleanup.

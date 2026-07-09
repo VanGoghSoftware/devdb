@@ -53,7 +53,9 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null; onPulled: (m
             <Button
               size="compact-xs"
               loading={pull.isPending}
-              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag }, { onSuccess: () => a.onPulled(row.major) })}
+              // Only clear the major's latest-check when this retry actually pulls `latest`; a retry
+              // of a pinned non-latest tag doesn't verify the latest digest, so it must leave the badge.
+              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag }, { onSuccess: () => { if (row.releaseTag === "latest") a.onPulled(row.major); } })}
             >
               Retry pull
             </Button>

@@ -240,6 +240,33 @@ describe("Provisioner", () => {
     expect(pullPrefixSpy).not.toHaveBeenCalled();
   });
 
+  // Review finding (P3): byDigest is global-by-digest, but the dedup no-op must be scoped to the
+  // requested major. A ready row for a DIFFERENT major sharing the digest (a mislabeled/colliding
+  // image — contrived, since real per-major compute-node images never share a content digest) must
+  // NOT short-circuit the pull into a false no-op; it must extract so detectVersion's expected-major
+  // guard runs. Here the pulled image is genuinely major 17, so it reaches ready for 17.
+  it("digest dedup is scoped to the requested major: a same-digest ready row for another major does not no-op the pull", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci, pullPrefixSpy } = fakeOci({ digest: DIGEST_A });
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({
+      id: "ready-16", major: 16, minor: 9, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: join(builds, "v16", SHORT_A), status: "ready",
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("ready"); // extracted + validated for 17, NOT skipped against the v16 row
+      return r!;
+    });
+    expect(row.major).toBe(17);
+    expect(pullPrefixSpy).toHaveBeenCalled(); // extraction ran (not a cross-major dedup no-op)
+    expect(state.pgBuilds.byId("ready-16")?.status).toBe("ready"); // the v16 row is untouched
+  });
+
   it("detected major mismatch → failed row, no rename into place", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);

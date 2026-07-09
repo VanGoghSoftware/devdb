@@ -295,7 +295,11 @@ export class Provisioner {
       const { digest } = await deps.oci.resolveDigest(repo, tag);
       resolvedDigest = digest;
       const existing = state.pgBuilds.byDigest(digest);
-      if (existing && existing.status === "ready") {
+      // Scope the no-op to the SAME major: byDigest is global-by-digest, but a ready row for a
+      // DIFFERENT major sharing this digest (a mislabeled/colliding image) must NOT short-circuit the
+      // pull — let it extract so detectVersion's expected-major guard fails it explicitly rather than
+      // recording a false no-op that leaves the requested major with no build.
+      if (existing && existing.status === "ready" && existing.major === major) {
         const versionStr = existing.minor !== null ? `${existing.major}.${existing.minor}` : `${existing.major}.x`;
         // Benign no-op (identical digest already ready). Stamp the resolved digest + the collided-with
         // minor on THIS row so the skipped record is self-describing and prunable by (major, digest);
