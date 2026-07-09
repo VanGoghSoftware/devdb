@@ -106,9 +106,11 @@ export class EmbeddedPostgres {
   }
 
   // The catalog major of the storcon binary this image ships, resolved once (it is immutable for
-  // the process lifetime). MEMOIZED on purpose: start()'s guard awaits it, and if two concurrent
-  // start() calls ever awaited it they must share ONE suspension so they resume in registration
-  // order — that is what keeps the running-guard→claim region atomic (see start()).
+  // the process lifetime). MEMOIZED to dedup the probe (one `--version` spawn no matter how many
+  // start()s await it) and give concurrent callers a deterministic FIFO resume order. It is NOT what
+  // makes the running-guard→claim region atomic: that holds under ANY resume order, because the await
+  // sits BEFORE the running-guard so every resumed call re-checks it, and guard→claim is synchronous
+  // (see start()). Memoization is an optimization here, not the safety mechanism.
   private expectedBinaryMajor(): Promise<number | null> {
     this.expectedMajorPromise ??= this.resolveExpectedMajor();
     return this.expectedMajorPromise;
@@ -137,22 +139,35 @@ export class EmbeddedPostgres {
     // initdb'd by a DIFFERENT postgres major than the binary this image ships cannot be opened by
     // postgres — it FATAL-loops on a cryptic parameter/catalog error (observed live 2026-07-08 when
     // devdb:dev repointed to true-vanilla 17.5 over a neond-vanilla-19devel `/data`). Detect it and
-    // refuse with an actionable message BEFORE spawning. Gated on PG_VERSION existing, so the
-    // fresh-initdb path (boot.ts runs init() first → the file is stamped by THIS binary → majors
-    // match) and any never-initialized dir fall straight through untouched.
+    // refuse with an actionable message BEFORE spawning. Gated on PG_VERSION existing: a FIRST boot
+    // on a fresh volume still runs the probe+compare (boot.ts calls init() before start(), so
+    // PG_VERSION is already stamped — by THIS binary, so found === expected and it clears). Only a
+    // dir that was NEVER initialized (no PG_VERSION at all) short-circuits before the probe await.
     //
     // Placed BEFORE the running-guard on purpose: the expected-major probe is the one `await` in
     // start()'s pre-spawn section, and it must not land BETWEEN the running-guard and the
     // `this.proc` claim below — an await there would let two concurrent start()s both pass the guard
     // while `this.proc` is still null and race two postmasters (the invariant removeStalePidFile's
-    // comment defends). Taking it up front, via the MEMOIZED expectedBinaryMajor(), means any
-    // concurrent callers share ONE suspension and resume in registration order, so the first runs
-    // the whole running-guard→claim region synchronously before the second re-checks. The
-    // existsSync/readFileSync are synchronous, so when PG_VERSION is absent there is no await at all
-    // and the pre-existing atomicity is byte-for-byte preserved.
+    // comment defends). With the await taken up front, whichever call resumes first runs the whole
+    // running-guard→claim region SYNCHRONOUSLY and claims this.proc before the next re-checks the
+    // guard — so the region stays atomic under ANY resume order, not just FIFO. (Memoizing
+    // expectedBinaryMajor() only dedups the probe and makes that order deterministic; see its
+    // comment.) The existsSync/readFileSync are synchronous, so when PG_VERSION is absent there is no
+    // await at all and the pre-existing atomicity is byte-for-byte preserved.
     const pgVersionPath = join(this.opts.dataDir, "PG_VERSION");
     if (existsSync(pgVersionPath)) {
-      const found = parsePgVersionFileMajor(readFileSync(pgVersionPath, "utf8"));
+      let found: number | null = null;
+      try {
+        found = parsePgVersionFileMajor(readFileSync(pgVersionPath, "utf8"));
+      } catch (e) {
+        // Fail OPEN (same principle as resolveExpectedMajor): a PG_VERSION that exists but can't be
+        // read — EACCES, or a file that vanished between existsSync and here — is treated as
+        // unparseable so the guard is SKIPPED. Only a CONFIRMED mismatch may refuse a boot; a raw fs
+        // error must not. postgres's own catalog check stays the backstop for anything that slips past.
+        this.opts.onLine?.(
+          `devdb: could not read storcon PG_VERSION (${(e as Error).message}); skipping catalog-major guard`,
+        );
+      }
       if (found !== null) {
         const expected = await this.expectedBinaryMajor();
         if (expected !== null && found !== expected) {
@@ -215,7 +230,9 @@ export class EmbeddedPostgres {
   // .start(), and a failed boot exits the process (there is no in-process restart path today). A
   // future crash-restart feature would have to re-derive safety — a crash-orphaned backend can still
   // hold shared memory, and postmaster.pid is postgres's OWN interlock for detecting that, so blindly
-  // deleting it there could let a second postmaster corrupt shared state.
+  // deleting it there could let a second postmaster corrupt shared state. (Such a feature would also
+  // expose the catalog guard's new pre-claim `await` to a concurrent stop() nulling this.proc — the
+  // guard→claim atomicity would then need re-deriving against interleaved start/stop.)
   //
   // SYNCHRONOUS on purpose: start()'s running-guard and its `this.proc = new ManagedProcess()` claim
   // must stay atomic. An `await` between them would let two concurrent start() calls both pass the
