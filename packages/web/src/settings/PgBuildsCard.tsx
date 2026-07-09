@@ -30,6 +30,17 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
     );
   }
 
+  // A benign no-op pull (its version was already installed): a muted, informational line — NOT a
+  // failure, so no alarming styling, no Retry (a retry just re-no-ops) and no Activate (there's no
+  // distinct build to activate). The daemon keeps at most one skipped row per (major, digest).
+  if (row.status === "skipped") {
+    return (
+      <Text size="sm" c="dimmed">
+        {row.error ?? `${row.version ?? `${row.major}.x`} — already installed (up to date)`}
+      </Text>
+    );
+  }
+
   if (row.status === "failed") {
     return (
       <Group justify="space-between" wrap="nowrap">
@@ -155,9 +166,19 @@ function MajorSection(a: {
               {a.activeVersion} · {a.source}
             </Badge>
           )}
+          {/* Honest by construction: updateAvailable is non-null ONLY for an "unverified" latest —
+              a digest we haven't confirmed is a newer minor (the daemon nulls it for current and for
+              a re-failing incompatible latest). So the badge says "unverified latest", never the
+              over-confident "update available", and Pull — the way to VERIFY — is offered only here. */}
           {a.updateAvailable && (
             <>
-              <Badge color="blue" variant="light">update available</Badge>
+              <Tooltip
+                multiline
+                w={260}
+                label="The registry's latest hasn't been verified against your installed build. Pull to check whether it's actually a newer minor."
+              >
+                <Badge color="yellow" variant="light" style={{ cursor: "help" }}>unverified latest</Badge>
+              </Tooltip>
               <Button
                 size="compact-xs"
                 loading={pull.isPending}
