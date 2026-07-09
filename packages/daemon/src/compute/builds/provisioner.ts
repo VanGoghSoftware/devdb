@@ -433,13 +433,19 @@ export class Provisioner {
         }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure compensation failed`, e));
       }
     } finally {
-      // Review finding (P3): if a prior check() cached this exact `latest` digest as "unverified", this
-      // pull has now settled it — verified ready/skipped (current) or proven incompatible — so re-derive
-      // and refresh the cache. Otherwise /api/status + MCP would keep prompting a Pull already done.
-      // Runs on every exit once the digest is known (including the early-returning no-op paths); a
-      // transient failure re-derives to "unverified" (unchanged), and a specific-tag pull of a DIFFERENT
-      // digest leaves latest's cached verdict alone (digest guard). Local/no-network, never throws.
-      if (resolvedDigest !== undefined && this.lastCheck.get(major)?.digest === resolvedDigest) {
+      // Review finding (P3): once the digest is known, refresh the update-check cache so /api/status +
+      // MCP don't keep prompting a Pull already settled (verified ready/skipped → current, proven
+      // incompatible, or — for a transient failure — re-derived back to unverified, unchanged). Refresh
+      // when EITHER:
+      //  - this was a `latest` pull: it re-resolved latest's CURRENT digest, which is exactly what the
+      //    cache tracks — so refresh even if the mutable tag MOVED since the check (the normal
+      //    new-minor-published flow); a strict digest-equality guard would leave the old digest's stale
+      //    "unverified" advertised forever (repeat latest pulls resolve the new digest, never matching), OR
+      //  - a pinned-tag pull happened to resolve the exact digest a prior check cached (settling it);
+      //    a pinned pull of a DIFFERENT digest must NOT clobber latest's cached verdict.
+      // Runs on every exit once the digest is known (incl. the early-returning no-op paths).
+      // Local/no-network, never throws.
+      if (resolvedDigest !== undefined && (tag === "latest" || this.lastCheck.get(major)?.digest === resolvedDigest)) {
         this.lastCheck.set(major, this.toCheckResult(resolvedDigest, this.classifyDigest(major, resolvedDigest)));
       }
     }

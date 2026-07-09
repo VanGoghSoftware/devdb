@@ -938,6 +938,40 @@ describe("Provisioner", () => {
     expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
   });
 
+  // Review finding (P3): the mutable `latest` moving BETWEEN a check and the pull is the normal update
+  // flow — a new minor published. A latest pull re-resolves latest's CURRENT digest, so it must refresh
+  // the cache even though that digest differs from the one the prior check saw; a strict digest-equality
+  // guard would leave the old "unverified latest@A" advertised forever (repeat pulls resolve B again, so
+  // the guard never clears A). The digest guard stays only for NON-latest tag pulls.
+  it("a latest pull refreshes the update signal even when the mutable tag MOVED since the check", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked 17.5
+    let latest = DIGEST_A; // what `latest` resolves to right now
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: latest }),
+      pullPrefix: async (p: { destDir: string }) => {
+        await mkdir(join(p.destDir, "bin"), { recursive: true });
+        await writeFile(join(p.destDir, "bin", "postgres"), "#!/bin/sh\n");
+      },
+    };
+    const { state, registry, provisioner } = makeProvisioner({
+      install, builds, oci, detectVersion: pathAwareDetectVersion(builds, { pulledMinor: 9 }),
+    });
+    await registry.seedBaked();
+    registry.resolveActives();
+
+    await provisioner.check([17]); // caches DIGEST_A, unverified
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+
+    latest = DIGEST_B; // a new minor is published — the mutable tag moves
+    const { buildId } = await provisioner.pull({ major: 17 }); // resolves DIGEST_B, installs 17.9
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("ready"));
+
+    // The stale latest@A signal must clear — the latest pull re-resolved and installed B (now current).
+    await vi.waitFor(() => expect(provisioner.updateAvailableFor(17)).toBeNull());
+  });
+
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
   // (activate/remove) were not serialized — only pulls were, via the private `pulling` flag.
   // remove(id) calls assertRemovable synchronously then `await rm(row.path)`; during that await,
