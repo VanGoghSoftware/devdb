@@ -3,6 +3,14 @@ services:
     build: { context: .., dockerfile: docker/Dockerfile }
     image: devdb:dev
     init: true
+    # The dynamic PG-build pull defaults to Neon's public Docker Hub compute-node images
+    # (anonymous; v17 works, v14-16 are ABI-broken on this bookworm runtime). To pull the
+    # from-source, all-bookworm worktreedb-compute images instead (all majors), opt into the
+    # private GHCR registry by uncommenting these + supplying a read:packages PAT:
+    #environment:
+    #  DEVDB_PG_REGISTRY_BASE: https://ghcr.io
+    #  DEVDB_PG_IMAGE_TEMPLATE: vangoghsoftware/worktreedb-compute-v{major}
+    #  DEVDB_PG_REGISTRY_TOKEN: <your ghcr.io read:packages PAT>
     ports:
       - "127.0.0.1:4400:4400"
       - "127.0.0.1:54300-54339:54300-54339"

@@ -118,15 +118,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
 
   // Dynamic PG builds (spec 2026-07-04): overrides exist for mirrors/air-gap AND for the hermetic
   // integration fixture registry. http:// is allowed deliberately (the fixture, an in-network
-  // registry:2, has no TLS). The DEFAULT is now GHCR (initiative-A P2-A1) — the from-source
-  // worktreedb-compute images live there; pointing these two vars back at Docker Hub +
-  // `neondatabase/compute-node-v{major}` still works (the mirror/air-gap AND GHCR-down fallback).
-  const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://ghcr.io").replace(/\/+$/, "");
+  // registry:2, has no TLS). DEFAULT = Docker Hub's `neondatabase/compute-node-v{major}` (pulls
+  // anonymously — v17 works out-of-box; v14-16 are bullseye/ABI-broken on this bookworm runtime).
+  // To use the from-source, all-bookworm `worktreedb-compute` images (all majors work), OPT IN with
+  //   DEVDB_PG_REGISTRY_BASE=https://ghcr.io
+  //   DEVDB_PG_IMAGE_TEMPLATE=vangoghsoftware/worktreedb-compute-v{major}
+  //   DEVDB_PG_REGISTRY_TOKEN=<read:packages PAT>   (GHCR is private)
+  // (initiative-A P2-A2, Jordan 2026-07-09: keep a graceful anonymous default while GHCR is private,
+  // rather than flipping the default to a registry that 401s without a token.)
+  const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://registry-1.docker.io").replace(/\/+$/, "");
   if (!/^https?:\/\//.test(pgRegistryBase)) {
     throw new Error(`DEVDB_PG_REGISTRY_BASE must be an http(s) URL, got: ${pgRegistryBase}`);
   }
   // A REPOSITORY PATH resolved against pgRegistryBase (no host prefix) — the base supplies the host.
-  const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "vangoghsoftware/worktreedb-compute-v{major}";
+  const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "neondatabase/compute-node-v{major}";
   if (!pgImageTemplate.includes("{major}")) {
     throw new Error(`DEVDB_PG_IMAGE_TEMPLATE must contain the literal {major} placeholder, got: ${pgImageTemplate}`);
   }

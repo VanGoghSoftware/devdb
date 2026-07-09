@@ -66,11 +66,13 @@ describe("loadConfig", () => {
     });
   });
 
-  it("pg build provisioning defaults + derived dirs (GHCR by default; token unset)", () => {
+  it("pg build provisioning defaults + derived dirs (Docker Hub by default; token unset)", () => {
     const cfg = loadConfig(base);
-    // initiative-A P2-A1: the default registry is now private GHCR; the template is a REPO PATH (no host).
-    expect(cfg.pgRegistryBase).toBe("https://ghcr.io");
-    expect(cfg.pgImageTemplate).toBe("vangoghsoftware/worktreedb-compute-v{major}");
+    // initiative-A P2-A2 (Jordan 2026-07-09): DEFAULT stays Docker Hub's anonymous compute-node
+    // (v17 works out-of-box) — flipping the default to the PRIVATE GHCR would 401 without a token.
+    // GHCR (all-bookworm, all majors) is opt-in via the three env vars — see the next test.
+    expect(cfg.pgRegistryBase).toBe("https://registry-1.docker.io");
+    expect(cfg.pgImageTemplate).toBe("neondatabase/compute-node-v{major}");
     expect(cfg.pgRegistryToken).toBeUndefined(); // no credential unless DEVDB_PG_REGISTRY_TOKEN is set
     expect(cfg.pgBuildsDir).toBe(`${cfg.dataDir}/pg_builds`);
     expect(cfg.pgDistribDir).toBe(`${cfg.dataDir}/pg_distrib`);
@@ -83,14 +85,16 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...base, DEVDB_PG_REGISTRY_TOKEN: "   " }).pgRegistryToken).toBeUndefined();
   });
 
-  it("registry base + template stay overridable back to Docker Hub (GHCR-down / mirror fallback)", () => {
+  it("opt-in to the private GHCR self-built images via the three env vars (P2-A2)", () => {
     const cfg = loadConfig({
       ...base,
-      DEVDB_PG_REGISTRY_BASE: "https://registry-1.docker.io",
-      DEVDB_PG_IMAGE_TEMPLATE: "neondatabase/compute-node-v{major}",
+      DEVDB_PG_REGISTRY_BASE: "https://ghcr.io",
+      DEVDB_PG_IMAGE_TEMPLATE: "vangoghsoftware/worktreedb-compute-v{major}",
+      DEVDB_PG_REGISTRY_TOKEN: "ghp_pat",
     });
-    expect(cfg.pgRegistryBase).toBe("https://registry-1.docker.io");
-    expect(cfg.pgImageTemplate).toBe("neondatabase/compute-node-v{major}");
+    expect(cfg.pgRegistryBase).toBe("https://ghcr.io");
+    expect(cfg.pgImageTemplate).toBe("vangoghsoftware/worktreedb-compute-v{major}");
+    expect(cfg.pgRegistryToken).toBe("ghp_pat");
   });
 
   it("DEVDB_PG_REGISTRY_BASE must be an http(s) URL; trailing slash stripped", () => {
