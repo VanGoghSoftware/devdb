@@ -58,7 +58,11 @@ export interface BranchDto {
   runningPgVersion: string | null;
 }
 
-export const PgBuildStatusSchema = z.enum(["downloading", "validating", "ready", "failed"]);
+// "skipped": a benign no-op terminal state — a pull whose resolved digest/minor is already
+// installed (same-minor dedup, or an identical-digest re-pull). Distinct from "failed" so the UI
+// doesn't alarm on it or offer a Retry that just re-no-ops; the row still records its digest→minor
+// so the update-check reads the major as up-to-date (see Provisioner.check / recordSkip).
+export const PgBuildStatusSchema = z.enum(["downloading", "validating", "ready", "failed", "skipped"]);
 export type PgBuildStatus = z.infer<typeof PgBuildStatusSchema>;
 
 export interface PgBuildDto {
