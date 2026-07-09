@@ -27,6 +27,10 @@ const EnvSchema = z.object({
   DEVDB_WEB_DIST: z.string().optional(),
   DEVDB_PG_REGISTRY_BASE: z.string().optional(),
   DEVDB_PG_IMAGE_TEMPLATE: z.string().optional(),
+  // Optional credential for a PRIVATE registry (the default GHCR namespace is private). A SECRET —
+  // it is threaded straight into the OciClient constructor and NEVER logged, echoed in a DTO, or
+  // included in /api/status. Unset ⇒ the anonymous pull flow (e.g. Docker Hub) is unchanged.
+  DEVDB_PG_REGISTRY_TOKEN: z.string().optional(),
 });
 
 export interface DevdbConfig {
@@ -50,6 +54,8 @@ export interface DevdbConfig {
   webDistDir: string | null;
   pgRegistryBase: string;
   pgImageTemplate: string;
+  // Secret; undefined when unset. Consumed ONLY by index.ts's OciClient construction — never serialized.
+  pgRegistryToken: string | undefined;
   pgBuildsDir: string;
   pgDistribDir: string;
 }
@@ -112,15 +118,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
 
   // Dynamic PG builds (spec 2026-07-04): overrides exist for mirrors/air-gap AND for the hermetic
   // integration fixture registry. http:// is allowed deliberately (the fixture, an in-network
-  // registry:2, has no TLS) — the DEFAULT stays https to Docker Hub.
-  const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://registry-1.docker.io").replace(/\/+$/, "");
+  // registry:2, has no TLS). The DEFAULT is now GHCR (initiative-A P2-A1) — the from-source
+  // worktreedb-compute images live there; pointing these two vars back at Docker Hub +
+  // `neondatabase/compute-node-v{major}` still works (the mirror/air-gap AND GHCR-down fallback).
+  const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://ghcr.io").replace(/\/+$/, "");
   if (!/^https?:\/\//.test(pgRegistryBase)) {
     throw new Error(`DEVDB_PG_REGISTRY_BASE must be an http(s) URL, got: ${pgRegistryBase}`);
   }
-  const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "neondatabase/compute-node-v{major}";
+  // A REPOSITORY PATH resolved against pgRegistryBase (no host prefix) — the base supplies the host.
+  const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "vangoghsoftware/worktreedb-compute-v{major}";
   if (!pgImageTemplate.includes("{major}")) {
     throw new Error(`DEVDB_PG_IMAGE_TEMPLATE must contain the literal {major} placeholder, got: ${pgImageTemplate}`);
   }
+  // Normalize an empty / whitespace-only value to unset so it can never produce a broken `Basic
+  // x-access-token:` (empty-password) auth attempt — an unset token means the anonymous flow.
+  const pgRegistryToken = e.DEVDB_PG_REGISTRY_TOKEN?.trim() || undefined;
 
   return {
     httpPort,
@@ -134,6 +146,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     webDistDir,
     pgRegistryBase,
     pgImageTemplate,
+    pgRegistryToken,
     pgBuildsDir: join(e.DEVDB_DATA_DIR, "pg_builds"),
     pgDistribDir: join(e.DEVDB_DATA_DIR, "pg_distrib"),
   };

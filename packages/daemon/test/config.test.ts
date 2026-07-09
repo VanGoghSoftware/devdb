@@ -66,12 +66,31 @@ describe("loadConfig", () => {
     });
   });
 
-  it("pg build provisioning defaults + derived dirs", () => {
+  it("pg build provisioning defaults + derived dirs (GHCR by default; token unset)", () => {
     const cfg = loadConfig(base);
-    expect(cfg.pgRegistryBase).toBe("https://registry-1.docker.io");
-    expect(cfg.pgImageTemplate).toBe("neondatabase/compute-node-v{major}");
+    // initiative-A P2-A1: the default registry is now private GHCR; the template is a REPO PATH (no host).
+    expect(cfg.pgRegistryBase).toBe("https://ghcr.io");
+    expect(cfg.pgImageTemplate).toBe("vangoghsoftware/worktreedb-compute-v{major}");
+    expect(cfg.pgRegistryToken).toBeUndefined(); // no credential unless DEVDB_PG_REGISTRY_TOKEN is set
     expect(cfg.pgBuildsDir).toBe(`${cfg.dataDir}/pg_builds`);
     expect(cfg.pgDistribDir).toBe(`${cfg.dataDir}/pg_distrib`);
+  });
+
+  it("DEVDB_PG_REGISTRY_TOKEN parses into pgRegistryToken; empty/whitespace normalizes to undefined", () => {
+    expect(loadConfig({ ...base, DEVDB_PG_REGISTRY_TOKEN: "ghp_secret-pat" }).pgRegistryToken).toBe("ghp_secret-pat");
+    expect(loadConfig({ ...base, DEVDB_PG_REGISTRY_TOKEN: "  ghp_trimmed  " }).pgRegistryToken).toBe("ghp_trimmed");
+    expect(loadConfig({ ...base, DEVDB_PG_REGISTRY_TOKEN: "" }).pgRegistryToken).toBeUndefined();
+    expect(loadConfig({ ...base, DEVDB_PG_REGISTRY_TOKEN: "   " }).pgRegistryToken).toBeUndefined();
+  });
+
+  it("registry base + template stay overridable back to Docker Hub (GHCR-down / mirror fallback)", () => {
+    const cfg = loadConfig({
+      ...base,
+      DEVDB_PG_REGISTRY_BASE: "https://registry-1.docker.io",
+      DEVDB_PG_IMAGE_TEMPLATE: "neondatabase/compute-node-v{major}",
+    });
+    expect(cfg.pgRegistryBase).toBe("https://registry-1.docker.io");
+    expect(cfg.pgImageTemplate).toBe("neondatabase/compute-node-v{major}");
   });
 
   it("DEVDB_PG_REGISTRY_BASE must be an http(s) URL; trailing slash stripped", () => {

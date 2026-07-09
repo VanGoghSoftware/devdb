@@ -178,6 +178,9 @@ beforeAll(async () => {
 interface Fixture {
   base: string;
   tokenHits: number;
+  // The `Authorization` header the client sent to /token on each hit (undefined = none). The private-GHCR
+  // Basic-auth arm is asserted through this; anonymous pulls must leave every entry undefined.
+  tokenAuthHeaders: (string | undefined)[];
   manifestFetches: string[];
   blobFetches: string[];
   close(): Promise<void>;
@@ -194,10 +197,11 @@ afterAll(async () => {
 async function startFixture(opts: {
   challenge?: boolean;
   corruptDigest?: string;
+  tokenStatus?: number;
   manifestOverrides?: Record<string, Buffer>;
   blobOverrides?: Record<string, Buffer>;
 }): Promise<Fixture> {
-  const fixture: Fixture = { base: "", tokenHits: 0, manifestFetches: [], blobFetches: [], close: async () => {} };
+  const fixture: Fixture = { base: "", tokenHits: 0, tokenAuthHeaders: [], manifestFetches: [], blobFetches: [], close: async () => {} };
   const server = http.createServer((req, res) => {
     const send = (code: number, body: Buffer | string, headers: Record<string, string> = {}): void => {
       res.writeHead(code, headers);
@@ -206,6 +210,12 @@ async function startFixture(opts: {
     const path = new URL(req.url ?? "/", "http://fixture").pathname;
     if (path === "/token") {
       fixture.tokenHits += 1;
+      fixture.tokenAuthHeaders.push(req.headers.authorization);
+      // Simulate a token-endpoint denial (e.g. a bad/expired PAT) so the error-hygiene test can assert the
+      // credential never leaks. The body is fixture-controlled and deliberately free of any secret text.
+      if (opts.tokenStatus !== undefined && opts.tokenStatus >= 400) {
+        return send(opts.tokenStatus, "token endpoint denied");
+      }
       return send(200, JSON.stringify({ token: "fixture-token" }), { "content-type": "application/json" });
     }
     if (opts.challenge === true && req.headers.authorization !== "Bearer fixture-token") {
@@ -270,6 +280,8 @@ async function startFixtureAndClient(
     challenge?: boolean;
     corruptDigest?: string;
     arch?: string;
+    authToken?: string;
+    tokenStatus?: number;
     manifestOverrides?: Record<string, Buffer>;
     blobOverrides?: Record<string, Buffer>;
   } = {},
@@ -277,7 +289,7 @@ async function startFixtureAndClient(
   const fixture = await startFixture(opts);
   const workDir = await mkdtemp(join(tmpdir(), "devdb-oci-work-"));
   scratchDirs.push(workDir);
-  const client = new OciClient({ registryBase: fixture.base, arch: opts.arch ?? "amd64" });
+  const client = new OciClient({ registryBase: fixture.base, arch: opts.arch ?? "amd64", authToken: opts.authToken });
   return { fixture, client, workDir, destDir: join(workDir, "dest") };
 }
 
@@ -327,6 +339,55 @@ describe("OciClient", () => {
     await client.pullPrefix({ repository: REPO, digest, destDir, prefix: "usr/local/" });
     expect(fixture.tokenHits).toBe(1); // challenged once; token cached for every later fetch
     await expect(access(join(destDir, "bin", "postgres"))).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 8 (initiative-A P2-A1): private-GHCR token auth. When an `authToken` is configured, the token
+// endpoint (the Bearer-challenge exchange) is called with HTTP Basic `x-access-token:<token>` — GHCR
+// accepts a PAT that way (the username is ignored). Unset ⇒ the anonymous flow (Docker Hub) is byte-for-
+// byte unchanged. The credential is a SECRET: it must never appear in a thrown error's message.
+// ---------------------------------------------------------------------------
+describe("OciClient — private-registry token auth (GHCR Basic arm)", () => {
+  const SECRET = "ghp_super-secret-pat-value-DO-NOT-LEAK-0123456789";
+  const expectedBasic = `Basic ${Buffer.from(`x-access-token:${SECRET}`).toString("base64")}`;
+
+  it("presents the configured token to the challenged token endpoint as HTTP Basic (x-access-token)", async () => {
+    const { fixture, client, destDir } = await startFixtureAndClient({ challenge: true, authToken: SECRET });
+    const { digest } = await client.resolveDigest(REPO, "latest");
+    await client.pullPrefix({ repository: REPO, digest, destDir, prefix: "usr/local/" });
+    expect(fixture.tokenHits).toBe(1);
+    expect(fixture.tokenAuthHeaders[0]).toBe(expectedBasic); // the token reached the endpoint as Basic auth
+    await expect(access(join(destDir, "bin", "postgres"))).resolves.toBeUndefined(); // pull still succeeds
+  });
+
+  it("sends NO Authorization header to the token endpoint when no token is configured (anonymous unchanged)", async () => {
+    const { fixture, client, destDir } = await startFixtureAndClient({ challenge: true }); // no authToken
+    const { digest } = await client.resolveDigest(REPO, "latest");
+    await client.pullPrefix({ repository: REPO, digest, destDir, prefix: "usr/local/" });
+    expect(fixture.tokenHits).toBe(1);
+    expect(fixture.tokenAuthHeaders.every((h) => h === undefined)).toBe(true); // Docker Hub path untouched
+    await expect(access(join(destDir, "bin", "postgres"))).resolves.toBeUndefined();
+  });
+
+  it("never echoes the token or the Basic header in a token-endpoint failure error", async () => {
+    // Token endpoint denies (403). The thrown error carries the token URL + status + a body snippet — it must
+    // NOT carry the credential we just sent. This assertion holds trivially before the auth arm exists (no
+    // header sent) and must KEEP holding after (the sent header value must not leak into the message).
+    const { client } = await startFixtureAndClient({ challenge: true, authToken: SECRET, tokenStatus: 403 });
+    const err = await client.resolveDigest(REPO, "latest").then(
+      () => {
+        throw new Error("expected resolveDigest to reject on a 403 token endpoint");
+      },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toMatch(/token request .* failed: 403/); // it IS the token-failure error path
+    expect(msg).not.toContain(SECRET); // the PAT never leaks
+    expect(msg).not.toContain(expectedBasic); // nor the full Basic header
+    expect(msg).not.toContain("Basic "); // nor even the scheme prefix
+    expect(msg).not.toMatch(/authorization/i);
   });
 });
 
