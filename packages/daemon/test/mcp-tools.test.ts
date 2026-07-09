@@ -1122,13 +1122,15 @@ describe("MCP read tools", () => {
         expect(body).toMatch(/re-pull/i);
       });
 
-      it("trails with an updates line when a prior check found news", async () => {
+      it("trails with an unverified-latest line when a prior check found an unconfirmed latest", async () => {
         h = await makeReadToolsHarness();
         vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
         vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
           fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
         ]);
         vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+        // updateAvailableFor is non-null ONLY for an "unverified" latest (null for current/incompatible),
+        // so the trailing line must be honest about that — not a confident "update available".
         vi.mocked(h.pgBuildFakes.provisioner.updateAvailableFor).mockImplementation(
           (major: number) => (major === 16 ? "latest@ab12cd34ef56" : null),
         );
@@ -1137,7 +1139,25 @@ describe("MCP read tools", () => {
 
         expect(res.isError).toBeFalsy();
         const body = firstText(res);
-        expect(body).toMatch(/updates: PG 16 → latest@ab12cd34ef56/);
+        expect(body).toMatch(/unverified: PG 16 → latest@ab12cd34ef56 \(pull to verify\)/);
+        expect(body).not.toMatch(/update available/i);
+      });
+
+      it("renders a skipped (benign no-op) build as [skipped], not [failed]", async () => {
+        h = await makeReadToolsHarness();
+        vi.mocked(h.pgBuildFakes.registry.installedMajors).mockReturnValue([16]);
+        vi.mocked(h.pgBuildFakes.registry.list).mockReturnValue([
+          fakeRow({ id: "baked-v16", major: 16, minor: 9, source: "baked", releaseTag: "baked", active: true, status: "ready" }),
+          fakeRow({ id: "noop-16", major: 16, minor: 9, source: "downloaded", releaseTag: "latest", active: false, status: "skipped", error: "already installed as 16.9 (baked) — up to date" }),
+        ]);
+        vi.mocked(h.pgBuildFakes.registry.degradedMajors).mockReturnValue([]);
+
+        const res = await h.call("list_pg_builds", {});
+
+        expect(res.isError).toBeFalsy();
+        const body = firstText(res);
+        expect(body).toMatch(/\[skipped\].*already installed as 16\.9 \(baked\) — up to date/);
+        expect(body).not.toMatch(/\[failed\]/); // a no-op is not a failure
       });
 
       it("with no installed majors, says so and hints at pull_pg_build", async () => {
@@ -1154,21 +1174,25 @@ describe("MCP read tools", () => {
     });
 
     describe("check_pg_updates", () => {
-      it("runs the provisioner check over the given majors and renders the isNew map", async () => {
+      it("renders an honest per-state line for each major (unverified / current / incompatible)", async () => {
         h = await makeReadToolsHarness();
         const checkSpy = vi.mocked(h.pgBuildFakes.provisioner.check).mockResolvedValue({
+          "15": { tag: "latest", digest: "sha256:" + "c".repeat(64), state: "incompatible", isNew: false, at: "2026-07-04T00:00:00.000Z" },
           "16": { tag: "latest", digest: "sha256:" + "a".repeat(64), state: "unverified", isNew: true, at: "2026-07-04T00:00:00.000Z" },
           "17": { tag: "latest", digest: "sha256:" + "b".repeat(64), state: "current", isNew: false, at: "2026-07-04T00:00:00.000Z" },
         } as Awaited<ReturnType<typeof h.pgBuildFakes.provisioner.check>>);
 
-        const res = await h.call("check_pg_updates", { majors: [16, 17] });
+        const res = await h.call("check_pg_updates", { majors: [15, 16, 17] });
 
         expect(res.isError).toBeFalsy();
-        expect(checkSpy).toHaveBeenCalledWith([16, 17]);
+        expect(checkSpy).toHaveBeenCalledWith([15, 16, 17]);
         const body = firstText(res);
-        expect(body).toMatch(/16/);
-        expect(body).toMatch(/17/);
-        expect(body.toLowerCase()).toMatch(/new|update/);
+        // Honest wording: unverified is offerable ("pull to verify"), current is up to date, and an
+        // incompatible latest is flagged as not-installable — never a confident "new build available".
+        expect(body).toMatch(/PG 16:.*unverified.*pull to verify/i);
+        expect(body).toMatch(/PG 17:.*up to date/i);
+        expect(body).toMatch(/PG 15:.*incompatible.*not installable/i);
+        expect(body.toLowerCase()).not.toMatch(/new build available/);
       });
 
       it("defaults majors to the currently-installed set when omitted", async () => {

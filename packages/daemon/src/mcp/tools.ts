@@ -168,6 +168,11 @@ function renderBuildSubline(row: PgBuildRow): string {
   if (row.status === "failed") {
     return `  [failed] ${originLabel}: ${row.error ?? "unknown error"}`;
   }
+  // A benign no-op (its digest/minor was already installed): show its message, distinctly from a
+  // failure so an agent doesn't read it as one or retry it (a retry just re-no-ops).
+  if (row.status === "skipped") {
+    return `  [skipped] ${row.error ?? "already installed (up to date)"}`;
+  }
   return `  [${row.status}] ${versionString(row)} ${originLabel}`;
 }
 
@@ -183,7 +188,10 @@ function renderBuildSubline(row: PgBuildRow): string {
 // literally no other rows to describe either.
 function noActiveSuffix(others: PgBuildRow[]): string {
   if (others.some((r) => r.status === "downloading" || r.status === "validating")) return " yet (pulling)";
-  if (others.length > 0 && others.every((r) => r.status === "failed")) return " (last pull failed)";
+  // "last pull failed" only when a REAL failure is all that's left — a benign `skipped` no-op is not
+  // a failure, so it neither triggers this suffix nor suppresses it when a genuine failure sits beside it.
+  const nonSkipped = others.filter((r) => r.status !== "skipped");
+  if (nonSkipped.length > 0 && nonSkipped.every((r) => r.status === "failed")) return " (last pull failed)";
   return "";
 }
 
@@ -206,7 +214,9 @@ function renderMajorBlock(major: number, rows: PgBuildRow[], degraded: boolean, 
       : `PG ${major} — no active build${noActiveSuffix(others)}`,
   );
   for (const row of others) lines.push(renderBuildSubline(row));
-  if (updateAvailable) lines.push(`updates: PG ${major} → ${updateAvailable}`);
+  // updateAvailable is non-null ONLY for an "unverified" latest (a digest we haven't confirmed is
+  // newer — null for current/incompatible), so word it honestly, not as a confident "update".
+  if (updateAvailable) lines.push(`unverified: PG ${major} → ${updateAvailable} (pull to verify)`);
   return lines.join("\n");
 }
 
@@ -517,17 +527,25 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
 
   const CheckPgUpdatesShape = { majors: z.array(PgVersionSchema).optional() };
   server.registerTool("check_pg_updates", {
-    description: "Check the OCI registry for a newer 'latest' build per major (egress — hits the network). Populates list_pg_builds' trailing 'updates:' lines.",
+    description: "Check the OCI registry's 'latest' per major and classify it honestly — current / unverified (worth a pull to verify) / incompatible (won't load on this runtime) — egress: hits the network. Populates list_pg_builds' trailing 'unverified:' lines.",
     inputSchema: CheckPgUpdatesShape,
   }, guard("check_pg_updates", deps, async ({ majors }: z.infer<z.ZodObject<typeof CheckPgUpdatesShape>>) => {
     const targets = majors ?? deps.registry.installedMajors();
     const result = await deps.provisioner.check(targets);
+    // Honest per-state wording (see Provisioner.CheckState): "unverified" is the only offerable
+    // outcome (a `latest` we haven't confirmed is newer — pull to verify); "current" is up to date;
+    // "incompatible" means `latest` already failed to load on this runtime and re-pulling re-fails.
+    const stateLabel: Record<string, string> = {
+      current: "up to date",
+      unverified: "latest unverified — pull to verify",
+      incompatible: "latest incompatible with this runtime — not installable",
+    };
     const lines = Object.entries(result).map(
-      ([major, r]) => `  PG ${major}: ${r.isNew ? "new build available" : "up to date"} (${r.tag}@${r.digest.replace(/^sha256:/, "").slice(0, 12)})`,
+      ([major, r]) => `  PG ${major}: ${stateLabel[r.state] ?? r.state} (${r.tag}@${r.digest.replace(/^sha256:/, "").slice(0, 12)})`,
     );
     return text(
       `[devdb] checked ${targets.length} major(s) as of ${nowIso()}\n${lines.join("\n")}\n` +
-      `Next: pull_pg_build for any major reporting a new build.`,
+      `Next: pull_pg_build for any major with an unverified latest.`,
     );
   }));
 
