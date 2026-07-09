@@ -150,6 +150,12 @@ no upstream license text is altered. Redistribution obligations (attribution /
 `NOTICE`) are to be settled in the pre-public review — until then the images are
 **private** (see below).
 
+The **engine** image is built on `node:22-bookworm-slim`, so beneath DevDB's own
+builds above it also redistributes Node.js (MIT) and the Debian bookworm userland
+(mixed licenses, incl. GPL/LGPL) — to be inventoried in the same pre-public
+review. The four `worktreedb-compute-v{14..17}` carriers are `FROM scratch` and
+contain nothing beyond the table.
+
 ## Private-registry access
 
 The GHCR packages are **private** (born private under the private repo; no public
