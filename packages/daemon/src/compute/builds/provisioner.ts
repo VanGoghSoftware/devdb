@@ -6,6 +6,7 @@ import { DevdbError } from "../../services/errors.js";
 import type { StateDb } from "../../state/db.js";
 import type { PgBuildRow } from "../../state/repos.js";
 import { shortDigest } from "./registry.js";
+import { isIncompatibilityError } from "./version.js";
 import type { BuildRegistry } from "./registry.js";
 import type { OciPuller } from "./oci.js";
 import type { LogsService } from "../../services/logs.js";
@@ -46,7 +47,22 @@ export function firstLine(e: unknown): string {
   return msg.split("\n")[0]!.slice(0, 500);
 }
 
-interface CheckResult { tag: "latest"; digest: string; isNew: boolean; at: string }
+// An HONEST per-major update-check outcome. `state` is the load-bearing field; `isNew` is kept as a
+// derived convenience (=== state "unverified") for the DTO/web/MCP call sites that predate it.
+//   current      — the registry's `latest` is a version you already run (its digest is installed
+//                  ready, or its recorded minor is): nothing to fetch.
+//   incompatible — `latest`'s digest already FAILED TO LOAD on this runtime (a build linked against a
+//                  different OS base): permanent for this runtime, re-pulling re-fails — NOT an update.
+//   unverified   — `latest`'s digest is unknown, or failed only transiently: it MIGHT be a newer minor
+//                  we can't confirm without a pull. We neither claim "confirmed newer" (we haven't
+//                  verified) nor hide it (a genuine newer minor stays reachable via Pull).
+// Deliberately NO "confirmed newer minor" state: the heuristic can't confirm one without a full pull
+// (it only has the digest, not its minor). Reading the minor from the image config/labels — which
+// WOULD let check() confirm a newer minor without a pull — is a future enhancement gated on the pull
+// target's label conventions (the default is Neon's public Docker Hub images; the Oracle rule forbids
+// inventing their payloads). See docs/superpowers/2026-07-10-pg-builds-update-check-honesty.md.
+type CheckState = "current" | "incompatible" | "unverified";
+interface CheckResult { tag: "latest"; digest: string; state: CheckState; isNew: boolean; at: string }
 
 // Orchestrates check/pull: preflight → OCI pull/extract → fixup (version detect + marker) →
 // validation gate (injected) → auto-activate → recompose pg_distrib. One pull runs at a time
@@ -114,33 +130,39 @@ export class Provisioner {
     return this.deps.cfg.pgImageTemplate.replace("{major}", String(major));
   }
 
-  // Resolves each major's `latest` digest against the registry and records whether it's new
-  // (i.e. not already present as a `pg_builds` row) — the UI's "update available" check.
+  // Resolves each major's `latest` digest against the registry and classifies it honestly (see
+  // CheckState) — the UI's update check.
   async check(majors: number[]): Promise<Record<string, CheckResult>> {
     const out: Record<string, CheckResult> = {};
     for (const major of majors) {
       const { digest } = await this.deps.oci.resolveDigest(this.repoFor(major), "latest");
-      // Version-aware "is there something new to pull?". byDigest is ready-preferred: it surfaces a
-      // prior row at this digest — a ready install, OR the same-minor no-op extractFixupAndGate
-      // records (status failed, but with its minor set). isNew is true only when this digest is
-      // NEITHER already installed at its exact digest, NOR (via that recorded minor) a minor already
-      // present as a ready build. Without the minor arm a baked build — which carries the '' digest
-      // sentinel, so `latest` never digest-matches it — would flag "update available" forever even
-      // when `latest` resolves to the exact minor already baked.
+      // byDigest is ready-preferred: it surfaces a prior row at this digest — a ready install, OR the
+      // same-minor no-op recordSkip persists (status "skipped"/legacy "failed", but with its minor
+      // set), OR a pull that failed here. `latest` never digest-matches a BAKED build (it carries the
+      // '' sentinel), so the minor arm is what stops a baked-current major reading as new: a prior
+      // no-op recorded this digest→minor, and that minor is installed ready.
       const seen = this.deps.state.pgBuilds.byDigest(digest);
       const seenMinor = seen?.minor ?? null;
       const minorInstalled = seenMinor !== null &&
         this.deps.state.pgBuilds.listByMajor(major).some((b) => b.status === "ready" && b.minor === seenMinor);
-      const isNew = seen?.status !== "ready" && !minorInstalled;
-      const result: CheckResult = { tag: "latest", digest, isNew, at: new Date().toISOString() };
+      const current = seen?.status === "ready" || minorInstalled;
+      // A `latest` whose only trace here is a load/base-incompatibility failure is NOT an update: the
+      // incompatibility is permanent for this runtime, so re-pulling it re-fails identically. (A
+      // TRANSIENT failure — gate timeout, disk, a 404, an activate malfunction — is left "unverified"
+      // so a genuine newer minor it might yet install stays reachable via Pull.)
+      const incompatible = !current && seen?.status === "failed" && isIncompatibilityError(seen.error);
+      const state: CheckState = current ? "current" : incompatible ? "incompatible" : "unverified";
+      const result: CheckResult = { tag: "latest", digest, state, isNew: state === "unverified", at: new Date().toISOString() };
       this.lastCheck.set(major, result);
       out[String(major)] = result;
     }
     return out;
   }
 
-  // The UI badge string for a major's last check(): "latest@<12-char digest>" only when that
-  // check found something not yet installed; null otherwise (nothing new, or never checked).
+  // The UI badge string for a major's last check(): "latest@<12-char digest>" only when that check
+  // left the major "unverified" (an unconfirmed `latest` worth a Pull); null for current/incompatible
+  // (nothing to fetch, or a re-failing incompatibility) and when never checked. Honest by
+  // construction: it never asserts a *confirmed* newer minor — the badge text says "unverified".
   updateAvailableFor(major: number): string | null {
     const c = this.lastCheck.get(major);
     if (!c || !c.isNew) return null;

@@ -1157,8 +1157,8 @@ describe("MCP read tools", () => {
       it("runs the provisioner check over the given majors and renders the isNew map", async () => {
         h = await makeReadToolsHarness();
         const checkSpy = vi.mocked(h.pgBuildFakes.provisioner.check).mockResolvedValue({
-          "16": { tag: "latest", digest: "sha256:" + "a".repeat(64), isNew: true, at: "2026-07-04T00:00:00.000Z" },
-          "17": { tag: "latest", digest: "sha256:" + "b".repeat(64), isNew: false, at: "2026-07-04T00:00:00.000Z" },
+          "16": { tag: "latest", digest: "sha256:" + "a".repeat(64), state: "unverified", isNew: true, at: "2026-07-04T00:00:00.000Z" },
+          "17": { tag: "latest", digest: "sha256:" + "b".repeat(64), state: "current", isNew: false, at: "2026-07-04T00:00:00.000Z" },
         } as Awaited<ReturnType<typeof h.pgBuildFakes.provisioner.check>>);
 
         const res = await h.call("check_pg_updates", { majors: [16, 17] });

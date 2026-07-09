@@ -1279,8 +1279,8 @@ describe("buildServer pg-builds routes", () => {
     const { registry } = await makePgBuildsRegistry(); // installedMajors() -> [16, 17]
     const provisioner = fakeProvisioner();
     const checkResult = {
-      "16": { tag: "latest" as const, digest: "sha256:c".repeat(1), isNew: false, at: "2026-07-04T00:00:00.000Z" },
-      "17": { tag: "latest" as const, digest: "sha256:d".repeat(1), isNew: true, at: "2026-07-04T00:00:00.000Z" },
+      "16": { tag: "latest" as const, digest: "sha256:c".repeat(1), state: "current" as const, isNew: false, at: "2026-07-04T00:00:00.000Z" },
+      "17": { tag: "latest" as const, digest: "sha256:d".repeat(1), state: "unverified" as const, isNew: true, at: "2026-07-04T00:00:00.000Z" },
     };
     vi.mocked(provisioner.check).mockResolvedValue(checkResult);
     const app = buildServer({

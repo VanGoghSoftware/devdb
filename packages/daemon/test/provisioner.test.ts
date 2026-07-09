@@ -674,20 +674,23 @@ describe("Provisioner", () => {
 
     const result = await provisioner.check([16, 17]);
 
-    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_B, isNew: true });
-    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: false });
+    // 17's latest digest is unknown ⇒ "unverified" (we can't confirm it's newer without a pull),
+    // NOT a confident "update available". 16's resolves to an installed-ready digest ⇒ "current".
+    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_B, state: "unverified", isNew: true });
+    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "current", isNew: false });
 
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_B.slice(7, 19)}`);
     expect(provisioner.updateAvailableFor(16)).toBeNull();
   });
 
-  it("check(): a FAILED row at the current digest does not count as installed — isNew stays true", async () => {
+  it("check(): a TRANSIENTLY-failed row at the current digest stays offerable — state unverified, isNew true", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);
-    // 17's `latest` resolves to DIGEST_A — the only row at that digest is `failed` (e.g. a prior
-    // gate failure or a non-409 activate malfunction). byDigest is ready-preferred: absent a ready
-    // row it still returns this failed one, so check() must not mistake "a row exists" for
-    // "installed" — nothing is actually on disk for this digest.
+    // 17's `latest` resolves to DIGEST_A — the only row at that digest is `failed` for a NON-base
+    // reason (a gate timeout / a non-409 activate malfunction; error not an incompatibility). byDigest
+    // is ready-preferred: absent a ready row it still returns this failed one, so check() must not
+    // mistake "a row exists" for "installed" — nothing is on disk. A transient failure might yet
+    // install a genuine newer minor on retry, so it stays "unverified" (offerable), not suppressed.
     const { oci } = fakeOci({ digest: DIGEST_A });
     const { state, provisioner } = makeProvisioner({ install, builds, oci });
 
@@ -695,11 +698,39 @@ describe("Provisioner", () => {
       id: "failed-17", major: 17, minor: null, source: "downloaded", releaseTag: "latest",
       imageDigest: DIGEST_A, path: "", status: "failed",
     });
+    state.pgBuilds.setStatus("failed-17", "failed", "gate timed out after 90s");
 
     const result = await provisioner.check([17]);
 
-    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: true });
+    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "unverified", isNew: true });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+  });
+
+  it("check(): an INCOMPATIBLE failed row at the current digest is not an update — state incompatible, isNew false", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    // 16's `latest` resolves to DIGEST_A, whose only row is a pull that FAILED TO LOAD (a bullseye
+    // compute-node — libssl.so.1.1 — on the bookworm runtime). The incompatibility is permanent for
+    // this runtime: re-pulling DIGEST_A re-fails identically, so it is NOT an available update. The
+    // over-eager pre-fix check flagged it forever (the very image that just failed to load).
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+
+    state.pgBuilds.insert({
+      id: "incompat-16", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed",
+    });
+    state.pgBuilds.setStatus("incompat-16", "failed",
+      "/data/pg_builds/v16/.tmp-aaaa/bin/postgres is incompatible with this runtime image "
+      + "(missing shared library libssl.so.1.1) — the build targets a different OS base than this container");
+
+    const result = await provisioner.check([16]);
+
+    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(16)).toBeNull();
   });
 
   // Same-version dedup (the fix): a baked build carries the '' digest sentinel, so `latest`
