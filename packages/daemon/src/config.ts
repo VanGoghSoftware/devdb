@@ -27,7 +27,7 @@ const EnvSchema = z.object({
   DEVDB_WEB_DIST: z.string().optional(),
   DEVDB_PG_REGISTRY_BASE: z.string().optional(),
   DEVDB_PG_IMAGE_TEMPLATE: z.string().optional(),
-  // Optional credential for a PRIVATE registry (the default GHCR namespace is private). A SECRET —
+  // Optional credential for a PRIVATE registry (the GHCR namespace for the self-built images is private). A SECRET —
   // it is threaded straight into the OciClient constructor and NEVER logged, echoed in a DTO, or
   // included in /api/status. Unset ⇒ the anonymous pull flow (e.g. Docker Hub) is unchanged.
   DEVDB_PG_REGISTRY_TOKEN: z.string().optional(),
