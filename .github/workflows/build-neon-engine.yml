@@ -30,6 +30,13 @@ name: build-neon-engine
 on:
   workflow_dispatch:
   push:
+    # branches guard (review I1): auto-publish ONLY from main. Without it, pushing
+    # ANY branch that touches the paths below (this feature branch does) would build
+    # + publish to the shared release-9129/{minor}/latest tags before review — and
+    # once the runtime pull defaults to GHCR's `latest`, a stray branch push would be
+    # consumed by live pulls. workflow_dispatch still validates any branch ref from
+    # the Actions UI / `gh workflow run --ref`, so no capability is lost.
+    branches: [main]
     paths:
       - docker/neon-build/versions.json
       - docker/neon-build/Dockerfile
