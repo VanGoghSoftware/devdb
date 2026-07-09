@@ -862,6 +862,29 @@ describe("Provisioner", () => {
     expect(ready[0]).toMatchObject({ id: "baked-v17", active: true });
   });
 
+  // Review finding (P3): a wrong-MAJOR image at the latest digest is also a PERMANENT failure for this
+  // major (re-pulling that tag re-extracts the same wrong-major image and re-fails the expected-major
+  // guard). Like an OS-base incompatibility, it must NOT be advertised as an unverified update — else
+  // status/MCP/UI loop-prompt a Pull already proven unusable. (Reachable only via a registry mislabel —
+  // v17's `latest` pointing at a v16 image — but the classification must stay honest regardless.)
+  it("check(): a wrong-major failed row at the current digest is a permanent failure, not an update", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({ id: "mismatch-17", major: 17, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("mismatch-17", "failed", "image contained postgres 16.9, expected major 17");
+
+    const result = await provisioner.check([17]);
+
+    expect(result["17"]).toMatchObject({ state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(17)).toBeNull();
+  });
+
   // Review finding (P3): an incompatibility is PERMANENT for this runtime, so ONE incompatible-failed
   // row at a digest is definitive — even if a later retry of the SAME digest fails transiently (after
   // resolveDigest, before detectVersion) and lands a newer row. byDigest returns only the newest

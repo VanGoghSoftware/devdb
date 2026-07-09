@@ -47,6 +47,19 @@ export function firstLine(e: unknown): string {
   return msg.split("\n")[0]!.slice(0, 500);
 }
 
+// The message runPipeline records when an extracted image's real PG major ≠ the requested major, and
+// its read-back predicate — co-located so the write and read can't drift (mirrors version.ts's
+// isIncompatibilityError). classifyDigest treats a wrong-major `latest` as a PERMANENT per-(major,
+// digest) failure: re-pulling that tag re-extracts the same wrong-major image and re-fails the
+// expected-major guard, so — exactly like an OS-base incompatibility — it must not be advertised as an
+// unverified update. (Reachable only via a registry mislabel, e.g. v17's `latest` → a v16 image.)
+export function majorMismatchMessage(a: { detectedMajor: number; minor: number; requestedMajor: number }): string {
+  return `image contained postgres ${a.detectedMajor}.${a.minor}, expected major ${a.requestedMajor}`;
+}
+export function isMajorMismatchError(err: string | null): boolean {
+  return err != null && /^image contained postgres \d+\.\d+, expected major \d+$/.test(err);
+}
+
 // An HONEST per-major update-check outcome. `state` is the load-bearing field; `isNew` is kept as a
 // derived convenience (=== state "unverified") for the DTO/web/MCP call sites that predate it.
 //   current      — the registry's `latest` is a version you already run (its digest is installed
@@ -149,7 +162,11 @@ export class Provisioner {
     const minorInstalledReady = (m: number | null): boolean =>
       m !== null && majorRows.some((b) => b.status === "ready" && b.minor === m);
     if (atDigest.some((r) => r.status === "ready" || minorInstalledReady(r.minor))) return "current";
-    if (atDigest.some((r) => r.status === "failed" && isIncompatibilityError(r.error))) return "incompatible";
+    // A failed row at this digest that is PERMANENT for this major — an OS-base incompatibility, or a
+    // wrong-major image (registry mislabel) — is not an update: re-pulling re-fails identically.
+    if (atDigest.some((r) => r.status === "failed" && (isIncompatibilityError(r.error) || isMajorMismatchError(r.error)))) {
+      return "incompatible";
+    }
     return "unverified";
   }
 
@@ -448,7 +465,7 @@ export class Provisioner {
     // --- Fixup: version detect, must match the requested major.
     const { major: detectedMajor, minor } = await deps.detectVersion(join(tmpDir, "bin", "postgres"));
     if (detectedMajor !== major) {
-      const msg = `image contained postgres ${detectedMajor}.${minor}, expected major ${major}`;
+      const msg = majorMismatchMessage({ detectedMajor, minor, requestedMajor: major });
       await rm(tmpDir, { recursive: true, force: true });
       state.pgBuilds.updatePath(id, ""); // FIX-3(a): failure-rm'd the dir ⇒ drop the row's claim on it
       state.pgBuilds.setStatus(id, "failed", msg);
