@@ -161,6 +161,17 @@ container is using this volume, clear it with:
 
 Then start normally (`docker compose -f docker/compose.yaml up -d`).
 
+**Upgrading from a neond-engine devdb volume.** DevDB's storage controller keeps
+its own small catalog Postgres (`storcon_db`) on the `/data` volume. The catalog
+major changed when the engine moved off the prebuilt neond image, so a volume
+first created by an older image can carry a `storage_controller_pg_data` from a
+different Postgres major than the current image ships. Postgres cannot open a
+data directory from another major, so rather than let it FATAL-loop cryptically,
+the daemon refuses to boot and prints the major it found versus the major this
+image ships. Either **start fresh with a new volume**, or **keep running the
+previous image**; automated migration of an existing volume lands with
+import/export (a later phase).
+
 **Where did my logs go?** `docker compose logs devdb` carries all engine and
 compute output (storage controller, pageserver, safekeeper, and every
 compute's `compute_ctl`/postgres) — it's the container's own stdout/stderr,

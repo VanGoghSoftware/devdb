@@ -1,5 +1,5 @@
 import { execa } from "execa";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -22,14 +22,37 @@ export function resolveVanillaPgDir(pgInstallDir: string): string {
   return join(pgInstallDir, `v${versions[0]}`);
 }
 
+// A data dir's PG_VERSION is a plain-text file whose first token is the catalog major that initdb
+// stamped it with (`17`, or a dev build's `19devel`). Parse the leading integer of that first token.
+export function parsePgVersionFileMajor(content: string): number | null {
+  const first = content.trim().split(/\s+/)[0] ?? "";
+  const m = first.match(/^(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+// `postgres --version` prints "postgres (PostgreSQL) 17.5" (true upstream), "... 19devel" (neon's
+// vanilla dev build — what neond's vanilla_v17 actually is), or "... 17.5 (<fork-hash>)" (the neon
+// fork). Take the major following "(PostgreSQL)"; fall back to the first integer anywhere.
+export function parsePostgresVersionMajor(output: string): number | null {
+  const tagged = output.match(/PostgreSQL\)\s+(\d+)/i);
+  if (tagged) return Number(tagged[1]);
+  const any = output.match(/(\d+)/);
+  return any ? Number(any[1]) : null;
+}
+
 export class EmbeddedPostgres {
   private proc: ManagedProcess | null = null;
   private pgDir: string;
   private initInFlight: Promise<void> | null = null;
+  private expectedMajorPromise: Promise<number | null> | null = null;
 
   constructor(private opts: {
     name: string; dataDir: string; pgInstallDir: string; port: number; password: string;
     onLine?: (line: string) => void;
+    // Test seam (optional → boot.ts, the sole construction site, is unchanged): overrides how the
+    // shipped storcon binary's catalog major is determined. Left unset in production, which probes
+    // `<pgDir>/bin/postgres --version` once — see resolveExpectedMajor() below.
+    probeBinaryMajor?: () => Promise<number>;
   }) {
     this.pgDir = resolveVanillaPgDir(opts.pgInstallDir);
   }
@@ -82,7 +105,66 @@ export class EmbeddedPostgres {
     }
   }
 
+  // The catalog major of the storcon binary this image ships, resolved once (it is immutable for
+  // the process lifetime). MEMOIZED on purpose: start()'s guard awaits it, and if two concurrent
+  // start() calls ever awaited it they must share ONE suspension so they resume in registration
+  // order — that is what keeps the running-guard→claim region atomic (see start()).
+  private expectedBinaryMajor(): Promise<number | null> {
+    this.expectedMajorPromise ??= this.resolveExpectedMajor();
+    return this.expectedMajorPromise;
+  }
+
+  private async resolveExpectedMajor(): Promise<number | null> {
+    try {
+      if (this.opts.probeBinaryMajor) return await this.opts.probeBinaryMajor();
+      const { stdout } = await execa(join(this.pgDir, "bin", "postgres"), ["--version"], {
+        env: { LD_LIBRARY_PATH: join(this.pgDir, "lib") },
+      });
+      return parsePostgresVersionMajor(stdout);
+    } catch (e) {
+      // Fail OPEN: the guard's own inability to read the shipped binary's version must never block a
+      // boot that would otherwise succeed. Only a CONFIRMED mismatch (both majors known and unequal)
+      // refuses; postgres's own catalog check stays the backstop for anything that slips past.
+      this.opts.onLine?.(
+        `devdb: could not determine storcon postgres major (${(e as Error).message}); skipping catalog-major guard`,
+      );
+      return null;
+    }
+  }
+
   async start(): Promise<void> {
+    // Catalog-major guard (initiative-A Phase 2). A pre-existing volume whose storcon catalog was
+    // initdb'd by a DIFFERENT postgres major than the binary this image ships cannot be opened by
+    // postgres — it FATAL-loops on a cryptic parameter/catalog error (observed live 2026-07-08 when
+    // devdb:dev repointed to true-vanilla 17.5 over a neond-vanilla-19devel `/data`). Detect it and
+    // refuse with an actionable message BEFORE spawning. Gated on PG_VERSION existing, so the
+    // fresh-initdb path (boot.ts runs init() first → the file is stamped by THIS binary → majors
+    // match) and any never-initialized dir fall straight through untouched.
+    //
+    // Placed BEFORE the running-guard on purpose: the expected-major probe is the one `await` in
+    // start()'s pre-spawn section, and it must not land BETWEEN the running-guard and the
+    // `this.proc` claim below — an await there would let two concurrent start()s both pass the guard
+    // while `this.proc` is still null and race two postmasters (the invariant removeStalePidFile's
+    // comment defends). Taking it up front, via the MEMOIZED expectedBinaryMajor(), means any
+    // concurrent callers share ONE suspension and resume in registration order, so the first runs
+    // the whole running-guard→claim region synchronously before the second re-checks. The
+    // existsSync/readFileSync are synchronous, so when PG_VERSION is absent there is no await at all
+    // and the pre-existing atomicity is byte-for-byte preserved.
+    const pgVersionPath = join(this.opts.dataDir, "PG_VERSION");
+    if (existsSync(pgVersionPath)) {
+      const found = parsePgVersionFileMajor(readFileSync(pgVersionPath, "utf8"));
+      if (found !== null) {
+        const expected = await this.expectedBinaryMajor();
+        if (expected !== null && found !== expected) {
+          throw new Error(
+            `${this.opts.name}: this volume's storage_controller catalog was created by PostgreSQL ${found}, ` +
+            `but this image ships PostgreSQL ${expected}. PostgreSQL cannot open a data directory created by a ` +
+            `different major version. Start DevDB with a fresh volume, or keep running the previous image; ` +
+            `automated migration arrives with import/export (Phase 4).`,
+          );
+        }
+      }
+    }
     if (this.proc && (this.proc.state === "running" || this.proc.state === "starting")) {
       throw new Error(`${this.opts.name} already ${this.proc.state}`);
     }
