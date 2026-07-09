@@ -215,7 +215,7 @@ describe("Provisioner", () => {
     expect(registry.pgbinFor(17).buildId).toBe("baked-v17"); // active pointer untouched
   });
 
-  it('digest dedup: already-installed digest → row failed with "already installed" and NO oci.pullPrefix call', async () => {
+  it('digest dedup: already-installed digest → row SKIPPED (benign) with "already installed" and NO oci.pullPrefix call', async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);
     const { oci, pullPrefixSpy } = fakeOci({ digest: DIGEST_A });
@@ -229,9 +229,11 @@ describe("Provisioner", () => {
 
     const { buildId } = await provisioner.pull({ major: 17, tag: "latest" });
 
+    // A no-op is a benign "skipped", NOT "failed" — the UI must not alarm or offer a Retry that
+    // just re-no-ops. The dedup guard itself is unchanged (pullPrefix never runs).
     const row = await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       return r!;
     });
     expect(row.error).toMatch(/already installed/);
@@ -753,13 +755,13 @@ describe("Provisioner", () => {
 
     const row = await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       return r!;
     });
     // The pull no-op'd against the already-installed 17.5 — recording the source it collided with.
     expect(row.error).toMatch(/already installed as 17\.5/);
-    // The digest→minor link is persisted on the failing row (so check() can read it back), the
-    // resolved digest survives, and the failure-rm'd row drops its path claim.
+    // The digest→minor link is persisted on the skipped row (so check() can read it back), the
+    // resolved digest survives, and the no-op row drops its path claim (owns no dir).
     expect(row.minor).toBe(5);
     expect(row.imageDigest).toBe(DIGEST_A);
     expect(row.path).toBe("");
@@ -788,17 +790,49 @@ describe("Provisioner", () => {
     expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: true } });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
 
-    // The same-minor pull no-ops, recording DIGEST_A → minor 5 on the failed row.
+    // The same-minor pull no-ops, recording DIGEST_A → minor 5 on the benign skipped row.
     const { buildId } = await provisioner.pull({ major: 17 });
     await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       expect(r?.minor).toBe(5);
     });
 
-    // AFTER: the recorded digest→minor resolves to the already-ready baked 17.5 — no update.
-    expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: false } });
+    // AFTER: the recorded digest→minor resolves to the already-ready baked 17.5 — current, no update.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
     expect(provisioner.updateAvailableFor(17)).toBeNull();
+  });
+
+  // Skipped rows carry the digest→minor memory check() needs, so they PERSIST (we can't just delete
+  // them) — but repeated no-op pulls at the same digest must not accumulate. recordSkip prunes older
+  // skipped siblings at the same (major, digest), keeping exactly one. Reachable via direct API/MCP
+  // force-pulls (agents-first): the honest check() stops the UI offering Pull for a current major,
+  // but the guard still bounds the rows.
+  it("repeated same-minor no-op pulls at the same digest keep exactly one skipped row (older pruned)", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked v17 (17.5)
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives(); // baked-v17 (17.5) active
+
+    const { buildId: first } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(first)?.status).toBe("skipped"));
+
+    const { buildId: second } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(second)?.status).toBe("skipped"));
+
+    const skipped = state.pgBuilds.listByMajor(17).filter((b) => b.status === "skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.id).toBe(second);           // the newest no-op record survives
+    expect(state.pgBuilds.byId(first)).toBeNull(); // the older duplicate was pruned
+    // digest→minor memory intact ⇒ check() still reads the major as current.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
+    // The real ready build is untouched — still exactly the baked one, active.
+    const ready = state.pgBuilds.listByMajor(17).filter((b) => b.status === "ready");
+    expect(ready).toHaveLength(1);
+    expect(ready[0]).toMatchObject({ id: "baked-v17", active: true });
   });
 
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
@@ -1037,7 +1071,13 @@ describe("Provisioner", () => {
       dirs.push(root);
       await fakeInstallDir(install, "v17");
       const { oci } = fakeOci();
-      const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+      // Pulled build detects 17.7 (≠ baked 17.5) so it reaches ACTIVATION rather than no-op'ing at
+      // the same-minor dedup first — the activate malfunction below is the whole point of this test.
+      // (Before benign-skip landed, a same-minor no-op set status "failed" too, so this test passed
+      // for the wrong reason: it never reached activate. Now a no-op is "skipped", exposing that.)
+      const { state, registry, provisioner } = makeProvisioner({
+        install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+      });
       await registry.seedBaked();
       registry.resolveActives();
       vi.spyOn(registry, "activate").mockImplementation(() => {

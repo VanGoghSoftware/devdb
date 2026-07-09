@@ -177,6 +177,35 @@ export class Provisioner {
     this.deps.logs.ingest(`pgbuild:${buildId}`, line);
   }
 
+  // Records a benign no-op pull — one whose resolved digest/minor is ALREADY installed (same-minor
+  // dedup, or an identical-digest re-pull) — as a distinct `skipped` terminal state, NOT `failed`.
+  // A no-op is not a failure: surfacing it as one made the UI alarm and offer a Retry that just
+  // re-no-ops (the observed gap). The row PERSISTS on purpose: its recorded digest→minor is how
+  // check() reads the major as up-to-date — a BAKED build carries the '' digest sentinel, so a prior
+  // no-op's row is the only link from `latest`'s digest to the installed minor. So we can't just
+  // delete it; instead we clear its path (a no-op owns no dir) and prune older `skipped` siblings at
+  // the same (major, digest) — keeping exactly one — so repeated no-op pulls (reachable via direct
+  // API/MCP force-pulls) don't accumulate. The status flip is immediate (non-destructive, like the
+  // failure paths); only the prune's row deletes run in the mutation lane, since a concurrent
+  // activate/remove could be operating on a sibling row.
+  private async recordSkip(id: string, msg: string): Promise<void> {
+    const { state } = this.deps;
+    state.pgBuilds.updatePath(id, "");
+    state.pgBuilds.setStatus(id, "skipped", msg);
+    this.log(id, msg);
+    const row = state.pgBuilds.byId(id);
+    if (row && row.imageDigest !== "") {
+      await this.runMutation(async () => {
+        for (const sib of state.pgBuilds.listByMajor(row.major)) {
+          if (sib.id !== id && sib.status === "skipped" && !sib.active && sib.imageDigest === row.imageDigest) {
+            state.pgBuilds.delete(sib.id);
+          }
+        }
+      });
+    }
+    this.publish();
+  }
+
   // Kicks off an async pull job and returns its buildId immediately (202-style). Only one pull
   // may run at a time process-wide; a concurrent call rejects with a generic 409 rather than
   // queuing — the caller (human or agent) retries once the first finishes.
@@ -253,10 +282,12 @@ export class Provisioner {
       const existing = state.pgBuilds.byDigest(digest);
       if (existing && existing.status === "ready") {
         const versionStr = existing.minor !== null ? `${existing.major}.${existing.minor}` : `${existing.major}.x`;
-        const msg = `already installed as ${versionStr} — no-op`;
-        state.pgBuilds.setStatus(id, "failed", msg);
-        this.log(id, msg);
-        this.publish();
+        // Benign no-op (identical digest already ready). Stamp the resolved digest + the collided-with
+        // minor on THIS row so the skipped record is self-describing and prunable by (major, digest);
+        // the existing ready row still carries the authoritative digest→minor for check().
+        state.pgBuilds.setDigestPath(id, { imageDigest: digest, path: "" });
+        if (existing.minor !== null) state.pgBuilds.updateMinor(id, existing.minor);
+        await this.recordSkip(id, `already installed as ${versionStr} (${existing.source}) — up to date`);
         return;
       }
 
@@ -271,7 +302,9 @@ export class Provisioner {
       state.raw.prepare("INSERT INTO jobs (id, kind, status) VALUES (?, 'pg_build_pull', 'running')").run(jobId);
       try {
         await this.extractFixupAndGate(id, major, tag, digest, tmpDir, finalDirRef, activatedRef);
-        jobStatus = state.pgBuilds.byId(id)?.status === "ready" ? "done" : "failed";
+        // A same-minor no-op ends `skipped` — a benign success, not a failed job.
+        const s = state.pgBuilds.byId(id)?.status;
+        jobStatus = s === "ready" || s === "skipped" ? "done" : "failed";
       } finally {
         state.raw.prepare("UPDATE jobs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
           .run(jobStatus, jobId);
@@ -407,13 +440,11 @@ export class Provisioner {
       (b) => b.id !== id && b.status === "ready" && b.minor === minor,
     );
     if (sameMinor) {
-      const msg = `already installed as ${major}.${minor} (${sameMinor.source}) — no-op`;
       await rm(tmpDir, { recursive: true, force: true });
-      state.pgBuilds.updateMinor(id, minor);
-      state.pgBuilds.updatePath(id, ""); // failure-rm'd the dir ⇒ drop the row's claim on it
-      state.pgBuilds.setStatus(id, "failed", msg);
-      this.log(id, msg);
-      this.publish();
+      state.pgBuilds.updateMinor(id, minor); // digest→minor link recordSkip keeps for check()
+      // Benign no-op, not a failure: record it as `skipped` (recordSkip clears the path + prunes
+      // older skipped siblings at this digest). The row's digest was stamped at setDigestPath above.
+      await this.recordSkip(id, `already installed as ${major}.${minor} (${sameMinor.source}) — up to date`);
       return;
     }
 

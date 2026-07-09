@@ -231,6 +231,16 @@ export class PgBuildsRepo {
   updateMinor(id: string, minor: number): void {
     this.db.prepare("UPDATE pg_builds SET minor = ? WHERE id = ?").run(minor, id);
   }
+  // One-shot boot migration (reconcilePgBuildsOnBoot): a benign no-op pull is recorded as `skipped`
+  // now, but rows created before that status existed are stuck as `failed … — no-op` — they read as
+  // alarming failures and offer a Retry that just re-no-ops. Reclassify exactly those historical rows
+  // to `skipped` (both no-op message shapes end `— no-op`); genuine failures are left untouched.
+  // Idempotent — once flipped they no longer match `status = 'failed'`. Returns the rows changed.
+  reclassifyLegacyNoOps(): number {
+    return this.db.prepare(
+      "UPDATE pg_builds SET status = 'skipped' WHERE status = 'failed' AND error LIKE 'already installed as %— no-op'",
+    ).run().changes;
+  }
   updatePath(id: string, path: string): void {
     this.db.prepare("UPDATE pg_builds SET path = ? WHERE id = ?").run(path, id);
   }
