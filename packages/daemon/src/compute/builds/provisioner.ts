@@ -289,8 +289,9 @@ export class Provisioner {
       // --- Dedup: resolve the digest, then check whether it's already installed & ready.
       // Identity is the DIGEST, never the tag: a mutable tag (`latest`) re-pulled at a new digest
       // is a NEW build (this row proceeds; the old digest's row and dir persist until GC), while
-      // the same digest already ready — whatever tag it arrived under — is a no-op. The no-op row
-      // keeps the '' digest sentinel so it can never shadow the real install in byDigest().
+      // the same digest already ready — whatever tag it arrived under — is a no-op. recordSkip below
+      // stamps this no-op row with the REAL digest (self-describing + prunable by (major, digest));
+      // it can't shadow the ready install because byDigest() is ready-preferred (ready rows sort first).
       const { digest } = await deps.oci.resolveDigest(repo, tag);
       resolvedDigest = digest;
       const existing = state.pgBuilds.byDigest(digest);

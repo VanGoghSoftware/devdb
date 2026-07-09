@@ -15,7 +15,7 @@ const isDowngradeConflict = (e: unknown): e is ApiError =>
 
 // One row of the installed-builds list under a major. Downloaded/baked "ready" rows get inline
 // Activate/Delete; in-flight rows show a spinner; failed rows show the error + a retry.
-function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
+function BuildRow(a: { row: PgBuildDto; activeMinor: number | null; onPulled: (major: number) => void }) {
   const activate = useActivatePgBuild();
   const del = useDeletePgBuild();
   const pull = usePullPgBuild();
@@ -53,7 +53,7 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
             <Button
               size="compact-xs"
               loading={pull.isPending}
-              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
+              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag }, { onSuccess: () => a.onPulled(row.major) })}
             >
               Retry pull
             </Button>
@@ -151,6 +151,7 @@ function MajorSection(a: {
   degradedDowngrade: boolean;
   updateAvailable: string | null;
   builds: PgBuildDto[];
+  onPulled: (major: number) => void;
 }) {
   const pull = usePullPgBuild();
   const activeRow = a.builds.find((b) => b.active);
@@ -182,7 +183,7 @@ function MajorSection(a: {
               <Button
                 size="compact-xs"
                 loading={pull.isPending}
-                onClick={() => pull.mutate({ major: a.major })}
+                onClick={() => pull.mutate({ major: a.major }, { onSuccess: () => a.onPulled(a.major) })}
               >
                 Pull
               </Button>
@@ -196,7 +197,7 @@ function MajorSection(a: {
         </Alert>
       )}
       <Stack gap={4}>
-        {a.builds.map((row) => <BuildRow key={row.id} row={row} activeMinor={activeMinor} />)}
+        {a.builds.map((row) => <BuildRow key={row.id} row={row} activeMinor={activeMinor} onPulled={a.onPulled} />)}
       </Stack>
     </Stack>
   );
@@ -206,12 +207,20 @@ export function PgBuildsCard() {
   const { data: status } = useStatus();
   const { data: builds } = usePgBuilds();
   const check = useCheckPgUpdates();
-  // "isNew" per major from the last Check-for-updates resolution — component-local, cleared by
-  // nothing (a fresh check overwrites it); status.pgBuilds' own updateAvailable field is a
-  // per-major server memory of the SAME thing but only refreshed on an actual check, so we track
-  // the just-resolved result locally to render the badge synchronously in the same test tick a
-  // status refetch might not have landed yet.
+  // "isNew" per major from the last Check-for-updates resolution — component-local (rendered
+  // synchronously, in the same tick a status refetch may not have landed). A fresh check overwrites
+  // it; and since it takes precedence over the server value, a pull for a major must CLEAR that
+  // major's entry (clearChecked below) — otherwise the check→pull→verify flow leaves a stale
+  // "unverified latest" badge over an "up to date" row for the rest of the session.
   const [checkResult, setCheckResult] = useState<Record<string, { tag: string; isNew: boolean }>>({});
+  // Drop a major's local check result once it's been pulled: the pull settles the digest server-side
+  // (Provisioner refreshes lastCheck; the pg_builds event refetches status), so the now-honest server
+  // updateAvailable should govern again instead of the pre-pull snapshot.
+  const clearChecked = (major: number): void =>
+    setCheckResult((prev) => {
+      const { [String(major)]: _cleared, ...rest } = prev;
+      return rest;
+    });
 
   if (!status) return null;
   // #8: union the ready majors (status.pgBuilds) with every major that has ANY build row
@@ -252,6 +261,7 @@ export function PgBuildsCard() {
               degradedDowngrade={majorStatus?.degradedDowngrade ?? false}
               updateAvailable={updateAvailable}
               builds={majorBuilds}
+              onPulled={clearChecked}
             />
           );
         })}

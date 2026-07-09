@@ -299,6 +299,29 @@ describe("PgBuildsCard", () => {
     expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
   });
 
+  // Review finding (P4): the motivating flow. After check→Pull, the local check result (which now
+  // takes precedence over the server value) must be cleared, or the "unverified latest" badge + Pull
+  // linger over an "up to date" row for the rest of the session — the pull just verified the digest.
+  it("clears the in-session unverified badge after the user pulls it (check → pull → verify)", async () => {
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:new", isNew: true },
+      "17": { tag: "17.5", digest: "sha256:old", isNew: false },
+    });
+    vi.mocked(api.pgBuilds.pull).mockResolvedValue({ buildId: "b16" });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    const pullBtn = await screen.findByRole("button", { name: /^pull$/i });
+    await userEvent.click(pullBtn);
+
+    // baseStatus carries updateAvailable:null for 16, so once the local check result is dropped the
+    // badge + Pull are gone (the honest server value governs) — no lingering prompt.
+    await waitFor(() => expect(screen.queryByText(/unverified latest/i)).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.pull).mock.calls.at(-1)?.[0]).toEqual({ major: 16 }));
+  });
+
   // Gap 2: a benign same-minor/dup no-op is a `skipped` row, not a `failed` one — it must read as a
   // muted "up to date" line, NOT alarm as a failure and NOT offer a Retry (that just re-no-ops) or an
   // Activate (there is no distinct build to activate).

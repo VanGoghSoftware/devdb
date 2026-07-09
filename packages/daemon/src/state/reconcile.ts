@@ -25,13 +25,14 @@ export function reconcileEndpointsOnBoot(state: StateDb): void {
   }
 }
 
-// One-shot boot reconcile for pg_builds: reclassify historical benign-no-op rows (recorded as
-// `failed … — no-op` before the `skipped` status existed) to `skipped`, so they stop reading as
-// alarming failures with a Retry that just re-no-ops. Genuine failures and other statuses are
-// untouched; idempotent across reboots. Placed beside reconcileEndpointsOnBoot() (index.ts runs both
-// at boot, before anything is live) — the SQL itself lives in PgBuildsRepo. Returns the rows changed.
+// One-shot boot reconcile for pg_builds: fix up historical benign-no-op rows (recorded as
+// `failed … — no-op` before the `skipped` status existed) so they stop reading as alarming failures
+// with a Retry that just re-no-ops — reclassifying the ones with a real digest→minor link to
+// `skipped` and deleting the value-less '' -digest noise (see PgBuildsRepo.reconcileLegacyNoOps).
+// Genuine failures are untouched; idempotent across reboots. Placed beside reconcileEndpointsOnBoot()
+// (index.ts runs both at boot, before anything is live). Returns the rows changed.
 export function reconcilePgBuildsOnBoot(state: StateDb): number {
-  return state.pgBuilds.reclassifyLegacyNoOps();
+  return state.pgBuilds.reconcileLegacyNoOps();
 }
 
 // Fix 4 (review, final wave): a compute mid-launch or mid-teardown at the moment the daemon
