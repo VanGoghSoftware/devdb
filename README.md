@@ -8,6 +8,8 @@ One Docker container; branches are copy-on-write and cost nothing to create.
     docker compose -f docker/compose.yaml up --build -d
     curl http://localhost:4400/api/status
 
+> **First build only:** the image's Neon engine base is a **private** GHCR image, so run a one-time `docker login ghcr.io` (with a `read:packages` PAT) before `--build`. See [`docker/BINARIES.md`](docker/BINARIES.md#private-registry-access).
+
 Open the dashboard at [http://localhost:4400](http://localhost:4400).
 
 Create a project (comes with a `main` branch):
