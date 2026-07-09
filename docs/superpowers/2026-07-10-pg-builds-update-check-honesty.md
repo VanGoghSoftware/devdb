@@ -82,5 +82,29 @@ two-gate review (independent reviewer subagent + review-broker scan) before prop
 
 ## Model note
 Bounded UX/logic fix within one subsystem (provisioner update-check + its DTO/web/MCP surfacing) —
-no concurrency-model / storage-durability / engine-contract change → stays on session default (Opus).
-Escalate to Fable only if the lane-prune interaction proves subtle in implementation.
+no concurrency-model / storage-durability / engine-contract change → stayed on session default (Opus).
+The lane-prune interaction proved straightforward; no Fable escalation needed. The final whole-branch
+review used Fable (per CLAUDE.md's "most capable model for final review") via a subagent.
+
+## Outcome (all green, two-gate review converged)
+
+11 commits on `claude/confident-hofstadter-70e975`. Final: daemon **648/648**, web **166/166**;
+tsc gates + all three prod builds clean.
+
+Two-gate review drove **11 findings to zero** over 5 fix rounds, ending on a **clean broker scan**:
+- **review-broker** (gpt-5.5, xhigh): r1 → 3 (stale lastCheck after a verifying pull; classify over
+  ALL rows at a digest, not byDigest's single pick; web fresh-check authority). r3 → 2 (major-scope the
+  digest dedup; scope the retry cache-clear to `latest`). r4 → 1 (classify a wrong-major latest as
+  permanent). r5 → 1 (**reachable**: refresh the cache on any `latest` pull even when the tag moved
+  since the check — the normal new-minor flow). r6 → **clean**.
+- **independent reviewer** (Fable, xhigh, subagent): confirmed the r1 broker fixes, then raised 4 —
+  P4 (clear the in-session badge on pull; the motivating flow) **fixed**; P5 stale sentinel comment
+  **fixed**; P5 delete `''`-digest legacy no-op noise in the boot reconcile **fixed**; P5
+  incompatible-verdict-outliving-an-image-upgrade **deferred** (existing Retry/delete recovery; an
+  image-version-keyed invalidation is disproportionate). **Rejected with rationale:** "prune by minor"
+  (would drop the load-bearing digest→minor link check() reads) and a web Delete on skipped rows
+  (re-clutters a deliberately benign row).
+
+Deferred (documented): image-version-keyed invalidation of `incompatible` verdicts after a devdb
+base-image upgrade; reading `latest`'s minor from image config/labels to confirm a newer minor without
+a pull (would upgrade `unverified` → `current`/`newer`; gated on the pull target's label conventions).
