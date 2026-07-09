@@ -181,7 +181,7 @@ async function main(): Promise<void> {
     // helpers, and recomposeDistrib (defined above, shared with boot's own initial compose call).
     const provisioner = new Provisioner({
       registry, state, logs, events, logger,
-      oci: new OciClient({ registryBase: cfg.pgRegistryBase }),
+      oci: new OciClient({ registryBase: cfg.pgRegistryBase, authToken: cfg.pgRegistryToken }),
       cfg: { pgBuildsDir: cfg.pgBuildsDir, pgImageTemplate: cfg.pgImageTemplate },
       validate: makeValidationRunner({ projects, endpoints, sql, logger }),
       detectVersion: detectPostgresVersion, du: duDir, statfsFree, recomposeDistrib,

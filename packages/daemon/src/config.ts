@@ -27,6 +27,10 @@ const EnvSchema = z.object({
   DEVDB_WEB_DIST: z.string().optional(),
   DEVDB_PG_REGISTRY_BASE: z.string().optional(),
   DEVDB_PG_IMAGE_TEMPLATE: z.string().optional(),
+  // Optional credential for a PRIVATE registry (the GHCR namespace for the self-built images is private). A SECRET —
+  // it is threaded straight into the OciClient constructor and NEVER logged, echoed in a DTO, or
+  // included in /api/status. Unset ⇒ the anonymous pull flow (e.g. Docker Hub) is unchanged.
+  DEVDB_PG_REGISTRY_TOKEN: z.string().optional(),
 });
 
 export interface DevdbConfig {
@@ -50,6 +54,8 @@ export interface DevdbConfig {
   webDistDir: string | null;
   pgRegistryBase: string;
   pgImageTemplate: string;
+  // Secret; undefined when unset. Consumed ONLY by index.ts's OciClient construction — never serialized.
+  pgRegistryToken: string | undefined;
   pgBuildsDir: string;
   pgDistribDir: string;
 }
@@ -112,15 +118,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
 
   // Dynamic PG builds (spec 2026-07-04): overrides exist for mirrors/air-gap AND for the hermetic
   // integration fixture registry. http:// is allowed deliberately (the fixture, an in-network
-  // registry:2, has no TLS) — the DEFAULT stays https to Docker Hub.
+  // registry:2, has no TLS). DEFAULT = Docker Hub's `neondatabase/compute-node-v{major}` (pulls
+  // anonymously — v17 works out-of-box; v14-16 are bullseye/ABI-broken on this bookworm runtime).
+  // To use the from-source, all-bookworm `worktreedb-compute` images (all majors work), OPT IN with
+  //   DEVDB_PG_REGISTRY_BASE=https://ghcr.io
+  //   DEVDB_PG_IMAGE_TEMPLATE=vangoghsoftware/worktreedb-compute-v{major}
+  //   DEVDB_PG_REGISTRY_TOKEN=<read:packages PAT>   (GHCR is private)
+  // (initiative-A P2-A2, Jordan 2026-07-09: keep a graceful anonymous default while GHCR is private,
+  // rather than flipping the default to a registry that 401s without a token.)
   const pgRegistryBase = (e.DEVDB_PG_REGISTRY_BASE?.trim() || "https://registry-1.docker.io").replace(/\/+$/, "");
   if (!/^https?:\/\//.test(pgRegistryBase)) {
     throw new Error(`DEVDB_PG_REGISTRY_BASE must be an http(s) URL, got: ${pgRegistryBase}`);
   }
+  // A REPOSITORY PATH resolved against pgRegistryBase (no host prefix) — the base supplies the host.
   const pgImageTemplate = e.DEVDB_PG_IMAGE_TEMPLATE?.trim() || "neondatabase/compute-node-v{major}";
   if (!pgImageTemplate.includes("{major}")) {
     throw new Error(`DEVDB_PG_IMAGE_TEMPLATE must contain the literal {major} placeholder, got: ${pgImageTemplate}`);
   }
+  // Normalize an empty / whitespace-only value to unset so it can never produce a broken `Basic
+  // x-access-token:` (empty-password) auth attempt — an unset token means the anonymous flow.
+  const pgRegistryToken = e.DEVDB_PG_REGISTRY_TOKEN?.trim() || undefined;
 
   return {
     httpPort,
@@ -134,6 +151,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DevdbConfig {
     webDistDir,
     pgRegistryBase,
     pgImageTemplate,
+    pgRegistryToken,
     pgBuildsDir: join(e.DEVDB_DATA_DIR, "pg_builds"),
     pgDistribDir: join(e.DEVDB_DATA_DIR, "pg_distrib"),
   };

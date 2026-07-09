@@ -1,0 +1,286 @@
+# Build the from-source Neon engine + per-major compute carrier images and publish
+# them multi-arch (amd64 + arm64) to GHCR (private). ONE Dockerfile
+# (docker/neon-build/Dockerfile) drives every image; all source pins live in
+# docker/neon-build/versions.json (the `check-manifest` gate guards drift before
+# any build runs).
+#
+# Images (namespace ghcr.io/vangoghsoftware — born PRIVATE under the private repo,
+# so no visibility step is needed):
+#   worktreedb-neon-engine        the `final` stage: the /usr/local/share/neon tree
+#                                 the outer devdb image FROMs. Tag = the pinned neon
+#                                 release tag (release-9129); the commit digest is
+#                                 inherent to the pushed manifest.
+#   worktreedb-compute-v{14..17}  `FROM scratch` carriers, each holding ONE major's
+#                                 pg_install under /usr/local — exactly what the
+#                                 runtime dynamic-minor pull (packages/daemon/src/
+#                                 compute/builds/oci.ts, prefix "usr/local/") fetches.
+#                                 Tags = {major}.{minor} (e.g. 14.18) + latest.
+#
+# Strategy: each arch builds NATIVELY on its own runner (NO QEMU — the from-source
+# PostgreSQL + Rust compile is far too slow under emulation), runs the engine
+# image's verify-binaries.sh, then pushes every image BY DIGEST. A final `merge`
+# job stitches the per-arch digests into multi-arch manifest lists with
+# `docker buildx imagetools create`.
+#
+# GATED ACCEPTANCE — this workflow CANNOT be validated locally. Its real proof is a
+# workflow_dispatch run on both hosted runners + a live GHCR pull (Jordan-gated).
+# Authored per plan Task 5 and its P2-A1 amendment.
+name: build-neon-engine
+
+on:
+  workflow_dispatch:
+  push:
+    # branches guard (review I1): auto-publish ONLY from main. Without it, pushing
+    # ANY branch that touches the paths below (this feature branch does) would build
+    # + publish to the shared release-9129/{minor}/latest tags before review — and
+    # once an instance opts into GHCR (P2-A2), a stray branch push's `latest` would be
+    # consumed by its live pulls. workflow_dispatch still validates any branch ref from
+    # the Actions UI / `gh workflow run --ref`, so no capability is lost.
+    branches: [main]
+    paths:
+      - docker/neon-build/versions.json
+      - docker/neon-build/Dockerfile
+      - docker/verify-binaries.sh
+      - .github/workflows/build-neon-engine.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: vangoghsoftware
+  ENGINE_IMAGE: ghcr.io/vangoghsoftware/worktreedb-neon-engine
+
+jobs:
+  build:
+    # FLAGGED (plan Task 5 Step 1): GitHub-hosted runners may be too small/slow for
+    # the cold from-source build and could hit the 6h per-job cap; if so, the
+    # fallback is larger or self-hosted runners (upstream neon uses self-hosted
+    # `large` runners). arm64 uses ubuntu-24.04-arm — standard hosted arm64,
+    # available to PRIVATE repos on included minutes since 2026-01-29.
+    # fail-fast:false so one arch's failure does not cancel the other leg.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Reclaim runner disk
+        # The cold from-source build's Docker footprint measured ~26 GB locally;
+        # GitHub-hosted runners ship only ~14 GB free on /. Drop the large
+        # preinstalled SDKs and prune preloaded images FIRST, before anything
+        # writes to the Docker data root. Inline (not jlumbroso/free-disk-space)
+        # to keep the supply-chain surface to pinned first-party actions and to
+        # stay arch-neutral across the amd64 + arm64 legs; `rm -rf` tolerates
+        # absent paths, so the same step is safe on both runner images.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: check-manifest gate (before any build)
+        # Static drift guard between versions.json and the Dockerfile ARGs.
+        run: go run ./cmd/worktreedb-build check-manifest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect build parallelism
+        run: echo "JOBS=$(nproc)" >> "$GITHUB_ENV"
+
+      - name: Build engine image (load) for native verify
+        # Build the `final` (engine) image once, load it into the local daemon,
+        # and populate the per-arch gha cache (mode=max caches every stage). The
+        # push builds below re-run entirely from this cache — only exporting to
+        # the registry — so the heavy compile happens exactly ONCE per leg.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: final
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          load: true
+          tags: worktreedb-neon-engine:verify
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=worktreedb-${{ matrix.arch }}
+
+      - name: Verify binaries natively (gate before push)
+        # Runs the same acceptance gate the outer image runs; the vanilla_v17
+        # tripwire fails fast if a neon-forked build slipped into vanilla.
+        run: docker run --rm worktreedb-neon-engine:verify bash /usr/local/bin/verify-binaries.sh
+
+      - name: Push engine image by digest
+        id: engine
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: final
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          provenance: false # keep a plain single-arch manifest for imagetools merge
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.ENGINE_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Push compute-v14 by digest
+        id: c14
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: compute-v14
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          provenance: false
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/worktreedb-compute-v14,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Push compute-v15 by digest
+        id: c15
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: compute-v15
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          provenance: false
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/worktreedb-compute-v15,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Push compute-v16 by digest
+        id: c16
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: compute-v16
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          provenance: false
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/worktreedb-compute-v16,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Push compute-v17 by digest
+        id: c17
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/neon-build/Dockerfile
+          target: compute-v17
+          platforms: linux/${{ matrix.arch }}
+          build-args: JOBS=${{ env.JOBS }}
+          provenance: false
+          cache-from: type=gha,scope=worktreedb-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OWNER }}/worktreedb-compute-v17,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Collect pushed digests
+        env:
+          ENGINE_DIGEST: ${{ steps.engine.outputs.digest }}
+          C14_DIGEST: ${{ steps.c14.outputs.digest }}
+          C15_DIGEST: ${{ steps.c15.outputs.digest }}
+          C16_DIGEST: ${{ steps.c16.outputs.digest }}
+          C17_DIGEST: ${{ steps.c17.outputs.digest }}
+        run: |
+          set -euo pipefail
+          d="${{ runner.temp }}/digests"
+          mkdir -p "$d/engine" "$d/compute-v14" "$d/compute-v15" "$d/compute-v16" "$d/compute-v17"
+          touch "$d/engine/${ENGINE_DIGEST#sha256:}"
+          touch "$d/compute-v14/${C14_DIGEST#sha256:}"
+          touch "$d/compute-v15/${C15_DIGEST#sha256:}"
+          touch "$d/compute-v16/${C16_DIGEST#sha256:}"
+          touch "$d/compute-v17/${C17_DIGEST#sha256:}"
+
+      - name: Upload per-arch digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create multi-arch manifests
+        run: |
+          set -euo pipefail
+          DIG="${{ runner.temp }}/digests"
+          MANIFEST=docker/neon-build/versions.json
+          neon_tag="$(jq -r '.neonTag' "$MANIFEST")"
+
+          # engine — tag = the pinned neon release tag (the commit digest is inherent).
+          engine_refs=()
+          for f in "$DIG"/engine/*; do
+            engine_refs+=("${ENGINE_IMAGE}@sha256:$(basename "$f")")
+          done
+          docker buildx imagetools create -t "${ENGINE_IMAGE}:${neon_tag}" "${engine_refs[@]}"
+
+          # per-major compute — tags = {major}.{minor} (from versions.json) + latest
+          # (latest is the runtime pull's default tag).
+          for major in 14 15 16 17; do
+            minor="$(jq -r ".majors[\"${major}\"].minor" "$MANIFEST")"
+            repo="${REGISTRY}/${OWNER}/worktreedb-compute-v${major}"
+            refs=()
+            for f in "$DIG"/compute-v${major}/*; do
+              refs+=("${repo}@sha256:$(basename "$f")")
+            done
+            docker buildx imagetools create \
+              -t "${repo}:${major}.${minor}" \
+              -t "${repo}:latest" \
+              "${refs[@]}"
+          done
+
+      - name: Inspect published manifests (confirm amd64 + arm64)
+        run: |
+          set -euo pipefail
+          MANIFEST=docker/neon-build/versions.json
+          neon_tag="$(jq -r '.neonTag' "$MANIFEST")"
+          docker buildx imagetools inspect "${ENGINE_IMAGE}:${neon_tag}"
+          for major in 14 15 16 17; do
+            minor="$(jq -r ".majors[\"${major}\"].minor" "$MANIFEST")"
+            docker buildx imagetools inspect "${REGISTRY}/${OWNER}/worktreedb-compute-v${major}:${major}.${minor}"
+          done

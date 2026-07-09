@@ -297,7 +297,10 @@ async function assertSafeExtractedTree(destDir: string): Promise<void> {
 export class OciClient implements OciPuller {
   private readonly tokens = new Map<string, string>(); // repo → bearer token (client-lifetime cache)
 
-  constructor(private readonly opts: { registryBase: string; arch?: string }) {}
+  // `authToken` (optional): a registry credential presented to the token endpoint via HTTP Basic when
+  // the registry challenges (private GHCR). Unset ⇒ the anonymous flow is unchanged (Docker Hub). It is
+  // a SECRET — held only here; never logged, never surfaced in a DTO/status payload or a thrown error.
+  constructor(private readonly opts: { registryBase: string; arch?: string; authToken?: string }) {}
 
   private arch(): string {
     return this.opts.arch ?? (process.arch === "arm64" ? "arm64" : "amd64");
@@ -323,7 +326,16 @@ export class OciClient implements OciPuller {
         const tokenUrl = new URL(challenge.realm);
         if (challenge.service !== undefined) tokenUrl.searchParams.set("service", challenge.service);
         if (challenge.scope !== undefined) tokenUrl.searchParams.set("scope", challenge.scope);
-        const tokenRes = await fetch(tokenUrl, { signal: AbortSignal.timeout(120_000) });
+        // Private-registry auth (GHCR): when a token is configured, present it to the token endpoint via
+        // HTTP Basic. GHCR mints the scoped bearer for a PAT supplied as the password with any username —
+        // `x-access-token` is the conventional placeholder, ignored by the server. Docker Hub's anonymous
+        // flow is untouched when no token is set (the header object stays empty). The token goes ONLY into
+        // this request header — never into `tokenUrl`, a log line, or the error thrown below.
+        const tokenHeaders: Record<string, string> = {};
+        if (this.opts.authToken !== undefined) {
+          tokenHeaders.authorization = `Basic ${Buffer.from(`x-access-token:${this.opts.authToken}`).toString("base64")}`;
+        }
+        const tokenRes = await fetch(tokenUrl, { headers: tokenHeaders, signal: AbortSignal.timeout(120_000) });
         if (!tokenRes.ok) {
           const body = await tokenRes.text().catch(() => "");
           throw new Error(`token request ${tokenUrl.href} failed: ${tokenRes.status} ${body.slice(0, 200)}`);

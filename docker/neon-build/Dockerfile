@@ -351,6 +351,41 @@ RUN set -e; \
     cp -a pg_install/v14 pg_install/v15 pg_install/v16 pg_install/v17 /out/pg_install/
 
 ##############################################################################
+# Compute carriers — one artifact-only image per PG major (Phase-2 Task 5).
+#
+# Each is a `FROM scratch` image whose ONLY content is that major's pg_install
+# tree laid down under /usr/local. They are NEVER run — only pulled: the runtime
+# dynamic-minor pull (packages/daemon/src/compute/builds/oci.ts) fetches ONE
+# major's image and extracts exactly the `usr/local/` prefix, then consumes
+# `bin/postgres` at the extracted tree's root (provisioner.ts detectVersion +
+# validate.ts both `join(dir, "bin", "postgres")`). This is the same contract as
+# neondatabase/compute-node-v{N}, whose /usr/local ships bin/ lib/ share/ direct.
+#
+# COPY semantics: `COPY <srcDir> /usr/local` copies the CONTENTS of pg_install/vN
+# (its bin/ lib/ share/) INTO /usr/local — not a nested /usr/local/vN — so the
+# binary lands at /usr/local/bin/postgres, exactly where oci.ts's
+# pullPrefix("usr/local/") assembles it.
+#
+# Placed AFTER `engine` and BEFORE `final` so `final` stays the Dockerfile's
+# DEFAULT (last) target: the local `worktreedb-build build` driver and
+# docker/Dockerfile keep building the engine runtime image with no --target,
+# and these cheap COPY-only stages are pruned from that graph (final does not
+# depend on them). CI selects each carrier with `--target compute-v{N}`; they
+# reuse the already-built `engine` stage from cache.
+##############################################################################
+FROM scratch AS compute-v14
+COPY --from=engine /out/pg_install/v14 /usr/local
+
+FROM scratch AS compute-v15
+COPY --from=engine /out/pg_install/v15 /usr/local
+
+FROM scratch AS compute-v16
+COPY --from=engine /out/pg_install/v16 /usr/local
+
+FROM scratch AS compute-v17
+COPY --from=engine /out/pg_install/v17 /usr/local
+
+##############################################################################
 # Stage 3: final — slim runtime carrying only the assembled engine tree + the
 # verify script.
 #

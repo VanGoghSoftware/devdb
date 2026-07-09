@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EmbeddedPostgres, resolveVanillaPgDir } from "../src/engine/embedded-postgres.js";
+import {
+  EmbeddedPostgres, parsePgVersionFileMajor, parsePostgresVersionMajor, resolveVanillaPgDir,
+} from "../src/engine/embedded-postgres.js";
 
 describe("EmbeddedPostgres", () => {
   it("builds connection uri", () => {
@@ -154,5 +156,135 @@ describe("EmbeddedPostgres", () => {
     const b = pg.init();
     expect(a).toBe(b);
     await expect(a).rejects.toThrow(); // bogus initdb — both share the same rejection
+  });
+
+  it("parses the catalog major from a PG_VERSION file (leading integer of the first token)", () => {
+    expect(parsePgVersionFileMajor("17\n")).toBe(17);
+    expect(parsePgVersionFileMajor("19devel\n")).toBe(19); // a dev-build catalog (neon's vanilla)
+    expect(parsePgVersionFileMajor("  16  ")).toBe(16);
+    expect(parsePgVersionFileMajor("")).toBeNull();
+    expect(parsePgVersionFileMajor("garbage")).toBeNull();
+  });
+
+  it("parses the major from `postgres --version` output (upstream, dev, and neon-fork formats)", () => {
+    expect(parsePostgresVersionMajor("postgres (PostgreSQL) 17.5")).toBe(17);           // true upstream
+    expect(parsePostgresVersionMajor("postgres (PostgreSQL) 19devel")).toBe(19);        // neon vanilla dev
+    expect(parsePostgresVersionMajor("postgres (PostgreSQL) 17.5 (a1b2c3d)")).toBe(17); // neon fork
+    expect(parsePostgresVersionMajor("nonsense")).toBeNull();
+  });
+
+  // The cutover this guards (initiative-A Phase 2): repointing devdb:dev onto the self-built
+  // true-vanilla 17.5 strands a PRE-EXISTING volume whose storcon catalog was initdb'd by neond's
+  // vanilla (19devel). Postgres refuses a data dir from another major with a cryptic FATAL loop;
+  // start() must instead refuse BEFORE spawning, with an actionable message naming both majors and
+  // the recovery options.
+  it("start() refuses when PG_VERSION's major differs from the shipped binary's, before spawning", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    writeFileSync(join(dataDir, "PG_VERSION"), "19devel\n"); // catalog created by neond's vanilla
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+      probeBinaryMajor: async () => 17, // the self-built true-vanilla this image now ships
+    });
+
+    const err = await pg.start().then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toContain("PostgreSQL 19"); // found — the volume's catalog major
+    expect(msg).toContain("PostgreSQL 17"); // expected — this image's binary major
+    expect(msg).toMatch(/fresh volume/);
+    expect(msg).toMatch(/previous image/);
+    expect(msg).toMatch(/import\/export \(Phase 4\)/);
+    // Refused BEFORE spawning: no ManagedProcess was ever claimed, so state stayed "stopped" (a
+    // spawn attempt against the bogus binary would have flipped it to "failed").
+    expect(pg.state).toBe("stopped");
+  });
+
+  it("start() proceeds normally when PG_VERSION's major matches the shipped binary", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    writeFileSync(join(dataDir, "PG_VERSION"), "17\n");
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+      probeBinaryMajor: async () => 17,
+    });
+    // A matching major clears the guard, so the ONLY failure is the bogus-binary spawn. Both the
+    // spawn error AND the guard's refusal begin with `${name}:` (→ "storcon_db"), so /storcon_db/
+    // alone can't tell them apart — a mis-plumbed `expected` that wrongly refused on a matching major
+    // would still match it. Pin it down by asserting the rejection is NOT the catalog-mismatch, whose
+    // distinctive phrase only the refusal carries.
+    const err = await pg.start().then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/storcon_db/);
+    expect((err as Error).message).not.toContain("catalog was created");
+  });
+
+  it("start() proceeds on a fresh data dir with no PG_VERSION (the guard is skipped entirely)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    expect(existsSync(join(dataDir, "PG_VERSION"))).toBe(false);
+    // A missing PG_VERSION must short-circuit BEFORE the expected-major probe — there is nothing to
+    // compare against. A COUNTING probe proves it: a throwing sentinel would be swallowed by the
+    // fail-open catch and hide a regression that consulted it, so count invocations and assert ZERO.
+    let probeCalls = 0;
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+      probeBinaryMajor: async () => { probeCalls++; return 17; },
+    });
+    await expect(pg.start()).rejects.toThrow(/storcon_db/); // only the bogus-binary spawn fails
+    expect(probeCalls).toBe(0); // the guard short-circuited on the absent PG_VERSION, never probing
+  });
+
+  // Fail-OPEN safety valve: if the shipped binary's major can't be determined (the --version probe
+  // throws), the guard must SKIP rather than refuse — its own inability to read the binary must never
+  // brick a boot that would otherwise succeed. Only a CONFIRMED mismatch refuses.
+  it("start() fails OPEN when the binary-major probe throws (PG_VERSION present, guard skipped)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    writeFileSync(join(dataDir, "PG_VERSION"), "17\n"); // a readable, plausibly-matching catalog
+    const lines: string[] = [];
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+      onLine: (l) => lines.push(l),
+      probeBinaryMajor: async () => { throw new Error("probe boom"); },
+    });
+
+    // The probe throwing leaves the expected major unknown → guard skipped → boot proceeds to the
+    // spawn, which fails on the bogus binary. It must NOT be the catalog-mismatch refusal, and the
+    // skip must be surfaced on onLine so a silently-disabled guard stays observable.
+    const err = await pg.start().then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toContain("catalog was created");
+    expect(lines.join("\n")).toContain("skipping catalog-major guard");
+  });
+
+  // Fail-OPEN, read side: a PG_VERSION that EXISTS but can't be read (EACCES, or the file vanished
+  // between existsSync and the read) must also skip the guard, not reject boot with a raw fs error.
+  // A directory at the PG_VERSION path makes existsSync pass and readFileSync throw EISDIR.
+  it("start() fails OPEN when PG_VERSION exists but can't be read (guard skipped)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pgi-"));
+    mkdirSync(join(root, "v17"));
+    const dataDir = mkdtempSync(join(tmpdir(), "pgdata-"));
+    mkdirSync(join(dataDir, "PG_VERSION")); // a dir → existsSync true, readFileSync throws EISDIR
+    const lines: string[] = [];
+    let probeCalls = 0;
+    const pg = new EmbeddedPostgres({
+      name: "storcon_db", dataDir, pgInstallDir: root, port: 5431, password: "pw",
+      onLine: (l) => lines.push(l),
+      probeBinaryMajor: async () => { probeCalls++; return 17; },
+    });
+
+    // Unreadable PG_VERSION → treated as unparseable (found stays null) → guard skipped before the
+    // probe → boot proceeds to the spawn failure. Not the catalog-mismatch; the skip is surfaced; and
+    // the probe is never reached because there was no parsed major to compare against.
+    const err = await pg.start().then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toContain("catalog was created");
+    expect(lines.join("\n")).toContain("skipping catalog-major guard");
+    expect(probeCalls).toBe(0);
   });
 });
