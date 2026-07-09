@@ -13,6 +13,13 @@ import { api, connect } from "./helpers/pg.js";
 // the REAL gate against LIVE storage. The three tests are deliberately ORDER-DEPENDENT (each
 // builds on the previous one's state), matching the brief: pull→gate→active→usable, then a
 // gate-failure that must not disturb that state, then re-up survival + the downgrade guard.
+//
+// Same-minor dedup (provisioner.extractFixupAndGate, commit 05323e4): a pull whose detected minor
+// already exists as a ready build is a no-op. The baked v17 is 17.5, so the downloaded and stub
+// fixtures each report a DISTINCT non-baked minor via a `bin/postgres` version shim (real image)
+// or the stub's fake banner — otherwise the pulls would dedup before reaching the gate/activate
+// path each test exercises. The shim still `exec`s the genuine 17.x server, so the gate and the
+// project endpoint serve real SQL; only the daemon's version LABEL is forged.
 
 const REPO = "neondatabase/compute-node-v17"; // repoFor(17) under the daemon's DEFAULT image template
 const REAL_TAG = "9999";
@@ -36,11 +43,14 @@ describe("dynamic pg builds (hermetic e2e)", () => {
   let net: StartedNetwork;
   let dev: Devdb;
   let registry: FixtureRegistry;
-  // Derived from the daemon's own baked row, not hardcoded: the fixture layer IS the baked build
-  // ("17.5" with the pinned neon compute image), so deriving keeps every equality below — and
-  // the tie-goes-to-baked assertions in test 3 — true by construction even if the pin moves.
+  // Derived from the daemon's own baked row, not hardcoded (so this survives a pin move): the baked
+  // v17 minor anchors the fixture minors below. The DOWNLOADED fixture reports one minor BELOW baked
+  // and the STUB two below — both non-baked (so neither dedups) and both below baked, which keeps
+  // test 3's "baked wins at re-up" + downgrade assertions true (a minor ABOVE baked would flip them).
   let bakedVersion: string;
   let bakedMinor: number;
+  let dlVersion: string; // the downloaded fixture's forged version string, e.g. "17.4" (bakedMinor − 1)
+  let dlMinor: number; // its minor, e.g. 4 — test 3's marker-forge sed targets this in build.json
   let seededDigest: string; // manifest digest of the REAL fixture image (tag 9999)
   let mainId: string; // test 1's project main branch; test 3 reuses it for the high-water run
 
@@ -117,12 +127,25 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     }
     bakedVersion = baked.version;
     bakedMinor = baked.minor;
+    // Two distinct non-baked minors, both below baked (see the derive-comment above). Needs baked
+    // minor ≥ 2 so the stub minor stays ≥ 0 — fail loudly rather than seed a nonsense version if a
+    // future pin lands baked absurdly low.
+    if (bakedMinor < 2) throw new Error(`baked v17 minor ${bakedMinor} too low for the fixture minor scheme`);
+    dlMinor = bakedMinor - 1;
+    dlVersion = `17.${dlMinor}`;
+    const stubMinor = bakedMinor - 2;
 
+    // The downloaded fixture carries a version shim so its `postgres --version` reports 17.<dlMinor>
+    // (≠ baked) — the pull reaches the gate/activate path instead of dedup-no-op'ing — while the
+    // shim still execs the real 17.5 server for the gate + endpoint.
     seededDigest = (await seedComputeImageFromDevdb({
       devdb: dev, externalBase: registry.externalBase, repository: REPO, tag: REAL_TAG,
+      reportVersion: dlVersion,
     })).manifestDigest;
+    // The stub reports a THIRD minor (17.<stubMinor>) — distinct from baked AND from the downloaded
+    // 17.<dlMinor> — so it dedups against neither and actually reaches the gate it must fail.
     await seedStubImage({
-      externalBase: registry.externalBase, repository: REPO, tag: STUB_TAG, version: bakedVersion,
+      externalBase: registry.externalBase, repository: REPO, tag: STUB_TAG, version: `17.${stubMinor}`,
     });
   });
 
@@ -145,7 +168,7 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     // biting on a real image — a REAL finding to report loudly, not a test bug to paper over.
     const row = await pollBuild(buildId, "ready");
     expect(row.active).toBe(true);
-    expect(row.version).toBe(bakedVersion); // the fixture layer IS the baked build — versions must agree
+    expect(row.version).toBe(dlVersion); // the shim forged a non-baked minor; the daemon detected it
     expect(row.imageDigest.startsWith("sha256:")).toBe(true);
     expect(row.imageDigest).toBe(seededDigest); // daemon's resolveDigest computed OUR content-address
     expect(row.source).toBe("downloaded");
@@ -153,7 +176,7 @@ describe("dynamic pg builds (hermetic e2e)", () => {
 
     const m = await major17();
     expect(m.source).toBe("downloaded"); // auto-activate flipped the major to the pulled build
-    expect(m.activeVersion).toBe(bakedVersion);
+    expect(m.activeVersion).toBe(dlVersion);
 
     // A PG-17 project's endpoint must now start FROM the downloaded build (pgbinFor resolves the
     // active row fresh per start) and serve real SQL against live storage.
@@ -162,9 +185,10 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     mainId = created.mainBranch.id;
     const branch = await api<{ connectionString: string | null; runningPgVersion: string | null }>(
       dev, "POST", `/api/branches/${mainId}/endpoint/start`);
-    expect(branch.runningPgVersion).toBe(bakedVersion);
-    // Baked and downloaded share the version STRING — inUse on the downloaded ROW is what proves
-    // the compute actually runs from the downloaded build's pgbin, not the baked one.
+    expect(branch.runningPgVersion).toBe(dlVersion); // resolved from the downloaded ROW (17.<dlMinor>), not baked 17.5
+    // The forged minor already distinguishes the downloaded build from baked; inUse on the
+    // downloaded ROW additionally proves the compute actually runs from ITS pgbin (the shim-wrapped
+    // tree), not the baked one.
     expect((await listBuilds()).find((r) => r.id === buildId)?.inUse).toBe(true);
     if (!branch.connectionString) throw new Error("endpoint started without a connectionString");
 
@@ -193,7 +217,7 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     expect(active?.status).toBe("ready");
     const m = await major17();
     expect(m.source).toBe("downloaded");
-    expect(m.activeVersion).toBe(bakedVersion);
+    expect(m.activeVersion).toBe(dlVersion); // still test 1's downloaded 17.<dlMinor> — the stub's gate failure left it untouched
 
     // A FAILED attempt must not latch the pull mutex — 409 is for in-flight pulls only. (The row
     // flips "failed" a beat before the pipeline's finally releases the mutex; the pause keeps
@@ -217,9 +241,11 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     await waitHealthy();
     const dl = (await listBuilds()).find((r) => r.imageDigest === seededDigest);
     expect(dl?.status).toBe("ready");
-    // Baked and downloaded are BOTH 17.5 here, and the boot tie deliberately goes to baked
-    // (resolveActives) — so "source stays downloaded" is NOT the post-restart contract. The
-    // survivable facts are: the downloaded row still exists ready, and the major serves 17.5.
+    // Downloaded is 17.<dlMinor>, baked is 17.5 — so at boot resolveActives elects baked as the
+    // NEWEST minor, NOT the downloaded pointer test 1 left active: "source stays downloaded" is not
+    // the post-restart contract. The survivable facts are: the downloaded row still exists ready (a
+    // rollback target), and the major serves baked 17.5 — above the 17.<dlMinor> high-water, so not
+    // degraded.
     let m = await major17();
     expect(m.activeVersion).toBe(bakedVersion);
     expect(m.degradedDowngrade).toBe(false);
@@ -227,21 +253,22 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     // --- FIX-6: adoptVolumeBuilds now validates a marker against its on-disk location (dir basename
     // == shortDigest(digest), major == vN) and adopts the DETECTED binary version. Forging a high
     // minor by mv-ing the dir to a non-content-address name and sed-ing build.json to minor:99 is
-    // exactly what it must REJECT: the dir `fake99-${short}` != shortDigest, and the binary detects
-    // 17.5 regardless. The mv un-claims the original dir, so its persisted row is failed by the
-    // missing-binary sweep — major 17 falls back to baked 17.5 and the forged 17.99 never surfaces.
+    // exactly what it must REJECT: the dir `fake99-${short}` != shortDigest, and the shim's binary
+    // still detects 17.<dlMinor> regardless. The mv un-claims the original dir, so its persisted row
+    // is failed by the missing-binary sweep — major 17 falls back to baked 17.5 and the forged
+    // 17.99 never surfaces. (The sed targets dlMinor — the minor the pull wrote into build.json.)
     const short = seededDigest.replace(/^sha256:/, "").slice(0, 16);
     const dir = `/data/pg_builds/v17/${short}`;
     const dir99 = `/data/pg_builds/v17/fake99-${short}`;
     await execa("docker", ["exec", dev.container.getId(), "sh", "-c",
-      `mv ${dir} ${dir99} && sed -i 's/"minor":${bakedMinor}/"minor":99/' ${dir99}/build.json`]);
+      `mv ${dir} ${dir99} && sed -i 's/"minor":${dlMinor}/"minor":99/' ${dir99}/build.json`]);
     await dev.restart({ timeout: 60_000 });
     await waitHealthy();
     expect((await listBuilds()).some((r) => r.status === "ready" && r.version === "17.99")).toBe(false); // forged 17.99 rejected
     m = await major17();
     expect(m.activeVersion).toBe(bakedVersion); // fell back to baked 17.5
     expect(m.source).toBe("baked");
-    expect(m.degradedDowngrade).toBe(false); // 17.5 is not below the recorded high-water (17.5 from test 1)
+    expect(m.degradedDowngrade).toBe(false); // baked 17.5 is ABOVE the 17.<dlMinor> high-water from test 1 — not a downgrade
 
     // --- Downgrade guard via a LEGIT high-water injection (the forged-build path can no longer set
     // one). Write pg_majors.last_run_minor=99 straight into the daemon's SQLite via the better-sqlite3
