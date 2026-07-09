@@ -239,6 +239,10 @@ export function PgBuildsCard() {
           const majorStatus = status.pgBuilds[String(major)]; // undefined for a major present only via an in-flight build row
           const majorBuilds = (builds ?? []).filter((b) => b.major === major);
           const checked = checkResult[String(major)];
+          // A fresh explicit check is authoritative: isNew:false clears the badge immediately,
+          // overriding a stale server updateAvailable (which a delayed/failed status refetch may still
+          // carry). Only fall back to the server value when NO local check has run for this major.
+          const updateAvailable = checked ? (checked.isNew ? checked.tag : null) : (majorStatus?.updateAvailable ?? null);
           return (
             <MajorSection
               key={major}
@@ -246,7 +250,7 @@ export function PgBuildsCard() {
               activeVersion={majorStatus?.activeVersion ?? null}
               source={majorStatus?.source ?? null}
               degradedDowngrade={majorStatus?.degradedDowngrade ?? false}
-              updateAvailable={checked?.isNew ? checked.tag : (majorStatus?.updateAvailable ?? null)}
+              updateAvailable={updateAvailable}
               builds={majorBuilds}
             />
           );

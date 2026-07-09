@@ -130,29 +130,40 @@ export class Provisioner {
     return this.deps.cfg.pgImageTemplate.replace("{major}", String(major));
   }
 
+  // Classifies a resolved `latest` digest against what's installed, honestly (see CheckState). Pure &
+  // local (no network): check() calls it after resolveDigest, and the pull pipeline calls it to refresh
+  // the cache once a pull has changed the installed state (see runPipeline's tail).
+  //
+  // Considers ALL rows at the digest, not byDigest's single ready-preferred/newest pick:
+  //  - current: any ready row at this digest, or any row here records a minor that IS installed ready.
+  //    `latest` never digest-matches a BAKED build (it carries the '' sentinel), so that minor arm is
+  //    what stops a baked-current major reading as new — a prior no-op recorded this digest→minor.
+  //  - incompatible: an incompatibility is PERMANENT for this runtime, so ONE incompatible-failed row
+  //    here is definitive even if a newer TRANSIENT-failed row (gate timeout / 404 / disk / a failure
+  //    after resolveDigest but before detectVersion) also exists at the digest — re-pulling re-fails.
+  //  - unverified: otherwise (digest unknown, or only transient failures) — might be a newer minor we
+  //    can't confirm without a pull; kept offerable so a genuine newer minor stays reachable.
+  private classifyDigest(major: number, digest: string): CheckState {
+    const majorRows = this.deps.state.pgBuilds.listByMajor(major);
+    const atDigest = majorRows.filter((r) => r.imageDigest === digest);
+    const minorInstalledReady = (m: number | null): boolean =>
+      m !== null && majorRows.some((b) => b.status === "ready" && b.minor === m);
+    if (atDigest.some((r) => r.status === "ready" || minorInstalledReady(r.minor))) return "current";
+    if (atDigest.some((r) => r.status === "failed" && isIncompatibilityError(r.error))) return "incompatible";
+    return "unverified";
+  }
+
+  private toCheckResult(digest: string, state: CheckState): CheckResult {
+    return { tag: "latest", digest, state, isNew: state === "unverified", at: new Date().toISOString() };
+  }
+
   // Resolves each major's `latest` digest against the registry and classifies it honestly (see
   // CheckState) — the UI's update check.
   async check(majors: number[]): Promise<Record<string, CheckResult>> {
     const out: Record<string, CheckResult> = {};
     for (const major of majors) {
       const { digest } = await this.deps.oci.resolveDigest(this.repoFor(major), "latest");
-      // byDigest is ready-preferred: it surfaces a prior row at this digest — a ready install, OR the
-      // same-minor no-op recordSkip persists (status "skipped"/legacy "failed", but with its minor
-      // set), OR a pull that failed here. `latest` never digest-matches a BAKED build (it carries the
-      // '' sentinel), so the minor arm is what stops a baked-current major reading as new: a prior
-      // no-op recorded this digest→minor, and that minor is installed ready.
-      const seen = this.deps.state.pgBuilds.byDigest(digest);
-      const seenMinor = seen?.minor ?? null;
-      const minorInstalled = seenMinor !== null &&
-        this.deps.state.pgBuilds.listByMajor(major).some((b) => b.status === "ready" && b.minor === seenMinor);
-      const current = seen?.status === "ready" || minorInstalled;
-      // A `latest` whose only trace here is a load/base-incompatibility failure is NOT an update: the
-      // incompatibility is permanent for this runtime, so re-pulling it re-fails identically. (A
-      // TRANSIENT failure — gate timeout, disk, a 404, an activate malfunction — is left "unverified"
-      // so a genuine newer minor it might yet install stays reachable via Pull.)
-      const incompatible = !current && seen?.status === "failed" && isIncompatibilityError(seen.error);
-      const state: CheckState = current ? "current" : incompatible ? "incompatible" : "unverified";
-      const result: CheckResult = { tag: "latest", digest, state, isNew: state === "unverified", at: new Date().toISOString() };
+      const result = this.toCheckResult(digest, this.classifyDigest(major, digest));
       this.lastCheck.set(major, result);
       out[String(major)] = result;
     }
@@ -261,6 +272,8 @@ export class Provisioner {
     // ~200 MB dir behind — finalDirRef stays undefined so the post-rename compensation skips it,
     // and sweepTmp only reclaims it at the NEXT boot. The outer catch rm's it when set.
     let stagingDir: string | undefined;
+    // Set the instant resolveDigest succeeds; drives the lastCheck refresh in the finally below.
+    let resolvedDigest: string | undefined;
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
       // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
@@ -279,6 +292,7 @@ export class Provisioner {
       // the same digest already ready — whatever tag it arrived under — is a no-op. The no-op row
       // keeps the '' digest sentinel so it can never shadow the real install in byDigest().
       const { digest } = await deps.oci.resolveDigest(repo, tag);
+      resolvedDigest = digest;
       const existing = state.pgBuilds.byDigest(digest);
       if (existing && existing.status === "ready") {
         const versionStr = existing.minor !== null ? `${existing.major}.${existing.minor}` : `${existing.major}.x`;
@@ -395,6 +409,16 @@ export class Provisioner {
           }
           this.publish();
         }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure compensation failed`, e));
+      }
+    } finally {
+      // Review finding (P3): if a prior check() cached this exact `latest` digest as "unverified", this
+      // pull has now settled it — verified ready/skipped (current) or proven incompatible — so re-derive
+      // and refresh the cache. Otherwise /api/status + MCP would keep prompting a Pull already done.
+      // Runs on every exit once the digest is known (including the early-returning no-op paths); a
+      // transient failure re-derives to "unverified" (unchanged), and a specific-tag pull of a DIFFERENT
+      // digest leaves latest's cached verdict alone (digest guard). Local/no-network, never throws.
+      if (resolvedDigest !== undefined && this.lastCheck.get(major)?.digest === resolvedDigest) {
+        this.lastCheck.set(major, this.toCheckResult(resolvedDigest, this.classifyDigest(major, resolvedDigest)));
       }
     }
   }

@@ -273,6 +273,32 @@ describe("PgBuildsCard", () => {
     expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument();
   });
 
+  // Review finding (P4): a fresh explicit check is authoritative — an isNew:false result must clear
+  // the badge immediately, even if the (not-yet-refetched) server status still carries a stale
+  // updateAvailable. Otherwise the exact false-positive the honesty change targets survives a check.
+  it("a fresh isNew:false check clears a stale server updateAvailable badge without waiting for a status refetch", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      ...baseStatus,
+      pgBuilds: {
+        ...baseStatus.pgBuilds,
+        "16": { ...baseStatus.pgBuilds["16"]!, updateAvailable: "16.11" }, // stale server memory
+      },
+    });
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:x", isNew: false }, // fresh check: now current, nothing to fetch
+      "17": { tag: "17.5", digest: "sha256:y", isNew: false },
+    });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument(); // from the stale server value
+
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+
+    // The fresh check said current — the badge + Pull must be gone, overriding the stale server value.
+    await waitFor(() => expect(screen.queryByText(/unverified latest/i)).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
+  });
+
   // Gap 2: a benign same-minor/dup no-op is a `skipped` row, not a `failed` one — it must read as a
   // muted "up to date" line, NOT alarm as a failure and NOT offer a Retry (that just re-no-ops) or an
   // Activate (there is no distinct build to activate).

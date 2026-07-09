@@ -835,6 +835,59 @@ describe("Provisioner", () => {
     expect(ready[0]).toMatchObject({ id: "baked-v17", active: true });
   });
 
+  // Review finding (P3): an incompatibility is PERMANENT for this runtime, so ONE incompatible-failed
+  // row at a digest is definitive — even if a later retry of the SAME digest fails transiently (after
+  // resolveDigest, before detectVersion) and lands a newer row. byDigest returns only the newest
+  // non-ready row, so classifying off it alone would miss the older incompatibility and falsely prompt
+  // a Pull. check() must classify over ALL rows at the digest.
+  it("check(): an older incompatible failed row wins over a newer transient one at the same digest — incompatible, not unverified", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({ id: "incompat-old", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("incompat-old", "failed",
+      "/x/bin/postgres is incompatible with this runtime image (missing shared library libssl.so.1.1) — the build targets a different OS base than this container");
+    state.pgBuilds.insert({ id: "transient-new", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("transient-new", "failed", "pullPrefix failed: network reset"); // newer row, byDigest returns THIS
+
+    const result = await provisioner.check([16]);
+
+    expect(result["16"]).toMatchObject({ state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(16)).toBeNull();
+  });
+
+  // Review finding (P3): after check() caches an "unverified latest", a pull that resolves that SAME
+  // digest verifies it (ready/skipped) or proves it incompatible — either way it's no longer an
+  // unverified update. The cache (which updateAvailableFor/status/MCP read) must refresh, or the UI
+  // keeps prompting a Pull that's already been done.
+  it("a pull that resolves the cached unverified-latest digest clears the update signal", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked 17.5
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives();
+
+    // A check finds DIGEST_A unverified (baked carries the '' sentinel, so latest never digest-matches).
+    await provisioner.check([17]);
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+
+    // Pulling latest resolves the SAME DIGEST_A and no-ops (same minor) → skipped/current.
+    const { buildId } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("skipped"));
+
+    // The stale "unverified latest" cache must clear — the pull just verified that digest.
+    await vi.waitFor(() => expect(provisioner.updateAvailableFor(17)).toBeNull());
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
+  });
+
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
   // (activate/remove) were not serialized — only pulls were, via the private `pulling` flag.
   // remove(id) calls assertRemovable synchronously then `await rm(row.path)`; during that await,
