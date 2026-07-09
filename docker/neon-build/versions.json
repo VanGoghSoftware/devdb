@@ -75,5 +75,41 @@
     "15": 13,
     "16": 9,
     "17": 5
+  },
+
+  "publishedDigests": {
+    "_notes": "Multi-arch (amd64+arm64) manifest-list digests published to GHCR by .github/workflows/build-neon-engine.yml (Phase-2 Task 5 -> recorded here in Task 6). The registry is PRIVATE (namespace ghcr.io/vangoghsoftware; GHCR packages born under a private repo are private, no visibility action taken). Each `manifestDigest` is the digest of the multi-arch MANIFEST LIST that `docker buildx imagetools create` stitched from the per-arch pushes, so `<repo>@<manifestDigest>` pulls the host's arch automatically. docker/Dockerfile's engine FROM pins images.engine.manifestDigest exactly; the runtime dynamic-minor pull (packages/daemon/src/compute/builds/oci.ts) resolves the compute images by tag once the GHCR opt-in env vars are set (DEVDB_PG_REGISTRY_BASE / DEVDB_PG_IMAGE_TEMPLATE / DEVDB_PG_REGISTRY_TOKEN). See docker/BINARIES.md -> Private-registry access. For-reference per-arch ENGINE digests (NOT pinned by anything; the manifest list above is): arm64 sha256:de942728d46b3aa5776cf82bc1c479c5d8112da2a2eb55e6e4e0818e823dc081, amd64 sha256:eb8fd2305768c8df8fa730fe0191d544316f434f4261f241f62e87607ca3d53e.",
+    "workflowRun": "29035944537",
+    "sourceCommit": "92886fc5af4fb739899ed3656edd0d4802f33600",
+    "publishedAt": "2026-07-09",
+    "registry": "ghcr.io",
+    "namespace": "vangoghsoftware",
+    "images": {
+      "engine": {
+        "repo": "ghcr.io/vangoghsoftware/worktreedb-neon-engine",
+        "tags": ["release-9129"],
+        "manifestDigest": "sha256:7c042751bb0fbe5c1593dd95c49418fc57abbead2b91565e5696fe6b8c8629f4"
+      },
+      "compute-v14": {
+        "repo": "ghcr.io/vangoghsoftware/worktreedb-compute-v14",
+        "tags": ["14.18", "latest"],
+        "manifestDigest": "sha256:6d29d3f44e840e863406895b9ed6f2389d22f574c6ead4e0fd7ea94712c60fa3"
+      },
+      "compute-v15": {
+        "repo": "ghcr.io/vangoghsoftware/worktreedb-compute-v15",
+        "tags": ["15.13", "latest"],
+        "manifestDigest": "sha256:edd1f32867443fdae126da760573f4e122555202201f63724105307de2d6deff"
+      },
+      "compute-v16": {
+        "repo": "ghcr.io/vangoghsoftware/worktreedb-compute-v16",
+        "tags": ["16.9", "latest"],
+        "manifestDigest": "sha256:a38e706ae8ecb358ac1bc760f51142ae63bf3539f9fa2d27e4c9e5364b94c7a1"
+      },
+      "compute-v17": {
+        "repo": "ghcr.io/vangoghsoftware/worktreedb-compute-v17",
+        "tags": ["17.5", "latest"],
+        "manifestDigest": "sha256:b7dffec7638a8a8c944868dd492b0799e3cd2b37ef378bb94cd4430da6ec5709"
+      }
+    }
   }
 }

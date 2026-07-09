@@ -1,5 +1,7 @@
 services:
   devdb:
+    # First `--build` only: docker/Dockerfile FROMs a PRIVATE GHCR engine image, so
+    # run a one-time `docker login ghcr.io` (read:packages PAT) first. See docker/BINARIES.md.
     build: { context: .., dockerfile: docker/Dockerfile }
     image: devdb:dev
     init: true

@@ -126,11 +126,38 @@ async function seedImage(a: {
 // leave this machine.
 export async function seedComputeImageFromDevdb(a: {
   devdb: Devdb; externalBase: string; repository: string; tag: string;
+  // When set (e.g. "17.4"), the layer's `bin/postgres` is replaced by a tiny shim that answers
+  // `--version` with THIS string while `exec`ing the REAL server (renamed to `bin/postgres.real`)
+  // for every other invocation. The daemon's version detection then reads a NON-baked minor — so
+  // the same-minor pull dedup (provisioner.extractFixupAndGate) doesn't no-op the pull before it
+  // reaches the gate — while the validation gate and a project's endpoint still run the genuine
+  // 17.x binary and serve real SQL. This is the integration analog of the unit suite's
+  // `pathAwareDetectVersion`. Omit to publish the baked tree verbatim (same minor as baked).
+  reportVersion?: string;
 }): Promise<{ manifestDigest: string }> {
   const id = a.devdb.container.getId();
-  await execa("docker", ["exec", id, "tar", "-czf", "/tmp/fixture-layer.tgz",
-    "--transform", "s|^v17|usr/local|",
-    "-C", "/usr/local/share/neon/pg_install", "v17"]);
+  const stage = "/tmp/pgb-fixture-stage";
+  if (a.reportVersion === undefined) {
+    await execa("docker", ["exec", id, "tar", "-czf", "/tmp/fixture-layer.tgz",
+      "--transform", "s|^v17|usr/local|",
+      "-C", "/usr/local/share/neon/pg_install", "v17"]);
+  } else {
+    // Stage a COPY of the baked v17 (patching it in place would corrupt the daemon's OWN baked
+    // build), move the real binary aside as `postgres.real`, and drop in the version shim. The
+    // shim is base64-piped into place to sidestep heredoc/quoting hazards — $0/$1/$@ must reach
+    // the file LITERALLY (they run in the container, not here), and the shebang must sit at column
+    // zero. The real 17.x binary still backs `postgres.real`, so find_my_exec resolves share/lib
+    // relative to `${stage}/bin/postgres.real` exactly as it would unwrapped.
+    const shim = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "postgres (PostgreSQL) ${a.reportVersion}"; exit 0; fi\nexec "$(dirname "$0")/postgres.real" "$@"\n`;
+    const shimB64 = Buffer.from(shim).toString("base64");
+    await execa("docker", ["exec", id, "sh", "-c",
+      `set -e; rm -rf ${stage}; cp -a /usr/local/share/neon/pg_install/v17 ${stage}; ` +
+      `mv ${stage}/bin/postgres ${stage}/bin/postgres.real; ` +
+      `echo ${shimB64} | base64 -d > ${stage}/bin/postgres; chmod 0755 ${stage}/bin/postgres`]);
+    await execa("docker", ["exec", id, "tar", "-czf", "/tmp/fixture-layer.tgz",
+      "--transform", "s|^pgb-fixture-stage|usr/local|",
+      "-C", "/tmp", "pgb-fixture-stage"]);
+  }
   const hostDir = await mkdtemp(join(tmpdir(), "devdb-pgb-fixture-"));
   try {
     const hostTgz = join(hostDir, "layer.tgz");
@@ -141,8 +168,8 @@ export async function seedComputeImageFromDevdb(a: {
     });
   } finally {
     await rm(hostDir, { recursive: true, force: true });
-    // ~80 MB in the container's overlay — drop it (best-effort) once pushed.
-    await execa("docker", ["exec", id, "rm", "-f", "/tmp/fixture-layer.tgz"]).catch(() => {});
+    // ~80 MB layer + the staged copy in the container's overlay — drop both (best-effort) once pushed.
+    await execa("docker", ["exec", id, "rm", "-rf", "/tmp/fixture-layer.tgz", stage]).catch(() => {});
   }
 }
 
@@ -152,7 +179,9 @@ export async function seedComputeImageFromDevdb(a: {
 // and leave the active pointer untouched.
 export async function seedStubImage(a: {
   externalBase: string; repository: string; tag: string;
-  /** Version the fake `postgres --version` reports, e.g. "17.5" — pass the baked version. */
+  /** Version the fake `postgres --version` reports, e.g. "17.3" — pass a NON-baked minor (distinct
+   *  from baked AND from any already-pulled build) so the same-minor pull dedup doesn't no-op this
+   *  pull before it reaches the gate it must fail. */
   version: string;
 }): Promise<{ manifestDigest: string }> {
   const hostDir = await mkdtemp(join(tmpdir(), "devdb-pgb-stub-"));

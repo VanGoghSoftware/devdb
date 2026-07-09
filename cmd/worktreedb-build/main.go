@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -139,9 +140,23 @@ type manifest struct {
 		PostgresForkCommit string `json:"postgresForkCommit"`
 		SubmodulePath      string `json:"submodulePath"`
 	} `json:"majors"`
+	PublishedDigests struct {
+		Images map[string]struct {
+			Repo           string   `json:"repo"`
+			Tags           []string `json:"tags"`
+			ManifestDigest string   `json:"manifestDigest"`
+		} `json:"images"`
+	} `json:"publishedDigests"`
 }
 
 var wantMajors = []string{"14", "15", "16", "17"}
+
+// wantImages is the set of published-image keys check-manifest expects under
+// publishedDigests.images (sorted; "compute-*" < "engine" alphabetically).
+var wantImages = []string{"compute-v14", "compute-v15", "compute-v16", "compute-v17", "engine"}
+
+// manifestDigestRe matches a well-formed OCI manifest digest: sha256:<64 hex>.
+var manifestDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 func cmdCheckManifest(args []string) int {
 	fs := flag.NewFlagSet("check-manifest", flag.ContinueOnError)
@@ -208,6 +223,32 @@ func cmdCheckManifest(args []string) int {
 		}
 	}
 
+	// publishedDigests.images must be exactly {engine, compute-v14..17}, each with
+	// a non-empty repo, at least one tag, and a well-formed sha256:<64hex> digest.
+	gotImages := make([]string, 0, len(m.PublishedDigests.Images))
+	for k := range m.PublishedDigests.Images {
+		gotImages = append(gotImages, k)
+	}
+	sort.Strings(gotImages)
+	if !equalStringSlices(gotImages, wantImages) {
+		problems = append(problems, fmt.Sprintf("publishedDigests.images == %v, want %v", gotImages, wantImages))
+	}
+	for _, k := range wantImages {
+		img, ok := m.PublishedDigests.Images[k]
+		if !ok {
+			continue // already reported by the set mismatch above
+		}
+		if strings.TrimSpace(img.Repo) == "" {
+			problems = append(problems, fmt.Sprintf("publishedDigests.images[%s].repo is empty", k))
+		}
+		if len(img.Tags) == 0 {
+			problems = append(problems, fmt.Sprintf("publishedDigests.images[%s].tags is empty", k))
+		}
+		if !manifestDigestRe.MatchString(img.ManifestDigest) {
+			problems = append(problems, fmt.Sprintf("publishedDigests.images[%s].manifestDigest %q is not sha256:<64hex>", k, img.ManifestDigest))
+		}
+	}
+
 	if len(problems) > 0 {
 		fmt.Fprintf(os.Stderr, "check-manifest: %s FAILED:\n", p)
 		for _, pr := range problems {
@@ -216,8 +257,8 @@ func cmdCheckManifest(args []string) int {
 		return 1
 	}
 
-	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v)\n",
-		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors)
+	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v, published %d images)\n",
+		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors, len(m.PublishedDigests.Images))
 	return 0
 }
 

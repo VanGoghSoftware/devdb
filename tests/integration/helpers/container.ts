@@ -4,8 +4,7 @@ import { GenericContainer, Wait, type StartedNetwork, type StartedTestContainer 
 
 // Image under test. Defaults to devdb:dev (built from docker/Dockerfile by
 // buildImage() below). Override with DEVDB_TEST_IMAGE to run the suite against a
-// pre-built image supplied externally — e.g. the Phase-1 `devdb:selfbuilt`
-// variant built from docker/Dockerfile.selfbuilt (self-built Neon engine).
+// pre-built image supplied externally — e.g. a locally-built engine variant.
 const IMAGE = process.env.DEVDB_TEST_IMAGE ?? "devdb:dev";
 let built = false;
 
