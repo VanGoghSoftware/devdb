@@ -93,7 +93,9 @@ jobs:
           go-version-file: go.mod
 
       - name: check-manifest gate (before any build)
-        # Static drift guard between versions.json and the Dockerfile ARGs.
+        # Static drift guard: validates versions.json and cross-checks the product
+        # docker/Dockerfile's engine FROM digest against publishedDigests.images.engine.
+        # (The dedicated check-manifest.yml runs the same gate + go test on PRs / Dockerfile edits.)
         run: go run ./cmd/worktreedb-build check-manifest
 
       - name: Set up Docker Buildx

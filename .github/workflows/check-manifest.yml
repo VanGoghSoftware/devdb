@@ -1,0 +1,50 @@
+# Fast drift gate — runs `check-manifest` (validates docker/neon-build/versions.json AND
+# cross-checks the product docker/Dockerfile's engine FROM digest against
+# publishedDigests.images.engine) plus the cmd/worktreedb-build unit tests, WITHOUT the
+# expensive from-source engine build.
+#
+# This complements build-neon-engine.yml, whose `push.paths` intentionally exclude the
+# product docker/Dockerfile: adding it there would trigger a full engine rebuild+publish on
+# every product-Dockerfile edit. Yet a lone docker/Dockerfile digest repoint (a bad merge,
+# revert, or manual bump) is exactly the drift the cross-check exists to catch — so it needs
+# its own cheap gate. Runs on PRs (pre-merge) and main pushes (post-merge safety net), on any
+# change to the manifest, the product Dockerfile, or the checker itself.
+name: check-manifest
+
+on:
+  pull_request:
+    paths:
+      - docker/Dockerfile
+      - docker/neon-build/versions.json
+      - cmd/worktreedb-build/**
+      - go.mod
+      - .github/workflows/check-manifest.yml
+  push:
+    branches: [main]
+    paths:
+      - docker/Dockerfile
+      - docker/neon-build/versions.json
+      - cmd/worktreedb-build/**
+      - go.mod
+      - .github/workflows/check-manifest.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check-manifest:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: check-manifest (versions.json + docker/Dockerfile engine-digest drift gate)
+        run: go run ./cmd/worktreedb-build check-manifest
+
+      - name: Unit tests
+        run: go test ./cmd/worktreedb-build

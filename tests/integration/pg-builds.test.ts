@@ -261,7 +261,11 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     const dir = `/data/pg_builds/v17/${short}`;
     const dir99 = `/data/pg_builds/v17/fake99-${short}`;
     await execa("docker", ["exec", dev.container.getId(), "sh", "-c",
-      `mv ${dir} ${dir99} && sed -i 's/"minor":${dlMinor}/"minor":99/' ${dir99}/build.json`]);
+      // Guard the forge against a silent no-op: sed exits 0 on no-match, so if build.json's
+      // marker format ever drifts from the compact `"minor":N,` this rewrites, the forge would
+      // quietly do nothing while the test still "passed". The trailing comma keeps grep exact
+      // (minor is always followed by ,"extractedAt") so it asserts minor:99 actually landed.
+      `mv ${dir} ${dir99} && sed -i 's/"minor":${dlMinor}/"minor":99/' ${dir99}/build.json && grep -q '"minor":99,' ${dir99}/build.json`]);
     await dev.restart({ timeout: 60_000 });
     await waitHealthy();
     expect((await listBuilds()).some((r) => r.status === "ready" && r.version === "17.99")).toBe(false); // forged 17.99 rejected
