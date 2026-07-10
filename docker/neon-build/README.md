@@ -1,9 +1,9 @@
 # Neon engine build-from-source (Worktree DB — initiative A)
 
 Builds the Neon storage + compute engine that DevDB / Worktree DB runs on **from
-pinned upstream source**, on one Debian **bookworm** base — replacing the
-third-party `neond/neond` image as the engine-binary supplier and eliminating the
-mixed-base (bullseye/bookworm) shared-library ABI problem at the root.
+pinned upstream source**, on one Debian **bookworm** base. This from-source build
+**replaced** the third-party `neond/neond` image as the engine-binary supplier,
+eliminating the mixed-base (bullseye/bookworm) shared-library ABI problem at the root.
 
 ## What it produces
 
@@ -22,7 +22,9 @@ exact `/usr/local/share/neon` layout the outer DevDB image consumes:
 `versions.json` pins the entire source set (neon release + commit, the 4
 per-major postgres-fork submodule commits, the pgvector tarball + sha256, the
 vanilla upstream-postgres commit, Rust, the Debian base). Bumped by hand in
-lockstep — no upstream tooling. `worktreedb-build check-manifest` validates it.
+lockstep — no upstream tooling. `worktreedb-build check-manifest` validates it, and
+cross-checks that the product `docker/Dockerfile`'s engine base-image digest still
+matches the published engine digest recorded here (`publishedDigests.images.engine`).
 
 ## Build
 

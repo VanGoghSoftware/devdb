@@ -27,10 +27,11 @@ import (
 )
 
 const (
-	dockerfilePath = "docker/neon-build/Dockerfile"
-	manifestPath   = "docker/neon-build/versions.json"
-	imagePrefix    = "worktreedb-neon-engine:local-"
-	verifyScript   = "/usr/local/bin/verify-binaries.sh"
+	dockerfilePath        = "docker/neon-build/Dockerfile"
+	manifestPath          = "docker/neon-build/versions.json"
+	productDockerfilePath = "docker/Dockerfile"
+	imagePrefix           = "worktreedb-neon-engine:local-"
+	verifyScript          = "/usr/local/bin/verify-binaries.sh"
 )
 
 func main() {
@@ -158,6 +159,47 @@ var wantImages = []string{"compute-v14", "compute-v15", "compute-v16", "compute-
 // manifestDigestRe matches a well-formed OCI manifest digest: sha256:<64 hex>.
 var manifestDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
+// engineImageName is the GHCR image the product Dockerfile pins as its engine base;
+// every engine FROM line must be pinned to publishedDigests.images.engine.manifestDigest.
+const engineImageName = "worktreedb-neon-engine"
+
+// engineRefRe matches each product Dockerfile FROM line that names the engine base image
+// and captures its full image-reference token (registry path + `@digest` or `:tag`). It
+// tolerates the Dockerfile forms that still name the same image — optional leading
+// indentation, case-insensitive FROM, and FROM flags such as `--platform=...` — and the
+// trailing whitespace/EOL boundary keeps the image name exact (so `worktreedb-neon-engine-foo`
+// is NOT a match). Capturing the ref rather than only a well-formed digest means a stage that
+// is tag-pinned or carries a malformed digest is still surfaced (as an un-pinned ref) instead
+// of silently ignored. Limitation: FROM instructions split across physical lines with a
+// trailing `\` continuation are not parsed. As the sole engine reference such a form fails
+// loud ("no engine base line"); as a second stage behind an already-valid engine FROM it
+// would be missed. Accepted by design — the product Dockerfile is a controlled, single-line-
+// FROM file, so a drift gate over it does not warrant a continuation-preprocessing parser.
+var engineRefRe = regexp.MustCompile(`(?m)^[ \t]*(?i:FROM)[ \t]+(?:--\S+[ \t]+)*(\S*/` + engineImageName + `(?:[@:]\S*)?)(?:[ \t\r]|$)`)
+
+// checkEngineDigestPin verifies that EVERY engine base FROM line in the product Dockerfile
+// at dfPath is pinned to exactly wantDigest (i.e. ends with `@<wantDigest>`). It returns a
+// human-readable problem string, or "" when the Dockerfile has at least one engine FROM line
+// and all of them are pinned to wantDigest.
+func checkEngineDigestPin(dfPath, wantDigest string) string {
+	dfRaw, err := os.ReadFile(dfPath)
+	if err != nil {
+		return fmt.Sprintf("cannot read %s for engine-digest cross-check: %v", dfPath, err)
+	}
+	refs := engineRefRe.FindAllSubmatch(dfRaw, -1)
+	if len(refs) == 0 {
+		return fmt.Sprintf("%s: found no `FROM .../%s@sha256:<digest>` engine base line", dfPath, engineImageName)
+	}
+	wantSuffix := "@" + wantDigest
+	for _, m := range refs {
+		ref := string(m[1])
+		if !strings.HasSuffix(ref, wantSuffix) {
+			return fmt.Sprintf("%s engine base %q is not pinned to publishedDigests.images.engine.manifestDigest %s", dfPath, ref, wantDigest)
+		}
+	}
+	return ""
+}
+
 func cmdCheckManifest(args []string) int {
 	fs := flag.NewFlagSet("check-manifest", flag.ContinueOnError)
 	path := fs.String("path", "", "path to versions.json (default: <repo-root>/"+manifestPath+")")
@@ -165,15 +207,19 @@ func cmdCheckManifest(args []string) int {
 		return 2
 	}
 
+	// The repo root is always resolved: it defaults the manifest path (when --path is
+	// unset) and locates the product Dockerfile for the engine-digest cross-check below,
+	// so check-manifest must be run from within the repo tree.
+	root, err := repoRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-manifest: %v\n", err)
+		return 1
+	}
 	p := *path
 	if p == "" {
-		root, err := repoRoot()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "check-manifest: %v\n", err)
-			return 1
-		}
 		p = filepath.Join(root, manifestPath)
 	}
+	dfPath := filepath.Join(root, productDockerfilePath)
 
 	raw, err := os.ReadFile(p)
 	if err != nil {
@@ -249,6 +295,17 @@ func cmdCheckManifest(args []string) int {
 		}
 	}
 
+	// Cross-check: the product Dockerfile must pin its engine base image to exactly
+	// publishedDigests.images.engine.manifestDigest. The two digests are hand-synced and
+	// nothing else enforces lockstep, so a publish that bumps versions.json but forgets to
+	// repoint docker/Dockerfile (or vice-versa) would otherwise slip through. Skipped when
+	// the engine digest is missing/malformed — already reported by the checks above.
+	if eng, ok := m.PublishedDigests.Images["engine"]; ok && manifestDigestRe.MatchString(eng.ManifestDigest) {
+		if prob := checkEngineDigestPin(dfPath, eng.ManifestDigest); prob != "" {
+			problems = append(problems, prob)
+		}
+	}
+
 	if len(problems) > 0 {
 		fmt.Fprintf(os.Stderr, "check-manifest: %s FAILED:\n", p)
 		for _, pr := range problems {
@@ -257,8 +314,8 @@ func cmdCheckManifest(args []string) int {
 		return 1
 	}
 
-	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v, published %d images)\n",
-		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors, len(m.PublishedDigests.Images))
+	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v, published %d images; %s engine FROM digest matches)\n",
+		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors, len(m.PublishedDigests.Images), productDockerfilePath)
 	return 0
 }
 
