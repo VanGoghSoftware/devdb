@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openState } from "../src/state/db.js";
-import { reconcileEndpointsOnBoot, sweepComputesDir } from "../src/state/reconcile.js";
+import { reconcileEndpointsOnBoot, reconcilePgBuildsOnBoot, sweepComputesDir } from "../src/state/reconcile.js";
 
 function freshState() {
   return openState(":memory:");
@@ -162,5 +162,50 @@ describe("sweepComputesDir", () => {
 
     await expect(sweepComputesDir(computesDir)).resolves.toBe(0);
     expect(existsSync(computesDir)).toBe(true); // the dir itself is left in place, only cleared
+  });
+});
+
+// A benign no-op pull (same-minor / identical-digest dedup) is recorded as `skipped` now, but rows
+// created before that status existed are stuck as `failed … — no-op` — they read as alarming
+// failures and offer a Retry that just re-no-ops. This one-shot boot reconcile reclassifies the
+// same-minor ones (real digest→minor link check() reads back) to `skipped` and DELETES the
+// value-less '' -digest identical-digest noise; genuine failures and ready builds are untouched.
+describe("reconcilePgBuildsOnBoot", () => {
+  it("reclassifies same-minor no-ops to skipped, deletes '' -digest no-op noise, leaves real failures/readies alone", () => {
+    const s = freshState();
+    // Legacy same-minor no-op — REAL digest + minor (the load-bearing digest→minor link) → skipped.
+    s.pgBuilds.insert({ id: "legacy-noop", major: 17, minor: 5, source: "downloaded", releaseTag: "latest",
+      imageDigest: "sha256:" + "a".repeat(64), path: "", status: "failed" });
+    s.pgBuilds.setStatus("legacy-noop", "failed", "already installed as 17.5 (baked) — no-op");
+    // Legacy identical-digest no-op (older path: '' digest, null minor, no link) → deleted as noise.
+    s.pgBuilds.insert({ id: "legacy-dedup", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "failed" });
+    s.pgBuilds.setStatus("legacy-dedup", "failed", "already installed as 16.9 — no-op");
+    // A GENUINE failure with a REAL digest must stay failed.
+    s.pgBuilds.insert({ id: "real-fail", major: 15, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: "sha256:" + "b".repeat(64), path: "", status: "failed" });
+    s.pgBuilds.setStatus("real-fail", "failed", "gate timed out after 90s");
+    // A GENUINE early failure with a '' digest (e.g. a registry 404 before any digest was resolved)
+    // must NOT be deleted — the delete is scoped to the no-op message, not merely to '' digest.
+    s.pgBuilds.insert({ id: "early-fail", major: 15, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: "", path: "", status: "failed" });
+    s.pgBuilds.setStatus("early-fail", "failed", "GET .../manifests/latest failed: 404 not found");
+    // A ready build must be untouched.
+    s.pgBuilds.insert({ id: "ready", major: 14, minor: 12, source: "baked", releaseTag: "baked",
+      imageDigest: "", path: "/data/pg/v14", status: "ready" });
+
+    const changed = reconcilePgBuildsOnBoot(s);
+
+    expect(changed).toBe(2); // 1 reclassified + 1 deleted
+    expect(s.pgBuilds.byId("legacy-noop")?.status).toBe("skipped");
+    expect(s.pgBuilds.byId("legacy-dedup")).toBeNull();          // '' -digest no-op noise deleted
+    expect(s.pgBuilds.byId("real-fail")?.status).toBe("failed"); // genuine failure kept
+    expect(s.pgBuilds.byId("early-fail")?.status).toBe("failed"); // '' -digest but NOT a no-op → kept
+    expect(s.pgBuilds.byId("ready")?.status).toBe("ready");
+    // The reclassified row keeps its diagnostic message + recorded minor (check() reads it back).
+    expect(s.pgBuilds.byId("legacy-noop")?.error).toMatch(/already installed as 17\.5/);
+    expect(s.pgBuilds.byId("legacy-noop")?.minor).toBe(5);
+
+    expect(reconcilePgBuildsOnBoot(s)).toBe(0); // idempotent
   });
 });

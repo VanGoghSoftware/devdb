@@ -1,5 +1,9 @@
 import { execFile } from "node:child_process";
 
+// The load-bearing phrase in a classifyPgVersionError() incompatibility message. Referenced by BOTH
+// the generator (below) and isIncompatibilityError() so the write and the read-back can't drift.
+const INCOMPATIBLE_RUNTIME_MARKER = "is incompatible with this runtime image";
+
 // A failed `postgres --version` whose stderr shows the dynamic linker could not resolve the
 // binary's shared libraries means the build was linked against a DIFFERENT OS base than this
 // runtime image (e.g. a Debian-bullseye Neon compute build — OpenSSL 1.1 / ICU 67 — on a
@@ -19,11 +23,23 @@ export function classifyPgVersionError(pgbinPath: string, rawMessage: string): s
     /\b(?:GLIBC|GLIBCXX|CXXABI|OPENSSL|LIBSSL|LIBCRYPTO)_[0-9.]+'?\s+not found/i.test(rawMessage);
   if (loaderFailure) {
     const lib = /([\w.+-]+\.so(?:\.\d+)*): cannot open shared object/i.exec(rawMessage)?.[1];
-    return `${pgbinPath} is incompatible with this runtime image` +
+    return `${pgbinPath} ${INCOMPATIBLE_RUNTIME_MARKER}` +
       (lib !== undefined ? ` (missing shared library ${lib})` : "") +
       " — the build targets a different OS base than this container";
   }
   return `${pgbinPath} --version failed: ${rawMessage}`;
+}
+
+// Read-back predicate over a failed pg_build row's STORED `error` column: was the failure an
+// image/runtime-base incompatibility (a build linked against a different OS base — libssl.so.1.1 on
+// bookworm, a GLIBC/OPENSSL symbol mismatch, …), as opposed to a transient one (gate timeout, disk,
+// a registry 404, an activate malfunction)? The stored string is classifyPgVersionError()'s own
+// output for that class, so we match its marker phrase — an incompatibility is permanent for THIS
+// runtime, so check() must never surface such a `latest` as an available update (re-pulling it
+// re-fails identically). Transient failures are NOT matched: they might yet install a genuine newer
+// minor, so check() keeps offering them (as "unverified", not "confirmed").
+export function isIncompatibilityError(storedError: string | null | undefined): boolean {
+  return storedError != null && storedError.includes(INCOMPATIBLE_RUNTIME_MARKER);
 }
 
 // Parses `postgres (PostgreSQL) 16.9` and Debian-suffixed variants. Spawn (not shell) — the

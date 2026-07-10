@@ -15,7 +15,7 @@ const isDowngradeConflict = (e: unknown): e is ApiError =>
 
 // One row of the installed-builds list under a major. Downloaded/baked "ready" rows get inline
 // Activate/Delete; in-flight rows show a spinner; failed rows show the error + a retry.
-function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
+function BuildRow(a: { row: PgBuildDto; activeMinor: number | null; onPulled: (major: number) => void }) {
   const activate = useActivatePgBuild();
   const del = useDeletePgBuild();
   const pull = usePullPgBuild();
@@ -27,6 +27,17 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
         <Loader size="xs" />
         <Text size="sm">{row.version ?? `${row.major}.x`} · {row.source} · {row.status}</Text>
       </Group>
+    );
+  }
+
+  // A benign no-op pull (its version was already installed): a muted, informational line — NOT a
+  // failure, so no alarming styling, no Retry (a retry just re-no-ops) and no Activate (there's no
+  // distinct build to activate). The daemon keeps at most one skipped row per (major, digest).
+  if (row.status === "skipped") {
+    return (
+      <Text size="sm" c="dimmed">
+        {row.error ?? `${row.version ?? `${row.major}.x`} — already installed (up to date)`}
+      </Text>
     );
   }
 
@@ -42,7 +53,9 @@ function BuildRow(a: { row: PgBuildDto; activeMinor: number | null }) {
             <Button
               size="compact-xs"
               loading={pull.isPending}
-              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag })}
+              // Only clear the major's latest-check when this retry actually pulls `latest`; a retry
+              // of a pinned non-latest tag doesn't verify the latest digest, so it must leave the badge.
+              onClick={() => pull.mutate({ major: row.major, tag: row.releaseTag }, { onSuccess: () => { if (row.releaseTag === "latest") a.onPulled(row.major); } })}
             >
               Retry pull
             </Button>
@@ -140,6 +153,7 @@ function MajorSection(a: {
   degradedDowngrade: boolean;
   updateAvailable: string | null;
   builds: PgBuildDto[];
+  onPulled: (major: number) => void;
 }) {
   const pull = usePullPgBuild();
   const activeRow = a.builds.find((b) => b.active);
@@ -155,13 +169,23 @@ function MajorSection(a: {
               {a.activeVersion} · {a.source}
             </Badge>
           )}
+          {/* Honest by construction: updateAvailable is non-null ONLY for an "unverified" latest —
+              a digest we haven't confirmed is a newer minor (the daemon nulls it for current and for
+              a re-failing incompatible latest). So the badge says "unverified latest", never the
+              over-confident "update available", and Pull — the way to VERIFY — is offered only here. */}
           {a.updateAvailable && (
             <>
-              <Badge color="blue" variant="light">update available</Badge>
+              <Tooltip
+                multiline
+                w={260}
+                label="The registry's latest hasn't been verified against your installed build. Pull to check whether it's actually a newer minor."
+              >
+                <Badge color="yellow" variant="light" style={{ cursor: "help" }}>unverified latest</Badge>
+              </Tooltip>
               <Button
                 size="compact-xs"
                 loading={pull.isPending}
-                onClick={() => pull.mutate({ major: a.major })}
+                onClick={() => pull.mutate({ major: a.major }, { onSuccess: () => a.onPulled(a.major) })}
               >
                 Pull
               </Button>
@@ -175,7 +199,7 @@ function MajorSection(a: {
         </Alert>
       )}
       <Stack gap={4}>
-        {a.builds.map((row) => <BuildRow key={row.id} row={row} activeMinor={activeMinor} />)}
+        {a.builds.map((row) => <BuildRow key={row.id} row={row} activeMinor={activeMinor} onPulled={a.onPulled} />)}
       </Stack>
     </Stack>
   );
@@ -185,12 +209,20 @@ export function PgBuildsCard() {
   const { data: status } = useStatus();
   const { data: builds } = usePgBuilds();
   const check = useCheckPgUpdates();
-  // "isNew" per major from the last Check-for-updates resolution — component-local, cleared by
-  // nothing (a fresh check overwrites it); status.pgBuilds' own updateAvailable field is a
-  // per-major server memory of the SAME thing but only refreshed on an actual check, so we track
-  // the just-resolved result locally to render the badge synchronously in the same test tick a
-  // status refetch might not have landed yet.
+  // "isNew" per major from the last Check-for-updates resolution — component-local (rendered
+  // synchronously, in the same tick a status refetch may not have landed). A fresh check overwrites
+  // it; and since it takes precedence over the server value, a pull for a major must CLEAR that
+  // major's entry (clearChecked below) — otherwise the check→pull→verify flow leaves a stale
+  // "unverified latest" badge over an "up to date" row for the rest of the session.
   const [checkResult, setCheckResult] = useState<Record<string, { tag: string; isNew: boolean }>>({});
+  // Drop a major's local check result once it's been pulled: the pull settles the digest server-side
+  // (Provisioner refreshes lastCheck; the pg_builds event refetches status), so the now-honest server
+  // updateAvailable should govern again instead of the pre-pull snapshot.
+  const clearChecked = (major: number): void =>
+    setCheckResult((prev) => {
+      const { [String(major)]: _cleared, ...rest } = prev;
+      return rest;
+    });
 
   if (!status) return null;
   // #8: union the ready majors (status.pgBuilds) with every major that has ANY build row
@@ -218,6 +250,10 @@ export function PgBuildsCard() {
           const majorStatus = status.pgBuilds[String(major)]; // undefined for a major present only via an in-flight build row
           const majorBuilds = (builds ?? []).filter((b) => b.major === major);
           const checked = checkResult[String(major)];
+          // A fresh explicit check is authoritative: isNew:false clears the badge immediately,
+          // overriding a stale server updateAvailable (which a delayed/failed status refetch may still
+          // carry). Only fall back to the server value when NO local check has run for this major.
+          const updateAvailable = checked ? (checked.isNew ? checked.tag : null) : (majorStatus?.updateAvailable ?? null);
           return (
             <MajorSection
               key={major}
@@ -225,8 +261,9 @@ export function PgBuildsCard() {
               activeVersion={majorStatus?.activeVersion ?? null}
               source={majorStatus?.source ?? null}
               degradedDowngrade={majorStatus?.degradedDowngrade ?? false}
-              updateAvailable={checked?.isNew ? checked.tag : (majorStatus?.updateAvailable ?? null)}
+              updateAvailable={updateAvailable}
               builds={majorBuilds}
+              onPulled={clearChecked}
             />
           );
         })}

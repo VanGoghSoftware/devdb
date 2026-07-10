@@ -109,7 +109,7 @@ describe("PgBuildsCard", () => {
     expect(screen.getAllByText(/running below the last-used minor/i)).toHaveLength(1);
   });
 
-  it("Check for updates shows an update-available badge and Pull button after resolving, and Pull posts the right body", async () => {
+  it("Check for updates shows an HONEST 'unverified latest' badge + Pull after resolving, and Pull posts the right body", async () => {
     vi.mocked(api.pgBuilds.check).mockResolvedValue({
       "16": { tag: "16.11", digest: "sha256:new", isNew: true },
       "17": { tag: "17.5", digest: "sha256:old", isNew: false },
@@ -121,7 +121,10 @@ describe("PgBuildsCard", () => {
     const checkButton = screen.getByRole("button", { name: /check for updates/i });
     await userEvent.click(checkButton);
 
-    expect(await screen.findByText(/update available/i)).toBeInTheDocument();
+    // Honest wording: the heuristic can't confirm a NEWER minor without a pull, so it says
+    // "unverified latest", never the over-confident "update available".
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument();
+    expect(screen.queryByText(/update available/i)).not.toBeInTheDocument();
     // Only PG 16 got isNew:true, so exactly one Pull-by-header button should appear from the check.
     const pullButtons = await screen.findAllByRole("button", { name: /^pull$/i });
     expect(pullButtons).toHaveLength(1);
@@ -130,6 +133,17 @@ describe("PgBuildsCard", () => {
     // TanStack Query v5's mutationFn(variables, context) 2-arg shape (same as dashboard.test.tsx's
     // create/delete assertions) — assert on the call's first argument only.
     await waitFor(() => expect(vi.mocked(api.pgBuilds.pull).mock.calls.at(-1)?.[0]).toEqual({ major: 16 }));
+  });
+
+  it("offers NO Pull affordance for a major with no unverified latest (nothing to fetch)", async () => {
+    // updateAvailable null for every major (current/incompatible) — the honest daemon's signal that
+    // there's nothing to fetch. The header Pull button must not appear (Gap 2: no Pull when there's
+    // no confirmed update). builds are all ready/active, so there are no failed-row Retry buttons either.
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/unverified latest/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/update available/i)).not.toBeInTheDocument();
   });
 
   it("Activate on a lower minor confirms via window.confirm and sends consented:true only when confirmed", async () => {
@@ -244,9 +258,9 @@ describe("PgBuildsCard", () => {
     expect(await screen.findByText("PG 18")).toBeInTheDocument();
   });
 
-  // #8: the update-available badge rendered only the component-local Check result and ignored the
-  // server's persisted status.pgBuilds[m].updateAvailable — so it vanished on reload. Fall back to it.
-  it("shows the update-available badge from the server's persisted status field, without a local Check", async () => {
+  // #8: the badge rendered only the component-local Check result and ignored the server's persisted
+  // status.pgBuilds[m].updateAvailable — so it vanished on reload. Fall back to it (honest wording).
+  it("shows the unverified-latest badge from the server's persisted status field, without a local Check", async () => {
     vi.mocked(api.status).mockResolvedValue({
       ...baseStatus,
       pgBuilds: {
@@ -256,7 +270,77 @@ describe("PgBuildsCard", () => {
     });
     renderApp(<PgBuildsCard />);
     await screen.findByText("PG 16");
-    expect(await screen.findByText(/update available/i)).toBeInTheDocument();
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument();
+  });
+
+  // Review finding (P4): a fresh explicit check is authoritative — an isNew:false result must clear
+  // the badge immediately, even if the (not-yet-refetched) server status still carries a stale
+  // updateAvailable. Otherwise the exact false-positive the honesty change targets survives a check.
+  it("a fresh isNew:false check clears a stale server updateAvailable badge without waiting for a status refetch", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      ...baseStatus,
+      pgBuilds: {
+        ...baseStatus.pgBuilds,
+        "16": { ...baseStatus.pgBuilds["16"]!, updateAvailable: "16.11" }, // stale server memory
+      },
+    });
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:x", isNew: false }, // fresh check: now current, nothing to fetch
+      "17": { tag: "17.5", digest: "sha256:y", isNew: false },
+    });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument(); // from the stale server value
+
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+
+    // The fresh check said current — the badge + Pull must be gone, overriding the stale server value.
+    await waitFor(() => expect(screen.queryByText(/unverified latest/i)).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
+  });
+
+  // Review finding (P4): the motivating flow. After check→Pull, the local check result (which now
+  // takes precedence over the server value) must be cleared, or the "unverified latest" badge + Pull
+  // linger over an "up to date" row for the rest of the session — the pull just verified the digest.
+  it("clears the in-session unverified badge after the user pulls it (check → pull → verify)", async () => {
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:new", isNew: true },
+      "17": { tag: "17.5", digest: "sha256:old", isNew: false },
+    });
+    vi.mocked(api.pgBuilds.pull).mockResolvedValue({ buildId: "b16" });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    const pullBtn = await screen.findByRole("button", { name: /^pull$/i });
+    await userEvent.click(pullBtn);
+
+    // baseStatus carries updateAvailable:null for 16, so once the local check result is dropped the
+    // badge + Pull are gone (the honest server value governs) — no lingering prompt.
+    await waitFor(() => expect(screen.queryByText(/unverified latest/i)).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /^pull$/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.pull).mock.calls.at(-1)?.[0]).toEqual({ major: 16 }));
+  });
+
+  // Gap 2: a benign same-minor/dup no-op is a `skipped` row, not a `failed` one — it must read as a
+  // muted "up to date" line, NOT alarm as a failure and NOT offer a Retry (that just re-no-ops) or an
+  // Activate (there is no distinct build to activate).
+  it("renders a skipped (benign no-op) build as a muted up-to-date line — no Retry/Activate", async () => {
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b16-10", major: 16, minor: 10, version: "16.10", active: true, inUse: true }),
+      build({
+        id: "b16-noop", major: 16, minor: 10, version: "16.10", source: "downloaded", releaseTag: "latest",
+        status: "skipped", active: false, inUse: false, error: "already installed as 16.10 (downloaded) — up to date",
+      }),
+    ]);
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+
+    expect(screen.getByText(/already installed as 16\.10 .* up to date/i)).toBeInTheDocument();
+    // Not a failure, not actionable: no Retry (would re-no-op), no Activate (the non-active skipped
+    // row must NOT fall into the ready branch and offer one).
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^activate$/i })).not.toBeInTheDocument();
   });
 
   // #7: the local heuristic flags a downgrade vs the ACTIVE minor, but the daemon guards against the
@@ -306,6 +390,30 @@ describe("PgBuildsCard", () => {
     // count assertion can't pass on an early poll before a (buggy) retry would have been issued.
     await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
     expect(vi.mocked(api.pgBuilds.activate).mock.calls).toHaveLength(1); // and no consented retry followed
+  });
+
+  // Review finding (P4): the failed-row Retry pulls the row's OWN (pinned) tag, not the latest flow —
+  // so it must NOT clear the major's latest-check badge. Only a latest pull (header Pull, or a retry
+  // of a `latest`-tagged row) verifies the latest digest.
+  it("retrying a failed NON-latest build leaves the major's latest-check badge intact", async () => {
+    vi.mocked(api.pgBuilds.check).mockResolvedValue({
+      "16": { tag: "16.11", digest: "sha256:new", isNew: true },
+    });
+    vi.mocked(api.pgBuilds.list).mockResolvedValue([
+      build({ id: "b16-active", major: 16, minor: 10, version: "16.10", active: true, inUse: true }),
+      build({ id: "b16-bad", major: 16, minor: null, version: null, status: "failed", active: false, inUse: false, error: "gate failed", releaseTag: "16.9" }),
+    ]);
+    vi.mocked(api.pgBuilds.pull).mockResolvedValue({ buildId: "retry-16" });
+    renderApp(<PgBuildsCard />);
+    await screen.findByText("PG 16");
+    await userEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(await screen.findByText(/unverified latest/i)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /retry pull/i }));
+    await waitFor(() => expect(vi.mocked(api.pgBuilds.pull).mock.calls.at(-1)?.[0]).toEqual({ major: 16, tag: "16.9" }));
+
+    // The retry pulled 16.9, not latest — the unverified-latest badge must remain.
+    expect(screen.getByText(/unverified latest/i)).toBeInTheDocument();
   });
 
   // #9: failed rows accumulated unbounded — the only action was Retry (which on a dedup no-op mints

@@ -18,7 +18,7 @@ import { LogsService } from "./services/logs.js";
 import { EventsService } from "./services/events.js";
 import { createLogger } from "./logging/logger.js";
 import { BranchQueue } from "./state/queue.js";
-import { reconcileEndpointsOnBoot, sweepComputesDir } from "./state/reconcile.js";
+import { reconcileEndpointsOnBoot, reconcilePgBuildsOnBoot, sweepComputesDir } from "./state/reconcile.js";
 import { engineDirs } from "./engine/configs.js";
 import { BuildRegistry } from "./compute/builds/registry.js";
 import { detectPostgresVersion } from "./compute/builds/version.js";
@@ -121,6 +121,13 @@ async function main(): Promise<void> {
     // Boot reconciliation (T16; extracted to state/reconcile.ts under Fix 4 for direct unit
     // coverage — see that module's doc comment for the full rationale).
     reconcileEndpointsOnBoot(state);
+
+    // Reclassify historical benign-no-op pg_build rows (`failed … — no-op`, predating the `skipped`
+    // status) so they stop reading as alarming failures. Idempotent; a no-op on a fresh volume.
+    const reclassifiedNoOps = reconcilePgBuildsOnBoot(state);
+    if (reclassifiedNoOps > 0) {
+      console.error(`boot: reclassified ${reclassifiedNoOps} historical no-op pg_build row(s) as skipped`);
+    }
 
     // Fix 4 (review, final wave): sweep any compute directories left behind by a compute that was
     // mid-launch/mid-teardown when the container died uncleanly. Runs immediately after

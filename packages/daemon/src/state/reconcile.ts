@@ -25,6 +25,16 @@ export function reconcileEndpointsOnBoot(state: StateDb): void {
   }
 }
 
+// One-shot boot reconcile for pg_builds: fix up historical benign-no-op rows (recorded as
+// `failed … — no-op` before the `skipped` status existed) so they stop reading as alarming failures
+// with a Retry that just re-no-ops — reclassifying the ones with a real digest→minor link to
+// `skipped` and deleting the value-less '' -digest noise (see PgBuildsRepo.reconcileLegacyNoOps).
+// Genuine failures are untouched; idempotent across reboots. Placed beside reconcileEndpointsOnBoot()
+// (index.ts runs both at boot, before anything is live). Returns the rows changed.
+export function reconcilePgBuildsOnBoot(state: StateDb): number {
+  return state.pgBuilds.reconcileLegacyNoOps();
+}
+
 // Fix 4 (review, final wave): a compute mid-launch or mid-teardown at the moment the daemon
 // container died unexpectedly (host reboot, `docker kill`, OOM — anything that skips the SIGTERM
 // shutdown path's own ComputeManager.stopAll()) leaves its mkdtemp'd directory under computesDir

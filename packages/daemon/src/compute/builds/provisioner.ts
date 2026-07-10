@@ -6,6 +6,7 @@ import { DevdbError } from "../../services/errors.js";
 import type { StateDb } from "../../state/db.js";
 import type { PgBuildRow } from "../../state/repos.js";
 import { shortDigest } from "./registry.js";
+import { isIncompatibilityError } from "./version.js";
 import type { BuildRegistry } from "./registry.js";
 import type { OciPuller } from "./oci.js";
 import type { LogsService } from "../../services/logs.js";
@@ -46,7 +47,35 @@ export function firstLine(e: unknown): string {
   return msg.split("\n")[0]!.slice(0, 500);
 }
 
-interface CheckResult { tag: "latest"; digest: string; isNew: boolean; at: string }
+// The message runPipeline records when an extracted image's real PG major ≠ the requested major, and
+// its read-back predicate — co-located so the write and read can't drift (mirrors version.ts's
+// isIncompatibilityError). classifyDigest treats a wrong-major `latest` as a PERMANENT per-(major,
+// digest) failure: re-pulling that tag re-extracts the same wrong-major image and re-fails the
+// expected-major guard, so — exactly like an OS-base incompatibility — it must not be advertised as an
+// unverified update. (Reachable only via a registry mislabel, e.g. v17's `latest` → a v16 image.)
+export function majorMismatchMessage(a: { detectedMajor: number; minor: number; requestedMajor: number }): string {
+  return `image contained postgres ${a.detectedMajor}.${a.minor}, expected major ${a.requestedMajor}`;
+}
+export function isMajorMismatchError(err: string | null): boolean {
+  return err != null && /^image contained postgres \d+\.\d+, expected major \d+$/.test(err);
+}
+
+// An HONEST per-major update-check outcome. `state` is the load-bearing field; `isNew` is kept as a
+// derived convenience (=== state "unverified") for the DTO/web/MCP call sites that predate it.
+//   current      — the registry's `latest` is a version you already run (its digest is installed
+//                  ready, or its recorded minor is): nothing to fetch.
+//   incompatible — `latest`'s digest already FAILED TO LOAD on this runtime (a build linked against a
+//                  different OS base): permanent for this runtime, re-pulling re-fails — NOT an update.
+//   unverified   — `latest`'s digest is unknown, or failed only transiently: it MIGHT be a newer minor
+//                  we can't confirm without a pull. We neither claim "confirmed newer" (we haven't
+//                  verified) nor hide it (a genuine newer minor stays reachable via Pull).
+// Deliberately NO "confirmed newer minor" state: the heuristic can't confirm one without a full pull
+// (it only has the digest, not its minor). Reading the minor from the image config/labels — which
+// WOULD let check() confirm a newer minor without a pull — is a future enhancement gated on the pull
+// target's label conventions (the default is Neon's public Docker Hub images; the Oracle rule forbids
+// inventing their payloads). See docs/superpowers/2026-07-10-pg-builds-update-check-honesty.md.
+type CheckState = "current" | "incompatible" | "unverified";
+interface CheckResult { tag: "latest"; digest: string; state: CheckState; isNew: boolean; at: string }
 
 // Orchestrates check/pull: preflight → OCI pull/extract → fixup (version detect + marker) →
 // validation gate (injected) → auto-activate → recompose pg_distrib. One pull runs at a time
@@ -114,33 +143,54 @@ export class Provisioner {
     return this.deps.cfg.pgImageTemplate.replace("{major}", String(major));
   }
 
-  // Resolves each major's `latest` digest against the registry and records whether it's new
-  // (i.e. not already present as a `pg_builds` row) — the UI's "update available" check.
+  // Classifies a resolved `latest` digest against what's installed, honestly (see CheckState). Pure &
+  // local (no network): check() calls it after resolveDigest, and the pull pipeline calls it to refresh
+  // the cache once a pull has changed the installed state (see runPipeline's tail).
+  //
+  // Considers ALL rows at the digest, not byDigest's single ready-preferred/newest pick:
+  //  - current: any ready row at this digest, or any row here records a minor that IS installed ready.
+  //    `latest` never digest-matches a BAKED build (it carries the '' sentinel), so that minor arm is
+  //    what stops a baked-current major reading as new — a prior no-op recorded this digest→minor.
+  //  - incompatible: an incompatibility is PERMANENT for this runtime, so ONE incompatible-failed row
+  //    here is definitive even if a newer TRANSIENT-failed row (gate timeout / 404 / disk / a failure
+  //    after resolveDigest but before detectVersion) also exists at the digest — re-pulling re-fails.
+  //  - unverified: otherwise (digest unknown, or only transient failures) — might be a newer minor we
+  //    can't confirm without a pull; kept offerable so a genuine newer minor stays reachable.
+  private classifyDigest(major: number, digest: string): CheckState {
+    const majorRows = this.deps.state.pgBuilds.listByMajor(major);
+    const atDigest = majorRows.filter((r) => r.imageDigest === digest);
+    const minorInstalledReady = (m: number | null): boolean =>
+      m !== null && majorRows.some((b) => b.status === "ready" && b.minor === m);
+    if (atDigest.some((r) => r.status === "ready" || minorInstalledReady(r.minor))) return "current";
+    // A failed row at this digest that is PERMANENT for this major — an OS-base incompatibility, or a
+    // wrong-major image (registry mislabel) — is not an update: re-pulling re-fails identically.
+    if (atDigest.some((r) => r.status === "failed" && (isIncompatibilityError(r.error) || isMajorMismatchError(r.error)))) {
+      return "incompatible";
+    }
+    return "unverified";
+  }
+
+  private toCheckResult(digest: string, state: CheckState): CheckResult {
+    return { tag: "latest", digest, state, isNew: state === "unverified", at: new Date().toISOString() };
+  }
+
+  // Resolves each major's `latest` digest against the registry and classifies it honestly (see
+  // CheckState) — the UI's update check.
   async check(majors: number[]): Promise<Record<string, CheckResult>> {
     const out: Record<string, CheckResult> = {};
     for (const major of majors) {
       const { digest } = await this.deps.oci.resolveDigest(this.repoFor(major), "latest");
-      // Version-aware "is there something new to pull?". byDigest is ready-preferred: it surfaces a
-      // prior row at this digest — a ready install, OR the same-minor no-op extractFixupAndGate
-      // records (status failed, but with its minor set). isNew is true only when this digest is
-      // NEITHER already installed at its exact digest, NOR (via that recorded minor) a minor already
-      // present as a ready build. Without the minor arm a baked build — which carries the '' digest
-      // sentinel, so `latest` never digest-matches it — would flag "update available" forever even
-      // when `latest` resolves to the exact minor already baked.
-      const seen = this.deps.state.pgBuilds.byDigest(digest);
-      const seenMinor = seen?.minor ?? null;
-      const minorInstalled = seenMinor !== null &&
-        this.deps.state.pgBuilds.listByMajor(major).some((b) => b.status === "ready" && b.minor === seenMinor);
-      const isNew = seen?.status !== "ready" && !minorInstalled;
-      const result: CheckResult = { tag: "latest", digest, isNew, at: new Date().toISOString() };
+      const result = this.toCheckResult(digest, this.classifyDigest(major, digest));
       this.lastCheck.set(major, result);
       out[String(major)] = result;
     }
     return out;
   }
 
-  // The UI badge string for a major's last check(): "latest@<12-char digest>" only when that
-  // check found something not yet installed; null otherwise (nothing new, or never checked).
+  // The UI badge string for a major's last check(): "latest@<12-char digest>" only when that check
+  // left the major "unverified" (an unconfirmed `latest` worth a Pull); null for current/incompatible
+  // (nothing to fetch, or a re-failing incompatibility) and when never checked. Honest by
+  // construction: it never asserts a *confirmed* newer minor — the badge text says "unverified".
   updateAvailableFor(major: number): string | null {
     const c = this.lastCheck.get(major);
     if (!c || !c.isNew) return null;
@@ -153,6 +203,35 @@ export class Provisioner {
 
   private log(buildId: string, line: string): void {
     this.deps.logs.ingest(`pgbuild:${buildId}`, line);
+  }
+
+  // Records a benign no-op pull — one whose resolved digest/minor is ALREADY installed (same-minor
+  // dedup, or an identical-digest re-pull) — as a distinct `skipped` terminal state, NOT `failed`.
+  // A no-op is not a failure: surfacing it as one made the UI alarm and offer a Retry that just
+  // re-no-ops (the observed gap). The row PERSISTS on purpose: its recorded digest→minor is how
+  // check() reads the major as up-to-date — a BAKED build carries the '' digest sentinel, so a prior
+  // no-op's row is the only link from `latest`'s digest to the installed minor. So we can't just
+  // delete it; instead we clear its path (a no-op owns no dir) and prune older `skipped` siblings at
+  // the same (major, digest) — keeping exactly one — so repeated no-op pulls (reachable via direct
+  // API/MCP force-pulls) don't accumulate. The status flip is immediate (non-destructive, like the
+  // failure paths); only the prune's row deletes run in the mutation lane, since a concurrent
+  // activate/remove could be operating on a sibling row.
+  private async recordSkip(id: string, msg: string): Promise<void> {
+    const { state } = this.deps;
+    state.pgBuilds.updatePath(id, "");
+    state.pgBuilds.setStatus(id, "skipped", msg);
+    this.log(id, msg);
+    const row = state.pgBuilds.byId(id);
+    if (row && row.imageDigest !== "") {
+      await this.runMutation(async () => {
+        for (const sib of state.pgBuilds.listByMajor(row.major)) {
+          if (sib.id !== id && sib.status === "skipped" && !sib.active && sib.imageDigest === row.imageDigest) {
+            state.pgBuilds.delete(sib.id);
+          }
+        }
+      });
+    }
+    this.publish();
   }
 
   // Kicks off an async pull job and returns its buildId immediately (202-style). Only one pull
@@ -210,6 +289,8 @@ export class Provisioner {
     // ~200 MB dir behind — finalDirRef stays undefined so the post-rename compensation skips it,
     // and sweepTmp only reclaims it at the NEXT boot. The outer catch rm's it when set.
     let stagingDir: string | undefined;
+    // Set the instant resolveDigest succeeds; drives the lastCheck refresh in the finally below.
+    let resolvedDigest: string | undefined;
     try {
       // --- Preflight: disk headroom, BEFORE any network. The row (inserted by pull()) still
       // carries the '' digest sentinel here — same sentinel baked rows use, and byDigest()
@@ -225,16 +306,24 @@ export class Provisioner {
       // --- Dedup: resolve the digest, then check whether it's already installed & ready.
       // Identity is the DIGEST, never the tag: a mutable tag (`latest`) re-pulled at a new digest
       // is a NEW build (this row proceeds; the old digest's row and dir persist until GC), while
-      // the same digest already ready — whatever tag it arrived under — is a no-op. The no-op row
-      // keeps the '' digest sentinel so it can never shadow the real install in byDigest().
+      // the same digest already ready — whatever tag it arrived under — is a no-op. recordSkip below
+      // stamps this no-op row with the REAL digest (self-describing + prunable by (major, digest));
+      // it can't shadow the ready install because byDigest() is ready-preferred (ready rows sort first).
       const { digest } = await deps.oci.resolveDigest(repo, tag);
+      resolvedDigest = digest;
       const existing = state.pgBuilds.byDigest(digest);
-      if (existing && existing.status === "ready") {
+      // Scope the no-op to the SAME major: byDigest is global-by-digest, but a ready row for a
+      // DIFFERENT major sharing this digest (a mislabeled/colliding image) must NOT short-circuit the
+      // pull — let it extract so detectVersion's expected-major guard fails it explicitly rather than
+      // recording a false no-op that leaves the requested major with no build.
+      if (existing && existing.status === "ready" && existing.major === major) {
         const versionStr = existing.minor !== null ? `${existing.major}.${existing.minor}` : `${existing.major}.x`;
-        const msg = `already installed as ${versionStr} — no-op`;
-        state.pgBuilds.setStatus(id, "failed", msg);
-        this.log(id, msg);
-        this.publish();
+        // Benign no-op (identical digest already ready). Stamp the resolved digest + the collided-with
+        // minor on THIS row so the skipped record is self-describing and prunable by (major, digest);
+        // the existing ready row still carries the authoritative digest→minor for check().
+        state.pgBuilds.setDigestPath(id, { imageDigest: digest, path: "" });
+        if (existing.minor !== null) state.pgBuilds.updateMinor(id, existing.minor);
+        await this.recordSkip(id, `already installed as ${versionStr} (${existing.source}) — up to date`);
         return;
       }
 
@@ -249,7 +338,9 @@ export class Provisioner {
       state.raw.prepare("INSERT INTO jobs (id, kind, status) VALUES (?, 'pg_build_pull', 'running')").run(jobId);
       try {
         await this.extractFixupAndGate(id, major, tag, digest, tmpDir, finalDirRef, activatedRef);
-        jobStatus = state.pgBuilds.byId(id)?.status === "ready" ? "done" : "failed";
+        // A same-minor no-op ends `skipped` — a benign success, not a failed job.
+        const s = state.pgBuilds.byId(id)?.status;
+        jobStatus = s === "ready" || s === "skipped" ? "done" : "failed";
       } finally {
         state.raw.prepare("UPDATE jobs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
           .run(jobStatus, jobId);
@@ -341,6 +432,22 @@ export class Provisioner {
           this.publish();
         }).catch((e) => deps.logger.error(`pg_build ${id}: post-failure compensation failed`, e));
       }
+    } finally {
+      // Review finding (P3): once the digest is known, refresh the update-check cache so /api/status +
+      // MCP don't keep prompting a Pull already settled (verified ready/skipped → current, proven
+      // incompatible, or — for a transient failure — re-derived back to unverified, unchanged). Refresh
+      // when EITHER:
+      //  - this was a `latest` pull: it re-resolved latest's CURRENT digest, which is exactly what the
+      //    cache tracks — so refresh even if the mutable tag MOVED since the check (the normal
+      //    new-minor-published flow); a strict digest-equality guard would leave the old digest's stale
+      //    "unverified" advertised forever (repeat latest pulls resolve the new digest, never matching), OR
+      //  - a pinned-tag pull happened to resolve the exact digest a prior check cached (settling it);
+      //    a pinned pull of a DIFFERENT digest must NOT clobber latest's cached verdict.
+      // Runs on every exit once the digest is known (incl. the early-returning no-op paths).
+      // Local/no-network, never throws.
+      if (resolvedDigest !== undefined && (tag === "latest" || this.lastCheck.get(major)?.digest === resolvedDigest)) {
+        this.lastCheck.set(major, this.toCheckResult(resolvedDigest, this.classifyDigest(major, resolvedDigest)));
+      }
     }
   }
 
@@ -364,7 +471,7 @@ export class Provisioner {
     // --- Fixup: version detect, must match the requested major.
     const { major: detectedMajor, minor } = await deps.detectVersion(join(tmpDir, "bin", "postgres"));
     if (detectedMajor !== major) {
-      const msg = `image contained postgres ${detectedMajor}.${minor}, expected major ${major}`;
+      const msg = majorMismatchMessage({ detectedMajor, minor, requestedMajor: major });
       await rm(tmpDir, { recursive: true, force: true });
       state.pgBuilds.updatePath(id, ""); // FIX-3(a): failure-rm'd the dir ⇒ drop the row's claim on it
       state.pgBuilds.setStatus(id, "failed", msg);
@@ -385,13 +492,11 @@ export class Provisioner {
       (b) => b.id !== id && b.status === "ready" && b.minor === minor,
     );
     if (sameMinor) {
-      const msg = `already installed as ${major}.${minor} (${sameMinor.source}) — no-op`;
       await rm(tmpDir, { recursive: true, force: true });
-      state.pgBuilds.updateMinor(id, minor);
-      state.pgBuilds.updatePath(id, ""); // failure-rm'd the dir ⇒ drop the row's claim on it
-      state.pgBuilds.setStatus(id, "failed", msg);
-      this.log(id, msg);
-      this.publish();
+      state.pgBuilds.updateMinor(id, minor); // digest→minor link recordSkip keeps for check()
+      // Benign no-op, not a failure: record it as `skipped` (recordSkip clears the path + prunes
+      // older skipped siblings at this digest). The row's digest was stamped at setDigestPath above.
+      await this.recordSkip(id, `already installed as ${major}.${minor} (${sameMinor.source}) — up to date`);
       return;
     }
 

@@ -215,7 +215,7 @@ describe("Provisioner", () => {
     expect(registry.pgbinFor(17).buildId).toBe("baked-v17"); // active pointer untouched
   });
 
-  it('digest dedup: already-installed digest → row failed with "already installed" and NO oci.pullPrefix call', async () => {
+  it('digest dedup: already-installed digest → row SKIPPED (benign) with "already installed" and NO oci.pullPrefix call', async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);
     const { oci, pullPrefixSpy } = fakeOci({ digest: DIGEST_A });
@@ -229,13 +229,42 @@ describe("Provisioner", () => {
 
     const { buildId } = await provisioner.pull({ major: 17, tag: "latest" });
 
+    // A no-op is a benign "skipped", NOT "failed" — the UI must not alarm or offer a Retry that
+    // just re-no-ops. The dedup guard itself is unchanged (pullPrefix never runs).
     const row = await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       return r!;
     });
     expect(row.error).toMatch(/already installed/);
     expect(pullPrefixSpy).not.toHaveBeenCalled();
+  });
+
+  // Review finding (P3): byDigest is global-by-digest, but the dedup no-op must be scoped to the
+  // requested major. A ready row for a DIFFERENT major sharing the digest (a mislabeled/colliding
+  // image — contrived, since real per-major compute-node images never share a content digest) must
+  // NOT short-circuit the pull into a false no-op; it must extract so detectVersion's expected-major
+  // guard runs. Here the pulled image is genuinely major 17, so it reaches ready for 17.
+  it("digest dedup is scoped to the requested major: a same-digest ready row for another major does not no-op the pull", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const { oci, pullPrefixSpy } = fakeOci({ digest: DIGEST_A });
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({
+      id: "ready-16", major: 16, minor: 9, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: join(builds, "v16", SHORT_A), status: "ready",
+    });
+
+    const { buildId } = await provisioner.pull({ major: 17 });
+
+    const row = await vi.waitFor(() => {
+      const r = state.pgBuilds.byId(buildId);
+      expect(r?.status).toBe("ready"); // extracted + validated for 17, NOT skipped against the v16 row
+      return r!;
+    });
+    expect(row.major).toBe(17);
+    expect(pullPrefixSpy).toHaveBeenCalled(); // extraction ran (not a cross-major dedup no-op)
+    expect(state.pgBuilds.byId("ready-16")?.status).toBe("ready"); // the v16 row is untouched
   });
 
   it("detected major mismatch → failed row, no rename into place", async () => {
@@ -674,20 +703,23 @@ describe("Provisioner", () => {
 
     const result = await provisioner.check([16, 17]);
 
-    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_B, isNew: true });
-    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: false });
+    // 17's latest digest is unknown ⇒ "unverified" (we can't confirm it's newer without a pull),
+    // NOT a confident "update available". 16's resolves to an installed-ready digest ⇒ "current".
+    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_B, state: "unverified", isNew: true });
+    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "current", isNew: false });
 
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_B.slice(7, 19)}`);
     expect(provisioner.updateAvailableFor(16)).toBeNull();
   });
 
-  it("check(): a FAILED row at the current digest does not count as installed — isNew stays true", async () => {
+  it("check(): a TRANSIENTLY-failed row at the current digest stays offerable — state unverified, isNew true", async () => {
     const { root, install, builds } = await scaffoldBuildDirs();
     dirs.push(root);
-    // 17's `latest` resolves to DIGEST_A — the only row at that digest is `failed` (e.g. a prior
-    // gate failure or a non-409 activate malfunction). byDigest is ready-preferred: absent a ready
-    // row it still returns this failed one, so check() must not mistake "a row exists" for
-    // "installed" — nothing is actually on disk for this digest.
+    // 17's `latest` resolves to DIGEST_A — the only row at that digest is `failed` for a NON-base
+    // reason (a gate timeout / a non-409 activate malfunction; error not an incompatibility). byDigest
+    // is ready-preferred: absent a ready row it still returns this failed one, so check() must not
+    // mistake "a row exists" for "installed" — nothing is on disk. A transient failure might yet
+    // install a genuine newer minor on retry, so it stays "unverified" (offerable), not suppressed.
     const { oci } = fakeOci({ digest: DIGEST_A });
     const { state, provisioner } = makeProvisioner({ install, builds, oci });
 
@@ -695,11 +727,39 @@ describe("Provisioner", () => {
       id: "failed-17", major: 17, minor: null, source: "downloaded", releaseTag: "latest",
       imageDigest: DIGEST_A, path: "", status: "failed",
     });
+    state.pgBuilds.setStatus("failed-17", "failed", "gate timed out after 90s");
 
     const result = await provisioner.check([17]);
 
-    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, isNew: true });
+    expect(result["17"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "unverified", isNew: true });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+  });
+
+  it("check(): an INCOMPATIBLE failed row at the current digest is not an update — state incompatible, isNew false", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    // 16's `latest` resolves to DIGEST_A, whose only row is a pull that FAILED TO LOAD (a bullseye
+    // compute-node — libssl.so.1.1 — on the bookworm runtime). The incompatibility is permanent for
+    // this runtime: re-pulling DIGEST_A re-fails identically, so it is NOT an available update. The
+    // over-eager pre-fix check flagged it forever (the very image that just failed to load).
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+
+    state.pgBuilds.insert({
+      id: "incompat-16", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed",
+    });
+    state.pgBuilds.setStatus("incompat-16", "failed",
+      "/data/pg_builds/v16/.tmp-aaaa/bin/postgres is incompatible with this runtime image "
+      + "(missing shared library libssl.so.1.1) — the build targets a different OS base than this container");
+
+    const result = await provisioner.check([16]);
+
+    expect(result["16"]).toMatchObject({ tag: "latest", digest: DIGEST_A, state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(16)).toBeNull();
   });
 
   // Same-version dedup (the fix): a baked build carries the '' digest sentinel, so `latest`
@@ -722,13 +782,13 @@ describe("Provisioner", () => {
 
     const row = await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       return r!;
     });
     // The pull no-op'd against the already-installed 17.5 — recording the source it collided with.
     expect(row.error).toMatch(/already installed as 17\.5/);
-    // The digest→minor link is persisted on the failing row (so check() can read it back), the
-    // resolved digest survives, and the failure-rm'd row drops its path claim.
+    // The digest→minor link is persisted on the skipped row (so check() can read it back), the
+    // resolved digest survives, and the no-op row drops its path claim (owns no dir).
     expect(row.minor).toBe(5);
     expect(row.imageDigest).toBe(DIGEST_A);
     expect(row.path).toBe("");
@@ -757,17 +817,159 @@ describe("Provisioner", () => {
     expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: true } });
     expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
 
-    // The same-minor pull no-ops, recording DIGEST_A → minor 5 on the failed row.
+    // The same-minor pull no-ops, recording DIGEST_A → minor 5 on the benign skipped row.
     const { buildId } = await provisioner.pull({ major: 17 });
     await vi.waitFor(() => {
       const r = state.pgBuilds.byId(buildId);
-      expect(r?.status).toBe("failed");
+      expect(r?.status).toBe("skipped");
       expect(r?.minor).toBe(5);
     });
 
-    // AFTER: the recorded digest→minor resolves to the already-ready baked 17.5 — no update.
-    expect(await provisioner.check([17])).toMatchObject({ "17": { isNew: false } });
+    // AFTER: the recorded digest→minor resolves to the already-ready baked 17.5 — current, no update.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
     expect(provisioner.updateAvailableFor(17)).toBeNull();
+  });
+
+  // Skipped rows carry the digest→minor memory check() needs, so they PERSIST (we can't just delete
+  // them) — but repeated no-op pulls at the same digest must not accumulate. recordSkip prunes older
+  // skipped siblings at the same (major, digest), keeping exactly one. Reachable via direct API/MCP
+  // force-pulls (agents-first): the honest check() stops the UI offering Pull for a current major,
+  // but the guard still bounds the rows.
+  it("repeated same-minor no-op pulls at the same digest keep exactly one skipped row (older pruned)", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked v17 (17.5)
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives(); // baked-v17 (17.5) active
+
+    const { buildId: first } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(first)?.status).toBe("skipped"));
+
+    const { buildId: second } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(second)?.status).toBe("skipped"));
+
+    const skipped = state.pgBuilds.listByMajor(17).filter((b) => b.status === "skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.id).toBe(second);           // the newest no-op record survives
+    expect(state.pgBuilds.byId(first)).toBeNull(); // the older duplicate was pruned
+    // digest→minor memory intact ⇒ check() still reads the major as current.
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
+    // The real ready build is untouched — still exactly the baked one, active.
+    const ready = state.pgBuilds.listByMajor(17).filter((b) => b.status === "ready");
+    expect(ready).toHaveLength(1);
+    expect(ready[0]).toMatchObject({ id: "baked-v17", active: true });
+  });
+
+  // Review finding (P3): a wrong-MAJOR image at the latest digest is also a PERMANENT failure for this
+  // major (re-pulling that tag re-extracts the same wrong-major image and re-fails the expected-major
+  // guard). Like an OS-base incompatibility, it must NOT be advertised as an unverified update — else
+  // status/MCP/UI loop-prompt a Pull already proven unusable. (Reachable only via a registry mislabel —
+  // v17's `latest` pointing at a v16 image — but the classification must stay honest regardless.)
+  it("check(): a wrong-major failed row at the current digest is a permanent failure, not an update", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({ id: "mismatch-17", major: 17, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("mismatch-17", "failed", "image contained postgres 16.9, expected major 17");
+
+    const result = await provisioner.check([17]);
+
+    expect(result["17"]).toMatchObject({ state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(17)).toBeNull();
+  });
+
+  // Review finding (P3): an incompatibility is PERMANENT for this runtime, so ONE incompatible-failed
+  // row at a digest is definitive — even if a later retry of the SAME digest fails transiently (after
+  // resolveDigest, before detectVersion) and lands a newer row. byDigest returns only the newest
+  // non-ready row, so classifying off it alone would miss the older incompatibility and falsely prompt
+  // a Pull. check() must classify over ALL rows at the digest.
+  it("check(): an older incompatible failed row wins over a newer transient one at the same digest — incompatible, not unverified", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: DIGEST_A }),
+      pullPrefix: async () => { throw new Error("check() must never pull"); },
+    };
+    const { state, provisioner } = makeProvisioner({ install, builds, oci });
+    state.pgBuilds.insert({ id: "incompat-old", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("incompat-old", "failed",
+      "/x/bin/postgres is incompatible with this runtime image (missing shared library libssl.so.1.1) — the build targets a different OS base than this container");
+    state.pgBuilds.insert({ id: "transient-new", major: 16, minor: null, source: "downloaded", releaseTag: "latest",
+      imageDigest: DIGEST_A, path: "", status: "failed" });
+    state.pgBuilds.setStatus("transient-new", "failed", "pullPrefix failed: network reset"); // newer row, byDigest returns THIS
+
+    const result = await provisioner.check([16]);
+
+    expect(result["16"]).toMatchObject({ state: "incompatible", isNew: false });
+    expect(provisioner.updateAvailableFor(16)).toBeNull();
+  });
+
+  // Review finding (P3): after check() caches an "unverified latest", a pull that resolves that SAME
+  // digest verifies it (ready/skipped) or proves it incompatible — either way it's no longer an
+  // unverified update. The cache (which updateAvailableFor/status/MCP read) must refresh, or the UI
+  // keeps prompting a Pull that's already been done.
+  it("a pull that resolves the cached unverified-latest digest clears the update signal", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked 17.5
+    const { oci } = fakeOci({ digest: DIGEST_A });
+    const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+    await registry.seedBaked();
+    registry.resolveActives();
+
+    // A check finds DIGEST_A unverified (baked carries the '' sentinel, so latest never digest-matches).
+    await provisioner.check([17]);
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+
+    // Pulling latest resolves the SAME DIGEST_A and no-ops (same minor) → skipped/current.
+    const { buildId } = await provisioner.pull({ major: 17 });
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("skipped"));
+
+    // The stale "unverified latest" cache must clear — the pull just verified that digest.
+    await vi.waitFor(() => expect(provisioner.updateAvailableFor(17)).toBeNull());
+    expect(await provisioner.check([17])).toMatchObject({ "17": { state: "current", isNew: false } });
+  });
+
+  // Review finding (P3): the mutable `latest` moving BETWEEN a check and the pull is the normal update
+  // flow — a new minor published. A latest pull re-resolves latest's CURRENT digest, so it must refresh
+  // the cache even though that digest differs from the one the prior check saw; a strict digest-equality
+  // guard would leave the old "unverified latest@A" advertised forever (repeat pulls resolve B again, so
+  // the guard never clears A). The digest guard stays only for NON-latest tag pulls.
+  it("a latest pull refreshes the update signal even when the mutable tag MOVED since the check", async () => {
+    const { root, install, builds } = await scaffoldBuildDirs();
+    dirs.push(root);
+    await fakeInstallDir(install, "v17"); // baked 17.5
+    let latest = DIGEST_A; // what `latest` resolves to right now
+    const oci: OciPuller = {
+      resolveDigest: async () => ({ digest: latest }),
+      pullPrefix: async (p: { destDir: string }) => {
+        await mkdir(join(p.destDir, "bin"), { recursive: true });
+        await writeFile(join(p.destDir, "bin", "postgres"), "#!/bin/sh\n");
+      },
+    };
+    const { state, registry, provisioner } = makeProvisioner({
+      install, builds, oci, detectVersion: pathAwareDetectVersion(builds, { pulledMinor: 9 }),
+    });
+    await registry.seedBaked();
+    registry.resolveActives();
+
+    await provisioner.check([17]); // caches DIGEST_A, unverified
+    expect(provisioner.updateAvailableFor(17)).toBe(`latest@${DIGEST_A.slice(7, 19)}`);
+
+    latest = DIGEST_B; // a new minor is published — the mutable tag moves
+    const { buildId } = await provisioner.pull({ major: 17 }); // resolves DIGEST_B, installs 17.9
+    await vi.waitFor(() => expect(state.pgBuilds.byId(buildId)?.status).toBe("ready"));
+
+    // The stale latest@A signal must clear — the latest pull re-resolved and installed B (now current).
+    await vi.waitFor(() => expect(provisioner.updateAvailableFor(17)).toBeNull());
   });
 
   // Fix round 1 (review of Task 10 commit 3bfc859, Fix #2, P3): build-mutating operations
@@ -1006,7 +1208,13 @@ describe("Provisioner", () => {
       dirs.push(root);
       await fakeInstallDir(install, "v17");
       const { oci } = fakeOci();
-      const { state, registry, provisioner } = makeProvisioner({ install, builds, oci });
+      // Pulled build detects 17.7 (≠ baked 17.5) so it reaches ACTIVATION rather than no-op'ing at
+      // the same-minor dedup first — the activate malfunction below is the whole point of this test.
+      // (Before benign-skip landed, a same-minor no-op set status "failed" too, so this test passed
+      // for the wrong reason: it never reached activate. Now a no-op is "skipped", exposing that.)
+      const { state, registry, provisioner } = makeProvisioner({
+        install, builds, oci, detectVersion: pathAwareDetectVersion(builds),
+      });
       await registry.seedBaked();
       registry.resolveActives();
       vi.spyOn(registry, "activate").mockImplementation(() => {
