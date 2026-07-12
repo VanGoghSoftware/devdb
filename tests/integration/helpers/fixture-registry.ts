@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { execa } from "execa";
 import { GenericContainer, Wait, type StartedNetwork } from "testcontainers";
 import type { Devdb } from "./container.js";
+import { ENV_PREFIX } from "./container.js";
 
 // Task 15 (dynamic-pg-builds): the HERMETIC fixture registry. The suite must never pull the
 // compute-node BUILD from Docker Hub — instead an in-network `registry:2` container (alias
@@ -203,4 +204,29 @@ export async function seedStubImage(a: {
   } finally {
     await rm(hostDir, { recursive: true, force: true });
   }
+}
+
+// Injects a pg high-water mark (last-run minor) straight into the daemon's
+// SQLite while it runs — the downgrade-guard tests need a high-water no
+// legitimate flow can produce. Image-agnostic by flavor dispatch on the
+// suite's env prefix:
+//   - DEVDB_ (default): the image ships a Node runtime with better-sqlite3
+//     in the daemon's node_modules — the original exec one-liner, verbatim.
+//     Schema: pg_majors(major, last_run_minor).
+//   - anything else (the Go image): the image ships the sqlite3 CLI as
+//     operator tooling; the daemon's schema keeps the high-water on
+//     pg_actives(major, active_build_id, last_run_minor) — the upsert
+//     deliberately leaves active_build_id alone.
+// Both arms set a busy timeout to coexist with the daemon's WAL writer; the
+// caller restarts the container afterwards, which re-reads it at boot.
+export async function injectLastRunMinor(dev: Devdb, major: number, minor: number): Promise<void> {
+  if (ENV_PREFIX === "DEVDB_") {
+    await execa("docker", ["exec", "-w", "/app/packages/daemon", dev.container.getId(), "node", "-e",
+      "const D=require('better-sqlite3');const db=new D('/data/state.db');db.pragma('busy_timeout=5000');" +
+      `db.prepare("INSERT INTO pg_majors (major,last_run_minor) VALUES (${major},${minor}) ON CONFLICT(major) DO UPDATE SET last_run_minor=${minor}").run();db.close();`]);
+    return;
+  }
+  await execa("docker", ["exec", dev.container.getId(), "sqlite3", "/data/state.db",
+    `PRAGMA busy_timeout=5000; INSERT INTO pg_actives (major, last_run_minor) VALUES (${major},${minor}) ` +
+    `ON CONFLICT(major) DO UPDATE SET last_run_minor=${minor};`]);
 }

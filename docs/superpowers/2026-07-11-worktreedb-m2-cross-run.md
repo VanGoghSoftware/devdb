@@ -16,8 +16,27 @@ The TS integration suite doubles as the Go daemon's parity oracle
 acceptance, projects, branching, endpoints, timetravel, events, boot,
 restart, unclean-restart, retry-helper, storcon-major-guard
 
-Later gates: pg-builds + mcp/mcp-handshake/mcp-concurrency at M3;
-web-ui at M4 (full suite = the parity gate).
+## M3 gate (4 build/MCP files — all must pass, assertions unmodified)
+
+pg-builds, mcp, mcp-handshake, mcp-concurrency
+
+State injection is image-agnostic since M3: helpers/fixture-registry.ts's
+injectLastRunMinor dispatches on DEVDB_TEST_ENV_PREFIX (node+better-sqlite3
+into pg_majors for the default image; the in-image sqlite3 CLI into
+pg_actives for WORKTREEDB_). Assertions unchanged.
+
+    cd ~/git/devdb/tests/integration && \
+      DEVDB_TEST_IMAGE=worktreedb:dev DEVDB_TEST_ENV_PREFIX=WORKTREEDB_ \
+      pnpm vitest run pg-builds mcp mcp-handshake mcp-concurrency
+
+Result 2026-07-12: 4/4 green against worktreedb:dev (pg-builds, mcp,
+mcp-handshake, mcp-concurrency; DEVDB_TEST_ENV_PREFIX=WORKTREEDB_).
+Full 15-file regression (M2's 11 + these 4) 2026-07-12: 13/15 on the first
+sequential pass; the 2 reds (branching, mcp-concurrency) were 300s TIMEOUTS
+under cumulative 15-file machine load and both PASSED isolated in ~8s each →
+load flakes, parity holds across all 15 files.
+
+Later gates: web-ui at M4 (full suite = the parity gate).
 
 ## Invocation
 

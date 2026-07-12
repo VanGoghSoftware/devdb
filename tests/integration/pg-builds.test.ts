@@ -3,7 +3,7 @@ import { Network, type StartedNetwork } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startDevdb, type Devdb } from "./helpers/container.js";
 import {
-  seedComputeImageFromDevdb, seedStubImage, startFixtureRegistry, type FixtureRegistry,
+  injectLastRunMinor, seedComputeImageFromDevdb, seedStubImage, startFixtureRegistry, type FixtureRegistry,
 } from "./helpers/fixture-registry.js";
 import { api, connect } from "./helpers/pg.js";
 
@@ -275,12 +275,11 @@ describe("dynamic pg builds (hermetic e2e)", () => {
     expect(m.degradedDowngrade).toBe(false); // baked 17.5 is ABOVE the 17.<dlMinor> high-water from test 1 — not a downgrade
 
     // --- Downgrade guard via a LEGIT high-water injection (the forged-build path can no longer set
-    // one). Write pg_majors.last_run_minor=99 straight into the daemon's SQLite via the better-sqlite3
-    // that ships in the image (no sqlite3 CLI in the runtime; resolve it from the daemon package dir).
-    // busy_timeout covers the daemon's WAL writer; the restart re-reads it at boot.
-    await execa("docker", ["exec", "-w", "/app/packages/daemon", dev.container.getId(), "node", "-e",
-      "const D=require('better-sqlite3');const db=new D('/data/state.db');db.pragma('busy_timeout=5000');" +
-      "db.prepare(\"INSERT INTO pg_majors (major,last_run_minor) VALUES (17,99) ON CONFLICT(major) DO UPDATE SET last_run_minor=99\").run();db.close();"]);
+    // one). injectLastRunMinor writes the high-water straight into the daemon's SQLite, dispatching on
+    // the suite's env prefix (node+better-sqlite3 into pg_majors for the default image; the in-image
+    // sqlite3 CLI into pg_actives for the Go image). busy_timeout covers the daemon's WAL writer; the
+    // restart re-reads it at boot.
+    await injectLastRunMinor(dev, 17, 99);
     // Remove the rejected forged dir so only baked 17.5 remains resolvable, then re-derive at boot:
     // baked 17.5 sits BELOW the injected high-water 99, so the never-silent-downgrade guard must flag
     // it (spec decision 10) while still serving the baked fallback.
