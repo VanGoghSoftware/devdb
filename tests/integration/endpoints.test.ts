@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startDevdb, type Devdb } from "./helpers/container.js";
+import { ENV_PREFIX, startDevdb, type Devdb } from "./helpers/container.js";
 
 describe("endpoint port exhaustion", () => {
   let dev: Devdb;
@@ -28,7 +28,7 @@ describe("endpoint port exhaustion", () => {
     // multiple projects' "main" branches doesn't read as an ambiguous "main, main".
     expect(body.error).toContain("p1/main");
     expect(body.error).toContain("p2/main");
-    expect(body.error).toContain("DEVDB_PORT_RANGE");
+    expect(body.error).toContain(`${ENV_PREFIX}PORT_RANGE`);
 
     // Live coverage: GET reflects the running endpoint, stop actually releases it, and the freed
     // port is reused by the branch that previously 409'd — proving this isn't just a status-flag

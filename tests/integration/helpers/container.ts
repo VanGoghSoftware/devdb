@@ -6,6 +6,21 @@ import { GenericContainer, Wait, type StartedNetwork, type StartedTestContainer 
 // buildImage() below). Override with DEVDB_TEST_IMAGE to run the suite against a
 // pre-built image supplied externally — e.g. a locally-built engine variant.
 const IMAGE = process.env.DEVDB_TEST_IMAGE ?? "devdb:dev";
+
+// Env-var prefix parameterization: the suite's daemon-env keys (and the one
+// assertion that names an env var) are written against the DEVDB_ prefix;
+// DEVDB_TEST_ENV_PREFIX rewrites them so the same suite drives an
+// image whose daemon reads a different prefix (paired with DEVDB_TEST_IMAGE).
+export const ENV_PREFIX = process.env.DEVDB_TEST_ENV_PREFIX ?? "DEVDB_";
+
+function reprefix(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    out[key.startsWith("DEVDB_") ? `${ENV_PREFIX}${key.slice("DEVDB_".length)}` : key] = value;
+  }
+  return out;
+}
+
 let built = false;
 
 export async function buildImage(): Promise<void> {
@@ -120,7 +135,7 @@ export async function startDevdb(
   const buildUnstarted = (name: string) => {
     const unstarted = new GenericContainer(IMAGE)
       .withName(name)
-      .withEnvironment({ DEVDB_PORT_RANGE: "54300-54309", ...env })
+      .withEnvironment(reprefix({ DEVDB_PORT_RANGE: "54300-54309", ...env }))
       .withExposedPorts(...exposedPorts)
       .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
       .withStartupTimeout(240_000);
