@@ -36,7 +36,25 @@ sequential pass; the 2 reds (branching, mcp-concurrency) were 300s TIMEOUTS
 under cumulative 15-file machine load and both PASSED isolated in ~8s each →
 load flakes, parity holds across all 15 files.
 
-Later gates: web-ui at M4 (full suite = the parity gate).
+## M4 gate (the FULL reference suite — all 16 files, assertions unmodified)
+
+The M4 gate is the entire suite green vs worktreedb:dev — M2's 11 + M3's 4 +
+web-ui. web-ui.test.ts is image-agnostic (hits dev.base :4400 only): GET / →
+200 text/html with id="root", a hashed /assets/*.js → 200 JS, an extensionless
+deep link → index.html (SPA fallback), and /api/<unknown> → 404 JSON (the
+fallback never shadows /api or /mcp). No state injection.
+
+    cd ~/git/devdb/tests/integration && \
+      DEVDB_TEST_IMAGE=worktreedb:dev DEVDB_TEST_ENV_PREFIX=WORKTREEDB_ \
+      pnpm vitest run acceptance projects branching endpoints timetravel events \
+        boot restart unclean-restart retry-helper storcon-major-guard \
+        pg-builds mcp mcp-handshake mcp-concurrency web-ui
+
+Result 2026-07-12: 16 files at parity vs worktreedb:dev. web-ui 3/3 (alone and
+in the full run). The full sequential pass was 15/16 with pg-builds.test.ts
+timing out under cumulative 16-file machine load; pg-builds PASSED isolated
+(3/3, 37.7s) → load flake, parity holds across all 16. FULL PARITY ACHIEVED —
+the Go rewrite serves the reference suite unmodified.
 
 ## Invocation
 
