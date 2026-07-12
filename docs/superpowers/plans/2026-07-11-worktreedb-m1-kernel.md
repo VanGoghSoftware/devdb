@@ -61,6 +61,16 @@ go.mod  go.sum  README.md  AGENTS.md  CLAUDE.md  docs/codebase-review.md
 
 ### Task 1: Repo bootstrap (the clean history's first page)
 
+> **AMENDED (A1, 2026-07-11, post-review):** the `.golangci.yml` below is v1 schema — WRONG for
+> `golangci-lint-action@v7`, which only supports golangci-lint v2 (broker P2, CI-blocking). The
+> fix wave migrated it to v2 (`version: "2"`, gofmt/goimports moved to `formatters`, goimports
+> local prefix under `formatters.settings`) and pinned the action's `version:` to the locally
+> verified golangci-lint release instead of `latest`. Also folded in: honest pre-M1 README
+> status wording (broker P3), `.env*` ignore patterns (P4), and a `.gitattributes`
+> (`* text=auto eol=lf`) for deterministic line endings (task-reviewer Minor — the CRLF class
+> that has bitten this machine before). Read the repo's committed files as authoritative over
+> the blocks below.
+
 **Files:**
 - Create: `~/git/worktreedb/` — clone of the EMPTY `github.com/VanGoghSoftware/worktreedb`
 - Create: `README.md`, `AGENTS.md`, `CLAUDE.md`, `.gitignore`, `.golangci.yml`, `.github/workflows/ci.yml`, `go.mod`, `cmd/worktreedbd/main.go` (skeleton), `docs/codebase-review.md`
@@ -319,6 +329,13 @@ git log --oneline   # 3 commits, no trailers — verify with: git log --format=%
 
 ### Task 2: internal/config — env → validated Config
 
+> **AMENDED (A2, 2026-07-11, post-review):** the shipped code REJECTS whitespace-padded path
+> values (broker P3 — the plan's trim-then-validate silently redirected e.g. `" /data"`);
+> `portEnv` reports non-integer vs out-of-range with distinct messages; locals renamed
+> `rangeMin`/`rangeMax` (builtin shadowing); the test table grew to 39 cases (all 8 reserved
+> ports × both mechanisms, whitespace ×3 vars, port boundary/syntax cases, full EnginePorts
+> pin). Repo code is authoritative over the blocks below.
+
 **Files:**
 - Create: `internal/config/config.go`, Test: `internal/config/config_test.go`
 
@@ -533,6 +550,16 @@ git commit -m "feat: validated env configuration with reserved-port checks"
 ---
 
 ### Task 3: internal/store — SQLite schema v1, generations, operations log
+
+> **AMENDED (A4, 2026-07-11, post-review):** the shipped code hardens the reference below —
+> repo authoritative. Operations transitions are guarded (FinishOperation validates done|failed;
+> Advance/Finish require phase ∈ pending|running via conditional UPDATE + RowsAffected error;
+> schema CHECKs on phase and step_cursor≥0); `OperationByID` added (a failed op's Error was
+> unreachable); `WithTx` gained an immediate deferred Rollback (a panicking callback stranded
+> the single pooled connection — RED-proven); `IncompleteOperations` orders by created_at, id;
+> `NowISO()` exported. Suite 5 → 11 tests. Dependency note: sqlite v1.53.0 forces go.mod's
+> `go 1.25.0` directive (sandboxes need Go ≥ 1.25); do NOT drive-by `go mod tidy` — it drags 14
+> test-only transitives into go.sum (reviewer-proven); the `// indirect` marker fix is deferred.
 
 **Files:**
 - Create: `internal/store/store.go`, `internal/store/schema.go`, `internal/store/operations.go`, Test: `internal/store/store_test.go`
@@ -1025,6 +1052,17 @@ git commit -m "feat: sqlite store — schema v1, generation contract, operations
 
 ### Task 4: internal/runtime — the owner framework + operation executor
 
+> **AMENDED (A5, 2026-07-11, post-review, Fable fix wave):** the reference code below needed a
+> concurrency-model hardening pass — repo authoritative. Owner lifecycle is now enforced
+> (Start idempotent via atomic CAS + warn, exactly one loop ever; Do fails fast with exported
+> `ErrOwnerStopped` pre-Start and after termination, with a buffered-reply drain so a received
+> request always returns its real result — happens-before proven in re-review; Wait hang-free).
+> `ErrConvergePanicked` sentinel replaces the misleading context.Canceled. A FAILED nudge-driven
+> converge re-arms itself via a delayed self-Nudge (package `retryBackoff`, coalescing-bounded);
+> Do-path failures deliberately do not. `RunOperation` validates the persisted cursor
+> (out-of-range → op failed + error, never silent done; a plan-fingerprint for cross-binary
+> step-list skew is DEFERRED to the milestone that adds real operation kinds). Suite 5 → 12.
+
 **Files:**
 - Create: `internal/runtime/owner.go`, `internal/runtime/operation.go`, Test: `internal/runtime/runtime_test.go`
 
@@ -1407,6 +1445,22 @@ git commit -m "feat: owner runtime — serialized converge inbox + durable opera
 ---
 
 ### Task 5: internal/engine/process.go — the managed child process
+
+> **AMENDED (A3, 2026-07-11, post-review):** the reference code below shipped with substantial,
+> gate-verified corrections — read the repo as authoritative. (1) `-race` proved two races IN the
+> reference (per-transition OnStateChange goroutines; killIfAlive's ProcessState read) — fixed to
+> synchronous-under-lock dispatch (upheld by review: the ordered-transitions contract demands it;
+> observers must offload, documented at the API) and unconditional signaling. (2) The reaper now
+> joins scanners BEFORE cmd.Wait (StdoutPipe contract) with a bounded 300ms drain grace — the
+> unbounded form deadlocks when a grandchild inherits the pipe (proven). (3) Signal-0 leader
+> polling replaced by a reaper-owned `done` channel (PID-reuse + goroutine-leak class); group
+> SIGKILL gated on leader-reaped. (4) A `terminating` handle prevents generation overlap — Start
+> refuses while the previous child is still dying; failStart stashes survivors the same way.
+> (5) Needle-check precedes the OnLine callback (a blocking observer can't stall readiness).
+> (6) ErrTooLong stream survival, RecentLines clamp, observer API docs. Suite grew 8 → 14 tests
+> incl. a companion fence test that genuinely pins the post-select fence on darwin (the
+> reviewer-authored verbatim one demonstrably does not — kept anyway per adjudication).
+> Deferred Minor: one OnLine doc clause (unbounded-blocking observer also stalls reaping/Stop).
 
 This is the load-bearing supervision primitive. It carries three contracts that MUST survive review: (1) a late readiness needle after Stop() must NOT flip state back to running (the stop-during-start fence); (2) Stop escalates SIGTERM→SIGKILL on a deadline, with process-GROUP semantics when Detached; (3) observer callbacks (OnLine/OnStateChange) can never break the child lifecycle.
 
@@ -1913,6 +1967,15 @@ git commit -m "feat: managed child process — needle readiness, stop fences, gr
 
 ### Task 6: internal/engine — specs, dirs, and the tracer sink
 
+> **AMENDED (A6, 2026-07-11, post-review):** the tracer reference code below carries a CONFIRMED
+> crash bug — `Start`'s goroutine re-reads the `t.server` FIELD while `Stop` nils it
+> unsynchronized (reviewer repro: `-race` + nil-deref SIGSEGV in a tight Start/Stop loop; the
+> boot fail-fast teardown is the live trigger window). Fixed: locals captured, mutex-guarded
+> lifecycle mirroring `Process`'s idiom, idempotent Stop, lifecycle tests. Also: the sink's body
+> drain is bounded (MaxBytesReader 10 MiB), and `tomlString` escapes the full TOML control-char
+> set (\n, \r, \t, <0x20 as \uXXXX) with table-driven tests. Repo authoritative over the blocks
+> below.
+
 **Files:**
 - Create: `internal/engine/specs.go`, `internal/engine/tracer.go`, Tests: `internal/engine/specs_test.go`, `internal/engine/tracer_test.go`
 
@@ -2327,6 +2390,17 @@ git commit -m "feat: engine process specs, on-volume layout, and the trace/upcal
 ---
 
 ### Task 7: internal/engine/catalogdb.go — the storage controller's catalog postgres
+
+> **AMENDED (A7, 2026-07-11, post-review):** repo authoritative over the blocks below. The
+> reference `Init` had a CRITICAL destructive fallthrough — ANY `os.Stat(PG_VERSION)` failure
+> (not just absence) proceeded to clear the whole data dir; now only `os.IsNotExist` clears,
+> anything else errors (`checking for existing catalog data: …`, ENOTDIR-tested). Stale-pid
+> removal logs honestly (success vs distinct failure line; parity substring kept) and carries
+> the full ownership argument (exclusive data-dir `.lock` = the cross-container authority;
+> boot-only; running-guard). `ConnectionURI` is net/url-built (url.UserPassword — hex case
+> byte-identical to the old format). The refusal message drops the trailing period (ST1005;
+> parity substrings unaffected). +5 tests (ENOTDIR, pid-removal failure, fresh-dir silence,
+> vanilla-fallback WARN, URI table).
 
 The storage controller keeps its metadata in its own PostgreSQL instance, hosted from the true-upstream `pg_install/vanilla_v17` tree in the engine image. This task carries three battle-tested contracts: the **catalog-major guard** (refuse a volume initdb'd by a different PostgreSQL major — with the exact parity strings), the **stale postmaster.pid removal** (unclean container stops orphan it; PID reuse then blocks the next boot), and **no unix socket** (`/tmp` persists across container restarts, so the socket lock file would be a second stale-lock class — disable the socket entirely).
 
@@ -2852,6 +2926,15 @@ git commit -m "feat: catalog postgres host — initdb, catalog-major guard, stal
 ---
 
 ### Task 8: Supervisor + engine owner + GET /api/status + main
+
+> **AMENDED (A8, 2026-07-11, post-review):** repo authoritative. Deltas vs the blocks below:
+> safekeeper registration uses a dedicated redirect-REFUSING client (DefaultClient's transparent
+> 301-follow could report false success), ctx-aware backoff, no trailing sleep; main surfaces
+> post-startup `Serve` failures through a channel select (headless-daemon hole closed) with one
+> linear teardown (engine → owner wait → lock LAST, no double-Stop); `healthy` requires the full
+> canonical topology (`engine.ExpectedComponents` — new exported single source) present AND
+> running, not merely "map non-empty and running". Supervisor test asserts Status() keys ==
+> ExpectedComponents. Suite +6 tests.
 
 **Files:**
 - Create: `internal/engine/supervisor.go`, Test: `internal/engine/supervisor_test.go`

@@ -2617,6 +2617,15 @@ cd ~/git/worktreedb && git add internal/compute && git commit -m "feat(compute):
 
 ### Task 6: compute — the manager (launch, readiness, group-kill stop)
 
+> **AMENDED (post-review, 2026-07-12):** the reference Step-5 code below carries a TSan-PROVEN
+> data race — `entry.proc` assigned in launch() without the lock while statusLocked reads it
+> under `m.mu` (a status poll during Start is the live reader). The fix wave locks all entry
+> writes + adds the race repro as a permanent test; makes readiness DEATH-AWARE (derived-ctx
+> cancel from the state hook — crash mid-poll fails fast, not the full 50s budget); corrects the
+> OnExit doc (also fires on start-phase failures — consumers must tolerate the double signal);
+> pins the port wiring with binding assertions; identity-guards the failure-path entry delete.
+> Repo authoritative over the blocks below.
+
 The compute lifecycle: one entry per branch; `Start` writes the config files into a fresh dir under `<dataDir>/computes/`, grabs three ephemeral loopback ports, launches `compute_ctl` via `engine.Process` with **`Detached: true`** (compute_ctl orphans its postgres child on SIGTERM — only a group kill reaches the whole tree), waits for the log needle AND then polls `/metrics` for `compute_ctl_up{status="running"}` (the needle alone fires before the SCRAM verifier commits). `Stop` group-kills, then removes the dir — safe because `engine.Process.Stop` confirms the process group empty before returning, which deletes the leftover-writer directory-removal race class at the root.
 
 Simplification vs. a lane-free design, stated for reviewers: per-branch owner lanes (Task 8) serialize every Start/Stop for a branch, and shutdown calls `StopAll` only after all owners have quiesced (Task 14's ordering) — so the manager needs a plain mutex + phase guard, not an abort-fence dance against concurrent same-branch teardown.
@@ -5610,6 +5619,16 @@ cd ~/git/worktreedb && git add internal/service && git commit -m "feat(service):
 ---
 
 ### Task 10: service — branches (create under the parent lane, rename, delete, list)
+
+> **BINDING HANDOFFS (from T8/T9 gates — the brief predates them; repo is authoritative):**
+> (1) branch CREATE runs inside the PARENT branch's owner lane, and MUST register the new
+> branch's owner INSIDE that lane job (before the job returns) — the T9 drain loop's
+> progress guarantee assumes zero ownerless-live-branch window; a create that registers the
+> owner after releasing the lane reopens the exact spin/404 class T9 just closed. (2) T9's
+> DeleteProject drain now gates `Owners.Remove` on the branch actually being deleted and errors
+> after 3 zero-progress sweeps — branch DELETE here must use the same teardown-then-remove
+> discipline (`teardownBranchLocked` → remove only on confirmed gone). (3) fresh branch rows rest
+> at observed=0/spec=1 (no initial converge — matches T9); a superseded start returns nil.
 
 Branch create runs inside the PARENT's owner lane (a concurrent delete of that parent serializes with it — both share the parent's lane); in-lane re-checks catch a parent deleted or a name taken while queued. Rename is name-only (slug immutable; root branch refuses). Delete refuses when children exist and reuses Task 9's `teardownBranchLocked`.
 
