@@ -94,7 +94,12 @@ unmodified.
         boot restart unclean-restart retry-helper storcon-major-guard \
         pg-builds mcp mcp-handshake mcp-concurrency web-ui
 
-Full 16-file suite 2026-07-XX (suspend disabled): <PENDING — controller fills after the run>
+Full 16-file suite 2026-07-13 (suspend disabled): 16 files at parity, assertions
+unmodified. First pass 15/16 (194s); mcp.test.ts hit the documented 57P01
+compute-SIGTERM-mid-query flake (reset/restore path, machine-load, unrelated to
+suspend) — re-run isolated PASSED (mcp + mcp-concurrency + mcp-handshake, 5/5,
+43s). Same flake profile as the M4 gate; the additive auto-suspend, disabled by
+the injected WORKTREEDB_SUSPEND_TIMEOUT_SECONDS=0, does not perturb parity.
 
 Suspend/wake itself is proven Go-side by integration/suspend_test.go
 (TestSuspendThenWakePreservesData) against the same image.
