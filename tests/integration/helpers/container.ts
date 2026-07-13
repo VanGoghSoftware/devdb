@@ -133,9 +133,15 @@ export async function startDevdb(
   const exposedPorts = [4400, ...endpointPorts];
 
   const buildUnstarted = (name: string) => {
+    // Auto-suspend is M5 (Go image only) and must never fire during the parity
+    // run: a long-running test file would otherwise see a running endpoint flip
+    // to "suspended" (spec D8 — the additive feature stays out of the parity
+    // gate). Only inject it for the reprefixed (non-DEVDB_) cross-run; devdb's
+    // own TS daemon has no such env and its runs are unchanged.
+    const suspendOff: Record<string, string> = ENV_PREFIX === "DEVDB_" ? {} : { DEVDB_SUSPEND_TIMEOUT_SECONDS: "0" };
     const unstarted = new GenericContainer(IMAGE)
       .withName(name)
-      .withEnvironment(reprefix({ DEVDB_PORT_RANGE: "54300-54309", ...env }))
+      .withEnvironment(reprefix({ DEVDB_PORT_RANGE: "54300-54309", ...suspendOff, ...env }))
       .withExposedPorts(...exposedPorts)
       .withWaitStrategy(Wait.forHttp("/api/status", 4400).forStatusCode(200))
       .withStartupTimeout(240_000);

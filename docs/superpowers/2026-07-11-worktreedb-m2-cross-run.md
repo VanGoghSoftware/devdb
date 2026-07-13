@@ -79,3 +79,22 @@ reuse, container-restart reconciliation with data survival, unclean-restart
 recovery, typed lifecycle events, and the storcon foreign-major refusal —
 holds at parity with the reference daemon, with the reference assertions
 unmodified.
+
+## M5 gate — parity holds with suspend/wake present but DISABLED (spec D8)
+
+M5 adds auto-suspend + wake to the Go image. Per D8 the additive behavior never
+enters the parity gate: helpers/container.ts injects
+WORKTREEDB_SUSPEND_TIMEOUT_SECONDS=0 for the reprefixed cross-run (only when
+ENV_PREFIX != DEVDB_), so no endpoint parks mid-test. Same 16 files, assertions
+unmodified.
+
+    cd ~/git/devdb/tests/integration && \
+      DEVDB_TEST_IMAGE=worktreedb:dev DEVDB_TEST_ENV_PREFIX=WORKTREEDB_ \
+      pnpm vitest run acceptance projects branching endpoints timetravel events \
+        boot restart unclean-restart retry-helper storcon-major-guard \
+        pg-builds mcp mcp-handshake mcp-concurrency web-ui
+
+Full 16-file suite 2026-07-XX (suspend disabled): <PENDING — controller fills after the run>
+
+Suspend/wake itself is proven Go-side by integration/suspend_test.go
+(TestSuspendThenWakePreservesData) against the same image.
