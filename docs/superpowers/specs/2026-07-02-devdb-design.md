@@ -24,6 +24,12 @@ DevDB is a local development Postgres server with Neon-style instant branching a
 - TLS/SNI routing, PgBouncer pooling, public-network deployment.
 - Branch *merging* (branches fork; they never merge — same as Neon).
 - Auto-suspend of idle endpoints (start is automated where it helps agents; stop stays explicit).
+  **AMENDED 2026-07-13 (Worktree DB M5):** auto-suspend + wake-on-connect now
+  SHIPS as the first post-parity milestone — idle endpoints park automatically
+  (`WORKTREEDB_SUSPEND_TIMEOUT_SECONDS`, default 300, 0 disables) and wake on the
+  next connection. See `docs/superpowers/plans/2026-07-13-worktreedb-m5-suspend-wake.md`
+  and master-spec §8-M5 / D8. This reverses the v1 non-goal deliberately, on the
+  daemon-owned-listener foundation that made a transparent wake possible.
 - Native (non-Docker) packaging.
 - Building Neon/Postgres from source (binaries come from a pinned engine image).
 
@@ -46,7 +52,7 @@ DevDB is a local development Postgres server with Neon-style instant branching a
 
 - **Project** — a database universe pinned to a PG major version. Maps to a Neon **tenant**. Ships with default branch **`main`**.
 - **Branch** — writable copy-on-write fork of a parent at a point in time. Maps to a Neon **timeline**. Instant; no data copy. Unit of agent isolation (*worktree : files :: branch : data*).
-- **Endpoint** — the Postgres compute process serving a branch. Started on demand (explicitly, or automatically by MCP `create_branch`/`get_branch`), stopped explicitly. Auto-suspend of idle endpoints is a non-goal for v1. Statuses: `stopped | starting | running | stopping | failed`.
+- **Endpoint** — the Postgres compute process serving a branch. Started on demand (explicitly, or automatically by MCP `create_branch`/`get_branch`), stopped explicitly. ~~Auto-suspend of idle endpoints is a non-goal for v1.~~ **AMENDED 2026-07-13 (Worktree DB M5): auto-suspend + wake-on-connect ships (see the non-goals note above).** Statuses: `stopped | starting | running | stopping | suspended | failed`.
 - **Restore** — move a branch to a past timestamp/LSN, in place (destructive) or as a new branch (preferred).
 - **Reset** — discard a branch's changes; back to parent's current state.
 - **Checkpoint** — engine durability sync to remote storage; surfaced as an "all in sync" badge. Not a named marker.
