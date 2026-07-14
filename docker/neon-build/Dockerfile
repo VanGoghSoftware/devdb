@@ -447,6 +447,7 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl libssl3 libpq5 libreadline8 libseccomp2 \
         libcurl4 libicu72 zlib1g liblz4-1 libzstd1 libxml2 libkrb5-3 libuuid1 \
+        libgdal32 libgeos-c1v5 libproj25 libprotobuf-c1 libsfcgal1 libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=engine /out /usr/local/share/neon
@@ -458,7 +459,8 @@ ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
 
 # Acceptance gate: the same verify script the outer image runs.
 COPY docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
-RUN chmod +x /usr/local/bin/verify-binaries.sh
+COPY docker/verify-promised-extensions.sh /usr/local/bin/verify-promised-extensions
+RUN chmod +x /usr/local/bin/verify-binaries.sh /usr/local/bin/verify-promised-extensions
 
 # Default command runs the verifier so `docker run <image>` self-checks.
 CMD ["bash", "/usr/local/bin/verify-binaries.sh"]

@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -228,5 +230,109 @@ func TestPromisedExtensionBuildScriptContract(t *testing.T) {
 	}
 	if runAt, assembleAt := strings.Index(dockerfile, runNeedle), strings.Index(dockerfile, assembleNeedle); runAt >= assembleAt {
 		t.Errorf("extension build position = %d, output assembly position = %d; build must happen first", runAt, assembleAt)
+	}
+}
+
+type verifierFixture struct {
+	root    string
+	fakeBin string
+}
+
+func newVerifierFixture(t *testing.T) verifierFixture {
+	t.Helper()
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "fake-bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "ldd"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, major := range []string{"14", "15", "16", "17"} {
+		install := filepath.Join(root, "v"+major)
+		share := filepath.Join(install, "share", "extension")
+		lib := filepath.Join(install, "lib")
+		bin := filepath.Join(install, "bin")
+		for _, dir := range []string{share, lib, bin} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pgConfig := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in --sharedir) echo %s/share ;; --pkglibdir) echo %s/lib ;; *) exit 2 ;; esac\n", install, install)
+		if err := os.WriteFile(filepath.Join(bin, "pg_config"), []byte(pgConfig), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		postgisVersion := "3.3.3"
+		if major == "17" {
+			postgisVersion = "3.5.0"
+		}
+		controls := map[string]string{"pg_cron": "1.6", "vector": "0.8.0", "postgis": postgisVersion}
+		for name, version := range controls {
+			if err := os.WriteFile(filepath.Join(share, name+".control"), []byte("default_version = '"+version+"'\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(share, name+"--"+version+".sql"), []byte("-- fixture\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, library := range []string{"pg_cron.so", "vector.so", "postgis-3.so"} {
+			if err := os.WriteFile(filepath.Join(lib, library), []byte("fixture"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return verifierFixture{root: root, fakeBin: fakeBin}
+}
+
+func (f verifierFixture) run(t *testing.T) (string, error) {
+	t.Helper()
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join(root, "docker", "verify-promised-extensions.sh"), f.root)
+	cmd.Env = append(os.Environ(), "PATH="+f.fakeBin+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func TestPromisedExtensionVerifierAcceptsCompleteMatrix(t *testing.T) {
+	f := newVerifierFixture(t)
+	if out, err := f.run(t); err != nil {
+		t.Fatalf("verifier failed: %v\n%s", err, out)
+	}
+}
+
+func TestPromisedExtensionVerifierRejectsMissingCron(t *testing.T) {
+	f := newVerifierFixture(t)
+	if err := os.Remove(filepath.Join(f.root, "v16", "lib", "pg_cron.so")); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.run(t)
+	if err == nil || !strings.Contains(out, "pg_cron.so") {
+		t.Fatalf("got err=%v output=%q", err, out)
+	}
+}
+
+func TestPromisedExtensionVerifierRejectsWrongPostGISVersion(t *testing.T) {
+	f := newVerifierFixture(t)
+	control := filepath.Join(f.root, "v17", "share", "extension", "postgis.control")
+	if err := os.WriteFile(control, []byte("default_version = '3.3.3'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.run(t)
+	if err == nil || !strings.Contains(out, "3.5.0") {
+		t.Fatalf("got err=%v output=%q", err, out)
+	}
+}
+
+func TestPromisedExtensionVerifierRejectsBrokenLinkage(t *testing.T) {
+	f := newVerifierFixture(t)
+	if err := os.WriteFile(filepath.Join(f.fakeBin, "ldd"), []byte("#!/bin/sh\necho 'libbroken.so => not found'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.run(t)
+	if err == nil || !strings.Contains(out, "unresolved") {
+		t.Fatalf("got err=%v output=%q", err, out)
 	}
 }

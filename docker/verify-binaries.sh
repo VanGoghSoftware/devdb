@@ -49,5 +49,6 @@ if printf '%s' "$vanilla_ver" | grep -Eq '\([0-9a-f]{40}\)'; then
   exit 1
 fi
 echo "vanilla_v17: true-upstream OK, storcon DB host ($vanilla_ver)"
+/usr/local/bin/verify-promised-extensions "$PG"
 node --version
 echo "ALL BINARIES OK"

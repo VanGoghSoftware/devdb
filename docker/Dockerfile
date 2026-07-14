@@ -7,6 +7,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl libssl3 libpq5 libreadline8 libseccomp2 libcurl4 \
     libicu72 zlib1g liblz4-1 libzstd1 libxml2 libkrb5-3 libuuid1 \
+    libgdal32 libgeos-c1v5 libproj25 libprotobuf-c1 libsfcgal1 libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=neon-binaries /usr/local/share/neon /usr/local/share/neon
 ENV NEON_BINARIES_DIR=/usr/local/share/neon/bin \
@@ -29,6 +30,7 @@ USER node
 # the size delta stays modest (see handover §7).
 RUN pnpm install --frozen-lockfile && pnpm -r build
 COPY --chown=node:node docker/verify-binaries.sh /usr/local/bin/verify-binaries.sh
+COPY --chown=node:node docker/verify-promised-extensions.sh /usr/local/bin/verify-promised-extensions
 RUN bash /usr/local/bin/verify-binaries.sh
 EXPOSE 4400 54300-54339
 CMD ["node", "packages/daemon/dist/index.js"]
