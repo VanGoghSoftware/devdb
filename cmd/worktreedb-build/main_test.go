@@ -187,3 +187,46 @@ func TestCheckDockerfileArgs(t *testing.T) {
 		}
 	})
 }
+
+func TestPromisedExtensionBuildScriptContract(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(root, "docker", "neon-build", "build-promised-extensions.sh")
+	scriptRaw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(scriptRaw)
+	for _, required := range []string{
+		"set -Eeuo pipefail",
+		"PG_CRON_VERSION", "PG_CRON_SHA256",
+		"SFCGAL_VERSION", "SFCGAL_SHA256",
+		"POSTGIS_14_16_VERSION", "POSTGIS_14_16_SHA256",
+		"POSTGIS_17_VERSION", "POSTGIS_17_SHA256",
+		`$install/bin/pg_config`,
+		"oracle: neon compute/compute-node.Dockerfile",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("%s does not contain %q", scriptPath, required)
+		}
+	}
+
+	dockerfileRaw, err := os.ReadFile(filepath.Join(root, dockerfilePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := string(dockerfileRaw)
+	copyNeedle := "COPY docker/neon-build/build-promised-extensions.sh /usr/local/bin/build-promised-extensions"
+	runNeedle := "/usr/local/bin/build-promised-extensions /src/neon/pg_install"
+	assembleNeedle := "cp -a pg_install/v14 pg_install/v15 pg_install/v16 pg_install/v17 /out/pg_install/"
+	for _, needle := range []string{copyNeedle, runNeedle, assembleNeedle} {
+		if !strings.Contains(dockerfile, needle) {
+			t.Errorf("%s does not contain %q", dockerfilePath, needle)
+		}
+	}
+	if runAt, assembleAt := strings.Index(dockerfile, runNeedle), strings.Index(dockerfile, assembleNeedle); runAt >= assembleAt {
+		t.Errorf("extension build position = %d, output assembly position = %d; build must happen first", runAt, assembleAt)
+	}
+}

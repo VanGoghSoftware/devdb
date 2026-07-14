@@ -86,10 +86,16 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 # already present in the rust base, but harmless to request; lsof is dev-only
 # and dropped).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git build-essential libtool libreadline-dev zlib1g-dev flex bison \
+        git autoconf automake build-essential g++ libtool ninja-build \
+        libreadline-dev zlib1g-dev flex bison \
         libseccomp-dev libssl-dev clang pkg-config libpq-dev cmake \
         postgresql-client protobuf-compiler libprotobuf-dev \
         libcurl4-openssl-dev openssl libicu-dev libxml2-dev uuid-dev \
+        libboost-dev libboost-filesystem-dev libboost-iostreams-dev \
+        libboost-program-options-dev libboost-system-dev libboost-thread-dev \
+        libboost-timer-dev libcgal-dev libgdal-dev libgeos-dev libgmp-dev \
+        libjson-c-dev libmpfr-dev libopenscenegraph-dev libpcre2-dev \
+        libproj-dev libprotobuf-c-dev libxslt1-dev protobuf-c-compiler xsltproc \
     && rm -rf /var/lib/apt/lists/*
 
 # port: neond Dockerfile:18-22 — protoc v22.2 (neon's build-tools uses 25.1;
@@ -190,6 +196,14 @@ ARG JOBS
 ARG PGVECTOR_VERSION
 ARG PGVECTOR_SHA256
 ARG PGVECTOR_074_SQL_SHA256
+ARG PG_CRON_VERSION
+ARG PG_CRON_SHA256
+ARG SFCGAL_VERSION
+ARG SFCGAL_SHA256
+ARG POSTGIS_14_16_VERSION
+ARG POSTGIS_14_16_SHA256
+ARG POSTGIS_17_VERSION
+ARG POSTGIS_17_SHA256
 
 ENV BUILD_TYPE=release
 WORKDIR /src/neon
@@ -337,7 +351,23 @@ RUN set -e; \
     rm -rf /tmp/pgvector.tar.gz /tmp/pgvector-src /tmp/vector--0.7.4.sql.keep
 
 # ---------------------------------------------------------------------------
-# 2g. Assemble the exact /usr/local/share/neon layout inside this stage so the
+# 2g. Promised extension surface — pg_cron + PostGIS for every compute major.
+# pgvector was installed in 2f. This script downloads only the manifest-pinned
+# sources, builds SFCGAL once, then uses each bundled installation's exact
+# pg_config so the carrier and baked-engine artifacts have identical ABI.
+# oracle: neon compute/compute-node.Dockerfile (pg_cron-build, postgis-build,
+# extensions-minimal).
+# ---------------------------------------------------------------------------
+COPY docker/neon-build/build-promised-extensions.sh /usr/local/bin/build-promised-extensions
+RUN chmod +x /usr/local/bin/build-promised-extensions \
+    && PG_CRON_VERSION="$PG_CRON_VERSION" PG_CRON_SHA256="$PG_CRON_SHA256" \
+       SFCGAL_VERSION="$SFCGAL_VERSION" SFCGAL_SHA256="$SFCGAL_SHA256" \
+       POSTGIS_14_16_VERSION="$POSTGIS_14_16_VERSION" POSTGIS_14_16_SHA256="$POSTGIS_14_16_SHA256" \
+       POSTGIS_17_VERSION="$POSTGIS_17_VERSION" POSTGIS_17_SHA256="$POSTGIS_17_SHA256" \
+       EXTENSION_JOBS=2 /usr/local/bin/build-promised-extensions /src/neon/pg_install
+
+# ---------------------------------------------------------------------------
+# 2h. Assemble the exact /usr/local/share/neon layout inside this stage so the
 #     final stage is a single clean COPY.
 #   - bin/         : the 5 storage binaries.
 #   - pg_install/v14..v17 : the per-major installs (with contrib + neon ext +
