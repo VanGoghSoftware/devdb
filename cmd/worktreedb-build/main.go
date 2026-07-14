@@ -27,11 +27,12 @@ import (
 )
 
 const (
-	dockerfilePath        = "docker/neon-build/Dockerfile"
-	manifestPath          = "docker/neon-build/versions.json"
-	productDockerfilePath = "docker/Dockerfile"
-	imagePrefix           = "worktreedb-neon-engine:local-"
-	verifyScript          = "/usr/local/bin/verify-binaries.sh"
+	dockerfilePath         = "docker/neon-build/Dockerfile"
+	manifestPath           = "docker/neon-build/versions.json"
+	productDockerfilePath  = "docker/Dockerfile"
+	imagePrefix            = "worktreedb-neon-engine:local-"
+	verifyScript           = "/usr/local/bin/verify-binaries.sh"
+	expectedCronSQLVersion = "1.6"
 )
 
 func main() {
@@ -328,6 +329,9 @@ func cmdCheckManifest(args []string) int {
 		}
 	}
 	req("pgCron.sqlVersion", m.PgCron.SQLVersion)
+	if m.PgCron.SQLVersion != "" && m.PgCron.SQLVersion != expectedCronSQLVersion {
+		problems = append(problems, fmt.Sprintf("pgCron.sqlVersion %q, want %q", m.PgCron.SQLVersion, expectedCronSQLVersion))
+	}
 	req("vanillaPostgres.tag", m.VanillaPostgres.Tag)
 	req("vanillaPostgres.commit", m.VanillaPostgres.Commit)
 

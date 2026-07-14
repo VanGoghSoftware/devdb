@@ -160,6 +160,34 @@ func TestPromisedExtensionPins(t *testing.T) {
 	}
 }
 
+func TestCheckManifestRejectsWrongPgCronSQLVersion(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, manifestPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.PgCron.SQLVersion = "9.9"
+	raw, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "versions.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := cmdCheckManifest([]string{"--path", path}); code == 0 {
+		t.Fatal("cmdCheckManifest accepted pgCron.sqlVersion 9.9, want rejection")
+	}
+}
+
 func TestCheckDockerfileArgs(t *testing.T) {
 	want := map[string]string{
 		"PG_CRON_VERSION": "1.6.4",
