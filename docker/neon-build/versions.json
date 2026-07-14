@@ -20,6 +20,39 @@
     "_notes": "NOT a git submodule upstream (unlike neond's own /pgvector submodule wrapper). neondatabase/neon fetches pgvector as a release tarball inside compute/compute-node.Dockerfile's pgvector-src stage, sha256-pinned, then applies compute/patches/pgvector.patch (adds NEON_SMGR unlogged-build hook + a v0.7.4 SQL upgrade path). One pgvector build is shared across all 4 PG majors — pin is per-source, not per-major. commit resolved via `git ls-remote --tags https://github.com/pgvector/pgvector.git v0.8.0` (read-only lookup against pgvector's own repo, not neon's tree)."
   },
 
+  "pgCron": {
+    "version": "1.6.4",
+    "sqlVersion": "1.6",
+    "repo": "https://github.com/citusdata/pg_cron.git",
+    "tarballUrl": "https://github.com/citusdata/pg_cron/archive/refs/tags/v1.6.4.tar.gz",
+    "tarballSha256": "52d1850ee7beb85a4cb7185731ef4e5a90d1de216709d8988324b0d02e76af61",
+    "_notes": "Pinned to the pg_cron source used by the official Neon compute recipe at this engine release. Release 1.6.4 installs SQL extension version 1.6. Built separately against every pg_install/v14..v17 via that installation's pg_config."
+  },
+
+  "sfcgal": {
+    "version": "1.4.1",
+    "repo": "https://gitlab.com/sfcgal/SFCGAL.git",
+    "tarballUrl": "https://gitlab.com/sfcgal/SFCGAL/-/archive/v1.4.1/SFCGAL-v1.4.1.tar.gz",
+    "tarballSha256": "1800c8a26241588f11cddcf433049e9b9aea902e923414d2ecef33a3295626c3",
+    "_notes": "Bookworm-compatible SFCGAL dependency pinned by the official Neon PostGIS build recipe. Built once, then used by every per-major PostGIS build."
+  },
+
+  "postgis": {
+    "pg14To16": {
+      "version": "3.3.3",
+      "repo": "https://git.osgeo.org/gitea/postgis/postgis.git",
+      "tarballUrl": "https://download.osgeo.org/postgis/source/postgis-3.3.3.tar.gz",
+      "tarballSha256": "74eb356e3f85f14233791013360881b6748f78081cc688ff9d6f0f673a762d13"
+    },
+    "pg17": {
+      "version": "3.5.0",
+      "repo": "https://git.osgeo.org/gitea/postgis/postgis.git",
+      "tarballUrl": "https://download.osgeo.org/postgis/source/postgis-3.5.0.tar.gz",
+      "tarballSha256": "ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510"
+    },
+    "_notes": "Version split follows the official Neon compute images for this source release: 3.3.3 on PostgreSQL 14-16 and 3.5.0 on PostgreSQL 17. Each release is rebuilt against the exact bundled pg_config."
+  },
+
   "vanillaPostgres": {
     "tag": "REL_17_5",
     "commit": "5e2f3df49d4298c6097789364a5a53be172f6e85",

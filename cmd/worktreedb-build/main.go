@@ -121,6 +121,16 @@ func cmdBuild(args []string) int {
 // check-manifest
 // ---------------------------------------------------------------------------
 
+// sourceArchive is a checksum-pinned upstream source archive. SQLVersion is
+// used only when the release tag and SQL extension version differ (pg_cron).
+type sourceArchive struct {
+	Version       string `json:"version"`
+	SQLVersion    string `json:"sqlVersion"`
+	Repo          string `json:"repo"`
+	TarballURL    string `json:"tarballUrl"`
+	TarballSha256 string `json:"tarballSha256"`
+}
+
 // manifest mirrors the fields of versions.json that this validator checks.
 // Unknown fields are ignored; missing required fields fail validation.
 type manifest struct {
@@ -132,6 +142,12 @@ type manifest struct {
 		TarballURL    string `json:"tarballUrl"`
 		TarballSha256 string `json:"tarballSha256"`
 	} `json:"pgvector"`
+	PgCron  sourceArchive `json:"pgCron"`
+	SFCGAL  sourceArchive `json:"sfcgal"`
+	PostGIS struct {
+		PG14To16 sourceArchive `json:"pg14To16"`
+		PG17     sourceArchive `json:"pg17"`
+	} `json:"postgis"`
 	VanillaPostgres struct {
 		Tag    string `json:"tag"`
 		Commit string `json:"commit"`
@@ -158,6 +174,13 @@ var wantImages = []string{"compute-v14", "compute-v15", "compute-v16", "compute-
 
 // manifestDigestRe matches a well-formed OCI manifest digest: sha256:<64 hex>.
 var manifestDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// sourceSha256Re matches the bare sha256 checksums used for source archives.
+var sourceSha256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// dockerArgRe captures the controlled single-line `ARG NAME=value` form used
+// by docker/neon-build/Dockerfile for source pins.
+var dockerArgRe = regexp.MustCompile(`(?m)^ARG[ \t]+([A-Z0-9_]+)=([^ \t\r\n]+)[ \t]*$`)
 
 // engineImageName is the GHCR image the product Dockerfile pins as its engine base;
 // every engine FROM line must be pinned to publishedDigests.images.engine.manifestDigest.
@@ -198,6 +221,49 @@ func checkEngineDigestPin(dfPath, wantDigest string) string {
 		}
 	}
 	return ""
+}
+
+func extensionDockerArgs(m manifest) map[string]string {
+	return map[string]string{
+		"PG_CRON_VERSION":       m.PgCron.Version,
+		"PG_CRON_SHA256":        m.PgCron.TarballSha256,
+		"SFCGAL_VERSION":        m.SFCGAL.Version,
+		"SFCGAL_SHA256":         m.SFCGAL.TarballSha256,
+		"POSTGIS_14_16_VERSION": m.PostGIS.PG14To16.Version,
+		"POSTGIS_14_16_SHA256":  m.PostGIS.PG14To16.TarballSha256,
+		"POSTGIS_17_VERSION":    m.PostGIS.PG17.Version,
+		"POSTGIS_17_SHA256":     m.PostGIS.PG17.TarballSha256,
+	}
+}
+
+// checkDockerfileArgs verifies the manifest-to-Dockerfile duplication that is
+// unavoidable because Docker cannot read versions.json while resolving ARGs.
+func checkDockerfileArgs(dfPath string, want map[string]string) []string {
+	raw, err := os.ReadFile(dfPath)
+	if err != nil {
+		return []string{fmt.Sprintf("cannot read %s for source-ARG cross-check: %v", dfPath, err)}
+	}
+	got := make(map[string]string)
+	for _, match := range dockerArgRe.FindAllSubmatch(raw, -1) {
+		got[string(match[1])] = string(match[2])
+	}
+	names := make([]string, 0, len(want))
+	for name := range want {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var problems []string
+	for _, name := range names {
+		value, ok := got[name]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s: missing ARG %s=%s", dfPath, name, want[name]))
+			continue
+		}
+		if value != want[name] {
+			problems = append(problems, fmt.Sprintf("%s: ARG %s=%s, want %s", dfPath, name, value, want[name]))
+		}
+	}
+	return problems
 }
 
 func cmdCheckManifest(args []string) int {
@@ -244,6 +310,24 @@ func cmdCheckManifest(args []string) int {
 	req("pgvector.tag", m.Pgvector.Tag)
 	req("pgvector.tarballUrl", m.Pgvector.TarballURL)
 	req("pgvector.tarballSha256", m.Pgvector.TarballSha256)
+	for _, source := range []struct {
+		name string
+		pin  sourceArchive
+	}{
+		{name: "pgCron", pin: m.PgCron},
+		{name: "sfcgal", pin: m.SFCGAL},
+		{name: "postgis.pg14To16", pin: m.PostGIS.PG14To16},
+		{name: "postgis.pg17", pin: m.PostGIS.PG17},
+	} {
+		req(source.name+".version", source.pin.Version)
+		req(source.name+".repo", source.pin.Repo)
+		req(source.name+".tarballUrl", source.pin.TarballURL)
+		req(source.name+".tarballSha256", source.pin.TarballSha256)
+		if source.pin.TarballSha256 != "" && !sourceSha256Re.MatchString(source.pin.TarballSha256) {
+			problems = append(problems, fmt.Sprintf("%s.tarballSha256 %q is not 64 lowercase hex", source.name, source.pin.TarballSha256))
+		}
+	}
+	req("pgCron.sqlVersion", m.PgCron.SQLVersion)
 	req("vanillaPostgres.tag", m.VanillaPostgres.Tag)
 	req("vanillaPostgres.commit", m.VanillaPostgres.Commit)
 
@@ -305,6 +389,7 @@ func cmdCheckManifest(args []string) int {
 			problems = append(problems, prob)
 		}
 	}
+	problems = append(problems, checkDockerfileArgs(filepath.Join(root, dockerfilePath), extensionDockerArgs(m))...)
 
 	if len(problems) > 0 {
 		fmt.Fprintf(os.Stderr, "check-manifest: %s FAILED:\n", p)
@@ -314,8 +399,10 @@ func cmdCheckManifest(args []string) int {
 		return 1
 	}
 
-	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, vanilla %s, majors %v, published %d images; %s engine FROM digest matches)\n",
-		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.VanillaPostgres.Tag, wantMajors, len(m.PublishedDigests.Images), productDockerfilePath)
+	fmt.Printf("check-manifest: OK — %s (neon %s, rust %s, pgvector %s, pg_cron %s, SFCGAL %s, PostGIS %s/%s, vanilla %s, majors %v, published %d images; source ARGs and %s engine FROM digest match)\n",
+		p, m.NeonTag, m.Rust, m.Pgvector.Tag, m.PgCron.Version, m.SFCGAL.Version,
+		m.PostGIS.PG14To16.Version, m.PostGIS.PG17.Version, m.VanillaPostgres.Tag,
+		wantMajors, len(m.PublishedDigests.Images), productDockerfilePath)
 	return 0
 }
 

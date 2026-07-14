@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -122,4 +124,66 @@ func TestCmdCheckManifestWiresRealRepo(t *testing.T) {
 		os.Stdout = orig
 		t.Fatalf("cmdCheckManifest(nil) on the real repo returned %d, want 0", code)
 	}
+}
+
+func TestPromisedExtensionPins(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, manifestPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{
+		"PG_CRON_VERSION":       "1.6.4",
+		"PG_CRON_SHA256":        "52d1850ee7beb85a4cb7185731ef4e5a90d1de216709d8988324b0d02e76af61",
+		"SFCGAL_VERSION":        "1.4.1",
+		"SFCGAL_SHA256":         "1800c8a26241588f11cddcf433049e9b9aea902e923414d2ecef33a3295626c3",
+		"POSTGIS_14_16_VERSION": "3.3.3",
+		"POSTGIS_14_16_SHA256":  "74eb356e3f85f14233791013360881b6748f78081cc688ff9d6f0f673a762d13",
+		"POSTGIS_17_VERSION":    "3.5.0",
+		"POSTGIS_17_SHA256":     "ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510",
+	}
+	if got := extensionDockerArgs(m); !reflect.DeepEqual(got, want) {
+		t.Fatalf("extensionDockerArgs() = %#v, want %#v", got, want)
+	}
+	if problems := checkDockerfileArgs(filepath.Join(root, dockerfilePath), want); len(problems) != 0 {
+		t.Fatalf("Docker ARG drift: %v", problems)
+	}
+}
+
+func TestCheckDockerfileArgs(t *testing.T) {
+	want := map[string]string{
+		"PG_CRON_VERSION": "1.6.4",
+		"PG_CRON_SHA256":  strings.Repeat("a", 64),
+	}
+
+	t.Run("matching", func(t *testing.T) {
+		path := writeDockerfile(t, "ARG PG_CRON_VERSION=1.6.4\nARG PG_CRON_SHA256="+strings.Repeat("a", 64)+"\n")
+		if problems := checkDockerfileArgs(path, want); len(problems) != 0 {
+			t.Fatalf("checkDockerfileArgs() = %v, want no problems", problems)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		path := writeDockerfile(t, "ARG PG_CRON_VERSION=1.6.4\n")
+		problems := strings.Join(checkDockerfileArgs(path, want), "\n")
+		if !strings.Contains(problems, "PG_CRON_SHA256") || !strings.Contains(problems, want["PG_CRON_SHA256"]) {
+			t.Fatalf("problem %q does not name missing ARG and expected value", problems)
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		path := writeDockerfile(t, "ARG PG_CRON_VERSION=9.9.9\nARG PG_CRON_SHA256="+strings.Repeat("a", 64)+"\n")
+		problems := strings.Join(checkDockerfileArgs(path, want), "\n")
+		if !strings.Contains(problems, "PG_CRON_VERSION") || !strings.Contains(problems, "9.9.9") || !strings.Contains(problems, "1.6.4") {
+			t.Fatalf("problem %q does not describe ARG drift", problems)
+		}
+	})
 }
