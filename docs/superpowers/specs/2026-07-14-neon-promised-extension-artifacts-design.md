@@ -206,4 +206,3 @@ changing the active high-water build.
 Database extension creation and upgrade remain explicit SQL. Neither producer
 nor consumer silently runs `CREATE EXTENSION` or `ALTER EXTENSION UPDATE` in a
 user database.
-
