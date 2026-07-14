@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/vangoghsoftware/worktreedb-neon-engine@sha256:7c042751bb0fbe5c1593dd95c49418fc57abbead2b91565e5696fe6b8c8629f4 AS neon-binaries
+FROM ghcr.io/vangoghsoftware/worktreedb-neon-engine@sha256:a46efbdad2add1cdab894ecba27d77686b10a2cd6249b09cc759f6b72edf53ca AS neon-binaries
 
 FROM node:22-bookworm-slim
 # Runtime libs the neon binaries + postgres need (oracle: neon Dockerfile final/runtime stage —

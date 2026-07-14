@@ -68,22 +68,22 @@ tripwire (below) asserting it prints a bare `17.5` with no 40-hex commit hash.
 
 ## Published images (GHCR — private)
 
-Multi-arch (amd64 + arm64) manifest-list digests — workflow run `29035944537`,
-source `92886fc`. Full digests are also in `versions.json`'s `publishedDigests`;
+Multi-arch (amd64 + arm64) manifest-list digests — workflow run `29348582996`,
+source `615d355`. Full digests are also in `versions.json`'s `publishedDigests`;
 `docker/Dockerfile`'s `FROM` pins the **engine** digest exactly.
 
 ```
 ghcr.io/vangoghsoftware/worktreedb-neon-engine:release-9129
-  @sha256:7c042751bb0fbe5c1593dd95c49418fc57abbead2b91565e5696fe6b8c8629f4   (engine — the /usr/local/share/neon tree)
+  @sha256:a46efbdad2add1cdab894ecba27d77686b10a2cd6249b09cc759f6b72edf53ca   (engine — the /usr/local/share/neon tree)
 
 ghcr.io/vangoghsoftware/worktreedb-compute-v14:14.18  (+ :latest)
-  @sha256:6d29d3f44e840e863406895b9ed6f2389d22f574c6ead4e0fd7ea94712c60fa3
+  @sha256:8a8c46d7de3e4b6d5967401cb66d8d5303902bcdda11658be9efb8b59beff43b
 ghcr.io/vangoghsoftware/worktreedb-compute-v15:15.13  (+ :latest)
-  @sha256:edd1f32867443fdae126da760573f4e122555202201f63724105307de2d6deff
+  @sha256:d11c60722a425643652d6172ffe36025134da46a3b02cd695233240673d0e9a1
 ghcr.io/vangoghsoftware/worktreedb-compute-v16:16.9   (+ :latest)
-  @sha256:a38e706ae8ecb358ac1bc760f51142ae63bf3539f9fa2d27e4c9e5364b94c7a1
+  @sha256:203741ee6e5ede55b463c2792c154623f0a83b3e4babddbd8cbe06539fd3be53
 ghcr.io/vangoghsoftware/worktreedb-compute-v17:17.5   (+ :latest)
-  @sha256:b7dffec7638a8a8c944868dd492b0799e3cd2b37ef378bb94cd4430da6ec5709
+  @sha256:ebb2f41243b1418b4d8135e67a701f08f8edf44592cca5b68f699592f3a4d8b4
 ```
 
 The **engine** image carries the full `/usr/local/share/neon` tree the outer
