@@ -103,3 +103,17 @@ the injected WORKTREEDB_SUSPEND_TIMEOUT_SECONDS=0, does not perturb parity.
 
 Suspend/wake itself is proven Go-side by integration/suspend_test.go
 (TestSuspendThenWakePreservesData) against the same image.
+
+## Phase-4 (import/export) — no regression, gate unchanged
+
+Phase 4 (local import/export, worktreedb `phase4-import-export`, 2026-07-14)
+adds no rows to this gate: import and export are user-triggered operations,
+never invoked by the reference suite itself, so they never enter the parity
+gate — no D8-style disable-injection is needed the way suspend needed one for
+M5. The same 16 files stay green against `worktreedb:dev`, reference
+assertions unmodified. Import/export have their own separate container
+acceptance (`TestImportRunningServer`, `TestExportImportRoundTrip`,
+`TestImportOutOfRangeMajorRefused`, `TestImportFailureHonesty`,
+`TestFreshBranchExportRestoresClean`) — see
+`docs/superpowers/specs/2026-07-13-worktreedb-phase4-import-export-design.md`
+`## Delivered` for that record.

@@ -231,3 +231,121 @@ release (still gated on Jordan's license review, per the master spec).
 - Terminology: standardize on **operation** for the durable row; keep the
   product spec's `get_job` / "import job" as the user-facing label for that
   operation's progress (they are 1:1).
+
+---
+
+## AMENDED (2026-07-14)
+
+Acceptance-time refinement, decided by Jordan when the naive full-dump
+round-trip (§8.2) collided on its own restore: a `pg_dump` of a Worktree DB
+branch is not just user data — every branch's compute has already created a
+small set of **engine-bootstrap objects** (the `neon`/`neon_migration`
+schemas, the availability-probe table `public.health_check` and its serial
+sequence `public.health_check_id_seq`, and — database-globally, not a member
+of the `neon` schema — the `neon` extension itself, whose `COMMENT ON
+EXTENSION` a non-superuser restore role cannot re-create). A dump that still
+carried them collided with the identical objects the *target* branch's own
+compute had already made, aborting `pg_restore` under `--exit-on-error`
+before a single user table landed. **Export is now refined to a clean,
+portable user-data dump**: it excludes that engine-bootstrap set via
+`pg_dump --exclude-schema=neon --exclude-schema=neon_migration
+--exclude-table=public.health_check --exclude-table=public.health_check_id_seq`,
+plus `--exclude-extension=neon` on PG17+ (where the flag exists) or a
+`--no-comments` fallback below 17 (where it doesn't). Every exclusion is a
+no-op on a source lacking the matching object.
+
+Two tradeoffs/limitations this decision introduces, both intentional and
+recorded here rather than silently shipped:
+
+- **Reserved-name import limitation.** The exclusion set applies ONLY on the
+  export path (a Worktree DB branch, which definitely carries those
+  objects) — **not** on the running-server import path, which dumps the
+  user's external source *faithfully*, with no exclusions. Excluding
+  engine-reserved names from a stranger's database would be silent data
+  loss: `public.health_check` is a plausible real table name, and quietly
+  dropping it from the dump would let an import report success with the
+  user's own object missing. Instead, a source that legitimately defines an
+  object under one of the engine's reserved names (`public.health_check`, or
+  the `neon`/`neon_migration` schemas) collides LOUDLY on restore
+  (`pg_restore --exit-on-error`) and the project lands `failed` with the
+  stderr tail — informative, never silent. This applies to both the
+  running-server and file-upload import paths (a file import restores
+  verbatim into a fresh project that already has the bootstrap objects, so
+  the same collision surfaces the same way). The fix is to rename the
+  colliding object in the source before importing.
+- **Sub-17 export drops user comments.** `pg_dump`'s `--exclude-extension`
+  flag doesn't exist before PG17, so a <17 export can't surgically remove
+  just the `neon` extension's restore-aborting comment — it falls back to
+  the coarser `--no-comments`, which strips *every* `COMMENT` in the dump,
+  including the user's own. Accepted as a minor, documented cross-major
+  fidelity tradeoff (17+ exports keep user comments intact via the surgical
+  `--exclude-extension` path).
+
+Implemented in worktreedb `feat(export): exclude engine-bootstrap objects so
+exports are clean, portable user data` (commit `b28998c`) and refined by
+`fix(import): dump running-server sources faithfully; keep the source
+password out of the major-detector` (commit `96c3cf2`), which reverted the
+export exclusion set off the running-server import path after it was found
+to silently drop matching user objects. See `## Delivered` below for the
+full acceptance record.
+
+---
+
+## Delivered (acceptance record)
+
+Implemented per `docs/superpowers/plans/2026-07-13-worktreedb-phase4-import-export.md`
+(worktreedb, local/unpushed). Acceptance 2026-07-14:
+
+- `go build`/`vet`/`test ./... -race` green + golangci-lint 0 issues;
+  `go.mod`/`go.sum` unchanged vs `main`. The unit suite includes the
+  delete-abort race guarantee (`TestDeleteDuringImportCancels`, `-race`
+  clean).
+- **Container acceptance** (image `worktreedb:dev` @ `b93997b`): the four
+  §8 acceptance tests — `TestImportRunningServer` (13.5s),
+  `TestExportImportRoundTrip` (13.8s), `TestImportOutOfRangeMajorRefused`
+  (3.8s), `TestImportFailureHonesty` (14.8s) — passed together in a single
+  **combined run, 46.4s, 4/4 green**. Earlier combined attempts had flaked
+  only on container startup under cumulative machine load (the documented
+  suite flake profile — see
+  `docs/superpowers/2026-07-11-worktreedb-m2-cross-run.md`), never on test
+  logic; this run cleared cleanly. The completeness guard
+  `TestFreshBranchExportRestoresClean` (deliberately run outside the
+  `TestImport|TestExport` filter — it round-trips a userless branch to
+  prove the exclusion set is complete) passes isolated.
+- The full 16-file reference parity suite stayed green vs `worktreedb:dev`
+  (import/export are user-triggered and never enter the parity gate — no
+  D8-style injection needed, unlike M5).
+- **Two real defects the container acceptance caught and fixed** — neither
+  was visible to the unit suite:
+  1. **P1 — inverted `pg_dump -Fc` header compression-width bug.**
+     `ArchiveMajor` read the archive header's compression field as a 5-byte
+     `ReadInt` for dump version ≥1.15 and a single byte below it — backwards
+     from postgres's own `ReadHead`, which writes a single
+     compression-**algorithm** byte at ≥1.15 and the `ReadInt` **level** at
+     1.4–1.14. The over-read desynced the parser 4 bytes past compression,
+     so the server-version string length decoded as garbage and
+     `POST /api/imports/file` rejected **every real archive** with a
+     spurious 400. No unit test caught it because the synthetic header
+     fixtures were built to the same inverted assumption; it surfaced only
+     against a real archive in the T10 container run. Fixed in worktreedb
+     `fix(pgtool): read the -Fc header compression field per ReadHead's
+     version ladder` (commit `808643d`), which also locks in a captured
+     real PG17 header as a regression fixture. See the plan doc's inline
+     `AMENDED` note at the `ArchiveMajor` compression comment for the full
+     origin story.
+  2. **Silent-data-loss — running-server import excluded engine names from
+     the SOURCE dump.** The first cut of the clean-export exclusion set was
+     applied to both the export path and the running-server import's
+     source dump; on import that meant a source database's own
+     `public.health_check` table (or a `neon`/`neon_migration` schema)
+     would be silently dropped, and the import would report success with
+     the user's data missing. Fixed in worktreedb `fix(import): dump
+     running-server sources faithfully; keep the source password out of
+     the major-detector` (commit `96c3cf2`): the running-server source is
+     now dumped with zero exclusions, and a genuine name collision fails
+     loudly via `pg_restore --exit-on-error` instead of vanishing quietly
+     (see the `## AMENDED` reserved-name note above).
+- Deferred (recorded): cloud/bucket durability (the whole back half — S3/Azure,
+  continuous backup, recover-from-bucket, bucket-artifact import); export-artifact
+  GC/retention + API delete; import into an existing branch; multi-database
+  computes; mid-pg_restore resume; non-URL (keyword) source DSNs.

@@ -884,7 +884,31 @@ func ArchiveMajor(header []byte) (int, error) {
 	}
 	return majorFromVersion(serverVersion)
 }
+```
 
+> **AMENDED (2026-07-14, post T10 container acceptance):** the compression-field
+> comment in the block above (`// compression: >=1.15 is a ReadInt spec; older is
+> a single byte.`) was **inverted** relative to postgres's own `ReadHead`
+> (`src/bin/pg_dump/pg_backup_archiver.c`): dump version **≥1.15 writes a single
+> compression-ALGORITHM byte**, not a `ReadInt`; **1.4–1.14** writes the 5-byte
+> `ReadInt` compression **level** (1 sign byte + 4-byte magnitude); 1.2–1.3 a
+> single level byte; below 1.2 nothing. `ArchiveMajor` was implemented faithfully
+> to the comment above — and its unit tests (`fakeCustomHeader`) were built to
+> the SAME wrong assumption, so the inversion was invisible to the unit suite;
+> every synthetic fixture shared the bad premise. It surfaced only when the T10
+> container acceptance fed it a real `pg_dump -Fc` archive: the over-read
+> desynced the parser four bytes past the compression field, so the later
+> server-version string length decoded as garbage and `POST /api/imports/file`
+> rejected every real archive with a spurious 400 ("archive header string length
+> out of range"). Fixed in worktreedb `fix(pgtool): read the -Fc header
+> compression field per ReadHead's version ladder` (commit `808643d`), which also
+> captures a real PG17 archive header as a regression fixture
+> (`testdata/real_pg17_header.dump`) — a real-archive test class no synthetic
+> fixture could have provided. Full acceptance record:
+> `docs/superpowers/specs/2026-07-13-worktreedb-phase4-import-export-design.md`
+> `## AMENDED (2026-07-14)` + `## Delivered`.
+
+```go
 // majorFromVersion extracts the integer major from a server_version string:
 // "16.4" -> 16, "14.11" -> 14. Postgres has used a single-number major since 10.
 func majorFromVersion(v string) (int, error) {
