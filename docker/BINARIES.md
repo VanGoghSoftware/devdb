@@ -10,8 +10,9 @@ authenticate to the private registry.
 
 > **Provenance.** The from-source pipeline (initiative A, Phase 2, 2026-07-09)
 > replaced the prior third-party engine image. All binary provenance now traces
-> to `neondatabase/neon` + `postgres/postgres` + `pgvector/pgvector` at the
-> commits pinned in [`docker/neon-build/versions.json`](neon-build/versions.json)
+> to `neondatabase/neon`, `postgres/postgres`, `citusdata/pg_cron`,
+> `pgvector/pgvector`, PostGIS, and SFCGAL at the versions pinned in
+> [`docker/neon-build/versions.json`](neon-build/versions.json)
 > — the single source of truth. Retiring the old image reference here closes the
 > last whitelisted third-party image dependency.
 
@@ -19,14 +20,16 @@ authenticate to the private registry.
 
 - **Recipe:** [`docker/neon-build/Dockerfile`](neon-build/Dockerfile) — one
   multi-stage build on a single Debian **bookworm** base (build-tools → fetch +
-  `engine` stage → per-major `pg_install` → true-upstream `vanilla` → `final`
-  engine image + four `FROM scratch` `compute-v{14..17}` carriers). Ports a
-  proven from-source recipe, re-based onto the official `neondatabase/neon` tree.
+  `engine` stage → per-major `pg_install` with promised extensions →
+  true-upstream `vanilla` → `final` engine image + four `FROM scratch`
+  `compute-v{14..17}` carriers). Ports a proven from-source recipe, re-based
+  onto the official `neondatabase/neon` tree.
 - **Manifest / pins:** [`docker/neon-build/versions.json`](neon-build/versions.json)
   — every pinned commit/tag + the published digests.
   `go run ./cmd/worktreedb-build check-manifest` statically validates it (the
-  source set **and** the `publishedDigests` shape: five images, each with a
-  well-formed `sha256:<64hex>` manifest digest). Bump the pins there, in lockstep.
+  source set, the promised-extension Docker ARG copies, **and** the
+  `publishedDigests` shape: five images, each with a well-formed
+  `sha256:<64hex>` manifest digest). Bump the pins there, in lockstep.
 - **CI:** [`.github/workflows/build-neon-engine.yml`](../.github/workflows/build-neon-engine.yml)
   — builds each arch **natively** (amd64 on `ubuntu-24.04`, arm64 on
   `ubuntu-24.04-arm`; no QEMU — the from-source PostgreSQL + Rust compile is too
@@ -50,7 +53,10 @@ Authoritative values live in `versions.json`; summarized here:
 | Postgres fork v15 | `vendor/postgres-v15` @ `aaaeff2550d5deba58847f112af9b98fa3a58b00` → **15.13** |
 | Postgres fork v16 | `vendor/postgres-v16` @ `9b9cb4b3e33347aea8f61e606bb6569979516de5` → **16.9** |
 | Postgres fork v17 | `vendor/postgres-v17` @ `fa1788475e3146cc9c7c6a1b74f48fd296898fcd` → **17.5** |
+| pg_cron | release **1.6.4** / SQL extension **1.6** (release tarball, sha256-pinned) |
 | pgvector | `v0.8.0` @ `2627c5ff775ae6d7aef0c430121ccf857842d2f2` (release tarball, sha256-pinned) |
+| PostGIS | **3.3.3** on PG14–16 / **3.5.0** on PG17 (release tarballs, sha256-pinned) |
+| SFCGAL | **1.4.1** (release tarball, sha256-pinned) |
 | vanilla_v17 (storcon host) | **true upstream** `postgres/postgres` **`REL_17_5`** @ `5e2f3df49d4298c6097789364a5a53be172f6e85` |
 
 `vanilla_v17` is deliberately **true upstream Postgres 17.5**, NOT the neon fork:
@@ -85,6 +91,9 @@ The **engine** image carries the full `/usr/local/share/neon` tree the outer
 `FROM scratch` carriers, each holding one major's `pg_install` under
 `/usr/local/` — exactly the prefix the runtime pull
 (`packages/daemon/src/compute/builds/oci.ts`, `prefix "usr/local/"`) extracts.
+Every carrier contains pg_cron, pgvector, and PostGIS. Because carriers are
+artifact-only scratch images, the consuming Bookworm runtime supplies their
+native PostGIS/SFCGAL shared-library dependencies.
 
 ## `verify-binaries.sh` inventory
 
@@ -120,6 +129,11 @@ executable `bin/postgres`; default = highest = `17`. **v18 is absent** (deferred
 to a later phase — do not add it here). `verify-binaries.sh`'s
 `EXPECTED_PG_VERSIONS` is kept in sync with this list.
 
+For every compute major, `verify-promised-extensions.sh` additionally requires
+the pg_cron 1.6, vector 0.8.0, and matching PostGIS control/SQL/shared-library
+artifacts. It runs `ldd` on their loadable modules and rejects missing runtime
+dependencies before an architecture leg can push by digest.
+
 **Two hard tripwires** (both fail the fast gate, exit 1):
 
 - `vanilla_v17/bin/{postgres,initdb}` MUST be present — otherwise
@@ -143,7 +157,10 @@ redistribute compiled binaries of:
 | PostgreSQL — `v14`–`v17` (neon fork) + `vanilla_v17` (true upstream) | PostgreSQL License (permissive, BSD-like) | `neondatabase/neon` postgres fork; `postgres/postgres` |
 | Neon storage engine — `pageserver`, `safekeeper`, `storage_broker`, `storage_controller` | Apache-2.0 | `neondatabase/neon` |
 | `compute_ctl` + neon PG extensions (`neon.so`, walproposer) | Apache-2.0 | `neondatabase/neon` |
+| pg_cron | PostgreSQL License | `citusdata/pg_cron` v1.6.4 |
 | pgvector | PostgreSQL License | `pgvector/pgvector` v0.8.0 |
+| PostGIS | GPL-2.0-or-later | PostGIS 3.3.3 / 3.5.0 |
+| SFCGAL | LGPL-2.0-or-later | SFCGAL 1.4.1 |
 
 These are DevDB's own builds of the above upstream sources at the pinned commits;
 no upstream license text is altered. Redistribution obligations (attribution /

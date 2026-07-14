@@ -40,7 +40,9 @@ on:
     paths:
       - docker/neon-build/versions.json
       - docker/neon-build/Dockerfile
+      - docker/neon-build/build-promised-extensions.sh
       - docker/verify-binaries.sh
+      - docker/verify-promised-extensions.sh
       - .github/workflows/build-neon-engine.yml
 
 permissions:

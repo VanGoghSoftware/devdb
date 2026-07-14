@@ -336,3 +336,23 @@ func TestPromisedExtensionVerifierRejectsBrokenLinkage(t *testing.T) {
 		t.Fatalf("got err=%v output=%q", err, out)
 	}
 }
+
+func TestBuildWorkflowTracksExtensionScripts(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "build-neon-engine.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(raw)
+	for _, path := range []string{
+		"docker/neon-build/build-promised-extensions.sh",
+		"docker/verify-promised-extensions.sh",
+	} {
+		if !strings.Contains(workflow, "- "+path) {
+			t.Errorf("workflow does not trigger on %s", path)
+		}
+	}
+}

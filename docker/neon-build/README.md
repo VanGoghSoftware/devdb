@@ -13,18 +13,21 @@ exact `/usr/local/share/neon` layout the outer DevDB image consumes:
 - `bin/` — the 5 storage/compute binaries: `pageserver`, `safekeeper`,
   `storage_broker`, `storage_controller`, `compute_ctl`.
 - `pg_install/v14..v17` — the per-major Neon compute Postgres (DevDB contrib set
-  + `neon.so` + pgvector, marked trusted).
+  + `neon.so` + pg_cron 1.6.4 + pgvector 0.8.0 + PostGIS 3.3.3 on
+  PostgreSQL 14–16 / 3.5.0 on PostgreSQL 17, marked trusted).
 - `pg_install/vanilla_v17` — a **true upstream Postgres 17** (NOT the neon fork)
   hosting `storage_controller`'s metadata catalog (storcon_db).
 
 ## Source of truth
 
 `versions.json` pins the entire source set (neon release + commit, the 4
-per-major postgres-fork submodule commits, the pgvector tarball + sha256, the
-vanilla upstream-postgres commit, Rust, the Debian base). Bumped by hand in
-lockstep — no upstream tooling. `worktreedb-build check-manifest` validates it, and
-cross-checks that the product `docker/Dockerfile`'s engine base-image digest still
-matches the published engine digest recorded here (`publishedDigests.images.engine`).
+per-major postgres-fork submodule commits, the pg_cron/pgvector/PostGIS/SFCGAL
+archives + sha256 values, the vanilla upstream-postgres commit, Rust, and the
+Debian base). Bumped by hand in lockstep — no upstream tooling.
+`worktreedb-build check-manifest` validates it, cross-checks the promised
+extension pins against the producer Dockerfile's ARG copies, and verifies that
+the product `docker/Dockerfile` engine base digest matches
+`publishedDigests.images.engine`.
 
 ## Build
 
@@ -37,9 +40,11 @@ Runs `docker buildx build` for the given arch, then the in-image
 
 ## Phase-1 result (2026-07-06) — go/no-go for Phase 2: **GO**
 
-The recipe is **proven**: it compiles all four PG majors + the storage binaries +
-`compute_ctl` + pgvector + a true-vanilla storcon host from source on one
-bookworm base, and the self-built engine passes the full acceptance gate.
+The original recipe is **proven**: it compiles all four PG majors + the storage
+binaries + `compute_ctl` + pgvector + a true-vanilla storcon host from source on
+one bookworm base. The promised-extension release extends that same shared
+per-major tree with pg_cron and PostGIS before either the engine image or
+carrier targets copy it; native amd64/arm64 verification gates publication.
 
 | Metric | Value |
 |---|---|
@@ -76,7 +81,8 @@ DevDB's needs required:
 
 ## Scope
 
-Phase 1 (this directory + `cmd/worktreedb-build`) is the local, validated recipe.
-Phase 2 (GitHub Actions → GHCR, multi-arch, digest-pinned manifest, `Dockerfile` +
-`oci.ts` repoint, neond-ref retirement) is gated separately — see
-`docs/superpowers/plans/2026-07-06-devdb-initiative-a-neon-build-pipeline.md`.
+This directory + `cmd/worktreedb-build` is the local, validated recipe. The
+GitHub Actions workflow publishes the engine and all four carriers to private
+GHCR as native amd64/arm64 manifest lists. The engine is consumed by immutable
+digest; runtime carrier pulls resolve a tag to a digest and must pass Worktree
+DB's live Neon-compute validation before activation.
